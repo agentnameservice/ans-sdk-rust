@@ -1,12 +1,14 @@
 //! DNS resolution for `_ans-badge` / `_ra-badge` TXT records and TLSA records.
 
 use async_trait::async_trait;
-use hickory_resolver::ResolveErrorKind;
 use hickory_resolver::TokioResolver;
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::proto::ProtoErrorKind;
+use hickory_resolver::config::{
+    CLOUDFLARE, GOOGLE, NameServerConfig, QUAD9, ResolverConfig, ResolverOpts,
+};
+use hickory_resolver::net::{DnsError as HickoryDnsError, NetError, NoRecords as HickoryNoRecords};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::op::ResponseCode;
+use hickory_resolver::proto::rr::RData;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 /// Well-known DNS resolver configurations.
@@ -44,12 +46,12 @@ impl DnsResolverConfig {
                     reason: format!("failed to read system DNS config: {e}"),
                 }
             }),
-            Self::Cloudflare => Ok((ResolverConfig::cloudflare(), ResolverOpts::default())),
-            Self::CloudflareTls => Ok((ResolverConfig::cloudflare_tls(), ResolverOpts::default())),
-            Self::Google => Ok((ResolverConfig::google(), ResolverOpts::default())),
-            Self::GoogleTls => Ok((ResolverConfig::google_tls(), ResolverOpts::default())),
-            Self::Quad9 => Ok((ResolverConfig::quad9(), ResolverOpts::default())),
-            Self::Quad9Tls => Ok((ResolverConfig::quad9_tls(), ResolverOpts::default())),
+            Self::Cloudflare => Ok((ResolverConfig::udp_and_tcp(&CLOUDFLARE), ResolverOpts::default())),
+            Self::CloudflareTls => Ok((ResolverConfig::tls(&CLOUDFLARE), ResolverOpts::default())),
+            Self::Google => Ok((ResolverConfig::udp_and_tcp(&GOOGLE), ResolverOpts::default())),
+            Self::GoogleTls => Ok((ResolverConfig::tls(&GOOGLE), ResolverOpts::default())),
+            Self::Quad9 => Ok((ResolverConfig::udp_and_tcp(&QUAD9), ResolverOpts::default())),
+            Self::Quad9Tls => Ok((ResolverConfig::tls(&QUAD9), ResolverOpts::default())),
         }
     }
 }
@@ -270,17 +272,23 @@ impl HickoryDnsResolver {
         let (config, opts) = preset.to_resolver_config()?;
 
         let mut builder =
-            TokioResolver::builder_with_config(config.clone(), TokioConnectionProvider::default());
+            TokioResolver::builder_with_config(config.clone(), TokioRuntimeProvider::default());
         *builder.options_mut() = opts.clone();
-        let resolver = builder.build();
+        let resolver = builder.build().map_err(|e| DnsError::LookupFailed {
+            fqdn: "(resolver init)".to_string(),
+            reason: e.to_string(),
+        })?;
 
         // Create DNSSEC-validating resolver for TLSA lookups
         let mut dnssec_builder =
-            TokioResolver::builder_with_config(config, TokioConnectionProvider::default());
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
         let dnssec_opts = dnssec_builder.options_mut();
         *dnssec_opts = opts;
         dnssec_opts.validate = true;
-        let dnssec_resolver = dnssec_builder.build();
+        let dnssec_resolver = dnssec_builder.build().map_err(|e| DnsError::LookupFailed {
+            fqdn: "(dnssec resolver init)".to_string(),
+            reason: e.to_string(),
+        })?;
 
         tracing::debug!(preset = ?preset, "Created DNS resolver");
         Ok(Self {
@@ -308,21 +316,28 @@ impl HickoryDnsResolver {
     pub async fn with_nameservers(nameservers: &[Ipv4Addr]) -> Result<Self, DnsError> {
         let ips: Vec<IpAddr> = nameservers.iter().map(|ip| IpAddr::V4(*ip)).collect();
 
-        let config = ResolverConfig::from_parts(
-            None,
-            vec![],
-            NameServerConfigGroup::from_ips_clear(&ips, 53, true),
-        );
+        let name_servers: Vec<NameServerConfig> = ips
+            .iter()
+            .map(|ip| NameServerConfig::udp_and_tcp(*ip))
+            .collect();
+        let config = ResolverConfig::from_parts(None, vec![], name_servers);
 
         let resolver =
-            TokioResolver::builder_with_config(config.clone(), TokioConnectionProvider::default())
-                .build();
+            TokioResolver::builder_with_config(config.clone(), TokioRuntimeProvider::default())
+                .build()
+                .map_err(|e| DnsError::LookupFailed {
+                    fqdn: "(resolver init)".to_string(),
+                    reason: e.to_string(),
+                })?;
 
         // Create DNSSEC-validating resolver for TLSA lookups
         let mut dnssec_builder =
-            TokioResolver::builder_with_config(config, TokioConnectionProvider::default());
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
         dnssec_builder.options_mut().validate = true;
-        let dnssec_resolver = dnssec_builder.build();
+        let dnssec_resolver = dnssec_builder.build().map_err(|e| DnsError::LookupFailed {
+            fqdn: "(dnssec resolver init)".to_string(),
+            reason: e.to_string(),
+        })?;
 
         tracing::debug!(nameservers = ?nameservers, "Created DNS resolver with custom nameservers");
         Ok(Self {
@@ -334,17 +349,23 @@ impl HickoryDnsResolver {
     /// Create a new resolver with custom configuration.
     pub async fn with_config(config: ResolverConfig, opts: ResolverOpts) -> Result<Self, DnsError> {
         let mut builder =
-            TokioResolver::builder_with_config(config.clone(), TokioConnectionProvider::default());
+            TokioResolver::builder_with_config(config.clone(), TokioRuntimeProvider::default());
         *builder.options_mut() = opts.clone();
-        let resolver = builder.build();
+        let resolver = builder.build().map_err(|e| DnsError::LookupFailed {
+            fqdn: "(resolver init)".to_string(),
+            reason: e.to_string(),
+        })?;
 
         // Create DNSSEC-validating resolver for TLSA lookups
         let mut dnssec_builder =
-            TokioResolver::builder_with_config(config, TokioConnectionProvider::default());
+            TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
         let dnssec_opts = dnssec_builder.options_mut();
         *dnssec_opts = opts;
         dnssec_opts.validate = true;
-        let dnssec_resolver = dnssec_builder.build();
+        let dnssec_resolver = dnssec_builder.build().map_err(|e| DnsError::LookupFailed {
+            fqdn: "(dnssec resolver init)".to_string(),
+            reason: e.to_string(),
+        })?;
 
         Ok(Self {
             resolver,
@@ -356,17 +377,23 @@ impl HickoryDnsResolver {
     pub async fn with_dnssec() -> Result<Self, DnsError> {
         let mut builder = TokioResolver::builder_with_config(
             ResolverConfig::default(),
-            TokioConnectionProvider::default(),
+            TokioRuntimeProvider::default(),
         );
         builder.options_mut().validate = true;
-        let resolver = builder.build();
+        let resolver = builder.build().map_err(|e| DnsError::LookupFailed {
+            fqdn: "(resolver init)".to_string(),
+            reason: e.to_string(),
+        })?;
 
         let mut dnssec_builder = TokioResolver::builder_with_config(
             ResolverConfig::default(),
-            TokioConnectionProvider::default(),
+            TokioRuntimeProvider::default(),
         );
         dnssec_builder.options_mut().validate = true;
-        let dnssec_resolver = dnssec_builder.build();
+        let dnssec_resolver = dnssec_builder.build().map_err(|e| DnsError::LookupFailed {
+            fqdn: "(dnssec resolver init)".to_string(),
+            reason: e.to_string(),
+        })?;
 
         Ok(Self {
             resolver,
@@ -384,42 +411,35 @@ impl HickoryDnsResolver {
     ) -> Result<DnsLookupResult<BadgeRecord>, DnsError> {
         let response = match self.resolver.txt_lookup(query_name).await {
             Ok(response) => response,
-            Err(e) => match e.kind() {
-                ResolveErrorKind::Proto(proto_err) => match proto_err.kind() {
-                    ProtoErrorKind::NoRecordsFound { .. } => {
-                        return Ok(DnsLookupResult::NotFound);
-                    }
-                    ProtoErrorKind::Timeout => {
-                        return Err(DnsError::Timeout {
-                            fqdn: fqdn.to_string(),
-                        });
-                    }
-                    _ => {
-                        return Err(DnsError::LookupFailed {
-                            fqdn: fqdn.to_string(),
-                            reason: e.to_string(),
-                        });
-                    }
-                },
-                _ => {
-                    return Err(DnsError::LookupFailed {
-                        fqdn: fqdn.to_string(),
-                        reason: e.to_string(),
-                    });
-                }
-            },
+            Err(NetError::Dns(HickoryDnsError::NoRecordsFound(_))) => {
+                return Ok(DnsLookupResult::NotFound);
+            }
+            Err(NetError::Timeout) => {
+                return Err(DnsError::Timeout {
+                    fqdn: fqdn.to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(DnsError::LookupFailed {
+                    fqdn: fqdn.to_string(),
+                    reason: e.to_string(),
+                });
+            }
         };
 
         let mut records = Vec::new();
-        for txt in response.iter() {
+        for record in response.answers() {
+            let RData::TXT(txt) = &record.data else {
+                continue;
+            };
             let txt_data: String = txt
-                .txt_data()
+                .txt_data
                 .iter()
                 .map(|d| String::from_utf8_lossy(d).to_string())
                 .collect::<String>();
 
             match BadgeRecord::parse(&txt_data) {
-                Ok(record) => records.push(record),
+                Ok(badge) => records.push(badge),
                 Err(_) => {
                     tracing::warn!(
                         fqdn = %fqdn,
@@ -438,7 +458,7 @@ impl HickoryDnsResolver {
     }
 }
 
-#[allow(clippy::too_many_lines)] // expanded error matching for hickory 0.25 ProtoErrorKind
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl DnsResolver for HickoryDnsResolver {
     async fn lookup_badge(&self, fqdn: &Fqdn) -> Result<DnsLookupResult<BadgeRecord>, DnsError> {
@@ -472,71 +492,56 @@ impl DnsResolver for HickoryDnsResolver {
 
         let response = match self.dnssec_resolver.tlsa_lookup(&query_name).await {
             Ok(response) => response,
-            Err(e) => {
-                match e.kind() {
-                    ResolveErrorKind::Proto(proto_err) => match proto_err.kind() {
-                        ProtoErrorKind::NoRecordsFound { response_code, .. } => {
-                            // ServFail from a DNSSEC-validating resolver typically means
-                            // the upstream rejected a bogus DNSSEC chain. Don't treat
-                            // this as "not found" — surface it as a DNSSEC failure.
-                            if *response_code == ResponseCode::ServFail {
-                                tracing::error!(
-                                    fqdn = %fqdn,
-                                    "TLSA lookup returned ServFail — possible DNSSEC failure"
-                                );
-                                return Err(DnsError::DnssecFailed {
-                                    fqdn: fqdn.to_string(),
-                                });
-                            }
-                            return Ok(DnsLookupResult::NotFound);
-                        }
-                        ProtoErrorKind::Timeout => {
-                            return Err(DnsError::Timeout {
-                                fqdn: fqdn.to_string(),
-                            });
-                        }
-                        // Typed DNSSEC negative response (new in hickory 0.25).
-                        ProtoErrorKind::Nsec { .. } => {
-                            tracing::error!(
-                                fqdn = %fqdn,
-                                error = %e,
-                                "DNSSEC validation failed for TLSA record (NSEC proof)"
-                            );
-                            return Err(DnsError::DnssecFailed {
-                                fqdn: fqdn.to_string(),
-                            });
-                        }
-                        // Fallback: string match for untyped DNSSEC errors.
-                        _ => {
-                            let err_str = proto_err.to_string();
-                            if matches_dnssec_pattern(&err_str) {
-                                tracing::error!(
-                                    fqdn = %fqdn,
-                                    error = %e,
-                                    "DNSSEC validation failed for TLSA record"
-                                );
-                                return Err(DnsError::DnssecFailed {
-                                    fqdn: fqdn.to_string(),
-                                });
-                            }
-                            tracing::warn!(
-                                fqdn = %fqdn,
-                                error = %proto_err,
-                                "Proto error did not match DNSSEC patterns, classifying as LookupFailed"
-                            );
-                            return Err(DnsError::LookupFailed {
-                                fqdn: fqdn.to_string(),
-                                reason: e.to_string(),
-                            });
-                        }
-                    },
-                    _ => {
-                        return Err(DnsError::LookupFailed {
-                            fqdn: fqdn.to_string(),
-                            reason: e.to_string(),
-                        });
-                    }
+            Err(NetError::Dns(HickoryDnsError::NoRecordsFound(HickoryNoRecords {
+                response_code,
+                ..
+            }))) => {
+                // ServFail from a DNSSEC-validating resolver typically means
+                // the upstream rejected a bogus DNSSEC chain. Don't treat
+                // this as "not found" — surface it as a DNSSEC failure.
+                if response_code == ResponseCode::ServFail {
+                    tracing::error!(
+                        fqdn = %fqdn,
+                        "TLSA lookup returned ServFail — possible DNSSEC failure"
+                    );
+                    return Err(DnsError::DnssecFailed {
+                        fqdn: fqdn.to_string(),
+                    });
                 }
+                return Ok(DnsLookupResult::NotFound);
+            }
+            Err(NetError::Timeout) => {
+                return Err(DnsError::Timeout {
+                    fqdn: fqdn.to_string(),
+                });
+            }
+            // DNSSEC negative proof — NSEC/NSEC3 authenticated denial of existence.
+            Err(NetError::Dns(HickoryDnsError::Nsec { .. })) => {
+                tracing::error!(
+                    fqdn = %fqdn,
+                    "DNSSEC validation failed for TLSA record (NSEC proof)"
+                );
+                return Err(DnsError::DnssecFailed {
+                    fqdn: fqdn.to_string(),
+                });
+            }
+            Err(e) => {
+                // Fallback: string match for untyped DNSSEC errors.
+                let err_str = e.to_string();
+                if matches_dnssec_pattern(&err_str) {
+                    tracing::error!(
+                        fqdn = %fqdn,
+                        error = %e,
+                        "DNSSEC validation failed for TLSA record"
+                    );
+                    return Err(DnsError::DnssecFailed {
+                        fqdn: fqdn.to_string(),
+                    });
+                }
+                return Err(DnsError::LookupFailed {
+                    fqdn: fqdn.to_string(),
+                    reason: e.to_string(),
+                });
             }
         };
 
@@ -553,14 +558,17 @@ impl DnsResolver for HickoryDnsResolver {
         );
 
         let mut records = Vec::new();
-        for tlsa in response.iter() {
+        for record in response.answers() {
+            let RData::TLSA(tlsa) = &record.data else {
+                continue;
+            };
             // Build RDATA from TLSA record fields
             let mut rdata = vec![
-                tlsa.cert_usage().into(),
-                tlsa.selector().into(),
-                tlsa.matching().into(),
+                u8::from(tlsa.cert_usage),
+                u8::from(tlsa.selector),
+                u8::from(tlsa.matching),
             ];
-            rdata.extend(tlsa.cert_data());
+            rdata.extend(&tlsa.cert_data);
 
             match TlsaRecord::from_rdata(&rdata) {
                 Ok(record) => {
@@ -918,45 +926,37 @@ mod tests {
     async fn test_real_dnssec_chain_validation_fails() {
         use hickory_resolver::TokioResolver;
         use hickory_resolver::config::LookupIpStrategy;
-        use hickory_resolver::name_server::TokioConnectionProvider;
+        use hickory_resolver::net::{DnsError as HickoryDnsError, NetError, NoRecords as HickoryNoRecords};
 
         let mut builder = TokioResolver::builder_with_config(
             hickory_resolver::config::ResolverConfig::default(),
-            TokioConnectionProvider::default(),
+            TokioRuntimeProvider::default(),
         );
         let opts = builder.options_mut();
         opts.validate = true;
         opts.ip_strategy = LookupIpStrategy::Ipv4Only;
-        let resolver = builder.build();
+        let resolver = builder.build().expect("resolver build must succeed");
 
         let result = resolver.lookup_ip("dnssec-failed.org.").await;
         let err = result.expect_err("dnssec-failed.org must not resolve — DNSSEC chain is broken");
 
-        match err.kind() {
-            ResolveErrorKind::Proto(proto_err) => match proto_err.kind() {
-                // Upstream DNSSEC validation: resolver returns ServFail for bogus chain.
-                ProtoErrorKind::NoRecordsFound { response_code, .. }
-                    if *response_code == ResponseCode::ServFail => {}
+        match err {
+            // Upstream DNSSEC validation: resolver returns ServFail for bogus chain.
+            NetError::Dns(HickoryDnsError::NoRecordsFound(HickoryNoRecords {
+                response_code: ResponseCode::ServFail,
+                ..
+            })) => {}
 
-                // Typed DNSSEC negative response (new in hickory 0.25).
-                ProtoErrorKind::Nsec { .. } => {}
+            // Typed DNSSEC negative response (NSEC/NSEC3 denial).
+            NetError::Dns(HickoryDnsError::Nsec { .. }) => {}
 
-                // Client-side DNSSEC validation via string-based Proto error.
-                _ => {
-                    let err_str = proto_err.to_string();
-                    assert!(
-                        matches_dnssec_pattern(&err_str),
-                        "Proto error from dnssec-failed.org did not match DNSSEC \
-                         detection patterns. Hickory may have changed error format. \
-                         Error: {err_str}"
-                    );
-                }
-            },
-
+            // Client-side DNSSEC validation via string-based error.
             other => {
-                panic!(
-                    "Expected Proto DNSSEC error for dnssec-failed.org, \
-                     got: {other:?}"
+                let err_str = other.to_string();
+                assert!(
+                    matches_dnssec_pattern(&err_str),
+                    "Error from dnssec-failed.org did not match DNSSEC detection patterns. \
+                     Hickory may have changed error format. Error: {err_str}"
                 );
             }
         }
@@ -1070,7 +1070,7 @@ mod tests {
     #[tokio::test]
     async fn test_hickory_with_config() {
         let resolver =
-            HickoryDnsResolver::with_config(ResolverConfig::cloudflare(), ResolverOpts::default())
+            HickoryDnsResolver::with_config(ResolverConfig::udp_and_tcp(&CLOUDFLARE), ResolverOpts::default())
                 .await;
         assert!(resolver.is_ok());
     }
