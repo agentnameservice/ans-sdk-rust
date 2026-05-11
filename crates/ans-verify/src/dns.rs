@@ -5,8 +5,8 @@ use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{
     CLOUDFLARE, GOOGLE, NameServerConfig, QUAD9, ResolverConfig, ResolverOpts,
 };
-use hickory_resolver::net::{DnsError as HickoryDnsError, NetError, NoRecords as HickoryNoRecords};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::{DnsError as HickoryDnsError, NetError, NoRecords as HickoryNoRecords};
 use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::rr::RData;
 use std::fmt;
@@ -46,9 +46,15 @@ impl DnsResolverConfig {
                     reason: format!("failed to read system DNS config: {e}"),
                 }
             }),
-            Self::Cloudflare => Ok((ResolverConfig::udp_and_tcp(&CLOUDFLARE), ResolverOpts::default())),
+            Self::Cloudflare => Ok((
+                ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+                ResolverOpts::default(),
+            )),
             Self::CloudflareTls => Ok((ResolverConfig::tls(&CLOUDFLARE), ResolverOpts::default())),
-            Self::Google => Ok((ResolverConfig::udp_and_tcp(&GOOGLE), ResolverOpts::default())),
+            Self::Google => Ok((
+                ResolverConfig::udp_and_tcp(&GOOGLE),
+                ResolverOpts::default(),
+            )),
             Self::GoogleTls => Ok((ResolverConfig::tls(&GOOGLE), ResolverOpts::default())),
             Self::Quad9 => Ok((ResolverConfig::udp_and_tcp(&QUAD9), ResolverOpts::default())),
             Self::Quad9Tls => Ok((ResolverConfig::tls(&QUAD9), ResolverOpts::default())),
@@ -316,11 +322,11 @@ impl HickoryDnsResolver {
     pub async fn with_nameservers(nameservers: &[Ipv4Addr]) -> Result<Self, DnsError> {
         let ips: Vec<IpAddr> = nameservers.iter().map(|ip| IpAddr::V4(*ip)).collect();
 
-        let name_servers: Vec<NameServerConfig> = ips
+        let ns_configs: Vec<NameServerConfig> = ips
             .iter()
             .map(|ip| NameServerConfig::udp_and_tcp(*ip))
             .collect();
-        let config = ResolverConfig::from_parts(None, vec![], name_servers);
+        let config = ResolverConfig::from_parts(None, vec![], ns_configs);
 
         let resolver =
             TokioResolver::builder_with_config(config.clone(), TokioRuntimeProvider::default())
@@ -926,7 +932,9 @@ mod tests {
     async fn test_real_dnssec_chain_validation_fails() {
         use hickory_resolver::TokioResolver;
         use hickory_resolver::config::LookupIpStrategy;
-        use hickory_resolver::net::{DnsError as HickoryDnsError, NetError, NoRecords as HickoryNoRecords};
+        use hickory_resolver::net::{
+            DnsError as HickoryDnsError, NetError, NoRecords as HickoryNoRecords,
+        };
 
         let mut builder = TokioResolver::builder_with_config(
             hickory_resolver::config::ResolverConfig::default(),
@@ -1069,9 +1077,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_hickory_with_config() {
-        let resolver =
-            HickoryDnsResolver::with_config(ResolverConfig::udp_and_tcp(&CLOUDFLARE), ResolverOpts::default())
-                .await;
+        let resolver = HickoryDnsResolver::with_config(
+            ResolverConfig::udp_and_tcp(&CLOUDFLARE),
+            ResolverOpts::default(),
+        )
+        .await;
         assert!(resolver.is_ok());
     }
 
