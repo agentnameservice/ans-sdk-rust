@@ -90,7 +90,7 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 rcgen = { workspace = true }
-rmcp = { version = "1.2", features = ["client", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "1.6", features = ["client", "transport-streamable-http-client-reqwest"] }
 anyhow = "1.0"
 webpki-roots = "1.0"
 
