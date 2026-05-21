@@ -28,7 +28,7 @@
 
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
-    KeyUsagePurpose, SanType,
+    KeyUsagePurpose, PKCS_RSA_SHA256, SanType,
 };
 use thiserror::Error;
 
@@ -120,16 +120,10 @@ impl AnsCsrBuilder {
 }
 
 fn generate_rsa_key_pair() -> Result<KeyPair, CsrError> {
-    use rsa::pkcs8::EncodePrivateKey as _;
-
-    let private_key = rsa::RsaPrivateKey::new(&mut rand_core::OsRng, 2048)
-        .map_err(|e| CsrError::KeyGeneration(e.to_string()))?;
-
-    let pem = private_key
-        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
-        .map_err(|e| CsrError::KeyGeneration(e.to_string()))?;
-
-    KeyPair::from_pem(pem.as_str()).map_err(CsrError::Serialization)
+    // RSA-2048 key generation via aws-lc-rs (BoringSSL).  The `ring` crate
+    // does not support RSA key generation; the `rsa` pure-Rust crate carries
+    // RUSTSEC-2023-0071 (Marvin Attack timing side-channel in decryption).
+    KeyPair::generate_for(&PKCS_RSA_SHA256).map_err(CsrError::Serialization)
 }
 
 fn build_csr(
