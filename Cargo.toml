@@ -36,7 +36,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 
 # DNS resolution
-hickory-resolver = { version = "0.25", features = ["tls-ring", "dnssec-ring", "system-config"] }
+hickory-resolver = { version = "0.26", features = ["tls-ring", "dnssec-ring", "system-config"] }
 
 # Cryptography
 sha2 = "0.10"
