@@ -11,10 +11,6 @@
 //! | Server      | `ServerAuth` | `DigitalSignature`, `KeyEncipherment` |
 //! | Identity    | `ClientAuth` | `DigitalSignature`                    |
 //!
-//! Both types carry a SAN URI of the form `ans://v{version}.{host}` and use
-//! RSA-2048 keys. ANS PKI silently rejects ECDSA keys; this builder avoids
-//! that class of failure entirely.
-//!
 //! ## Example
 //!
 //! ```rust,no_run
