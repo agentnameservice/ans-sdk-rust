@@ -34,6 +34,11 @@ thiserror = { workspace = true }
 # Secret management
 secrecy = { workspace = true }
 
+# CSR generation
+rcgen = { workspace = true }
+rsa = { workspace = true }
+rand_core = "0.6"
+
 # Utilities
 chrono = { workspace = true }
 url = { workspace = true }

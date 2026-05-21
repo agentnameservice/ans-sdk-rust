@@ -8,6 +8,7 @@
 //! ## Features
 //!
 //! - Agent registration and renewal
+//! - Certificate signing request generation ([`csr::AnsCsrBuilder`])
 //! - Certificate signing request submission
 //! - Agent search and resolution
 //! - Domain validation (ACME, DNS)
@@ -70,14 +71,19 @@
 //! 5. Call `verify_dns()` to complete registration
 //!
 //! ```rust,no_run
-//! # use ans_client::{AnsClient, models::*};
-//! # async fn example() -> ans_client::Result<()> {
+//! # use ans_client::{AnsClient, AnsCsrBuilder, models::*};
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let client = AnsClient::builder()
 //!     .base_url("https://api.godaddy.com")
 //!     .jwt("token")
 //!     .build()?;
 //!
-//! // Step 1: Register
+//! // Step 1: Generate CSRs with correct extensions and RSA-2048 keys
+//! let server = AnsCsrBuilder::server("agent.example.com", "1.0.0").build()?;
+//! let identity = AnsCsrBuilder::identity("agent.example.com", "1.0.0").build()?;
+//! // store server.private_key_pem and identity.private_key_pem securely
+//!
+//! // Step 2: Register
 //! let endpoint = AgentEndpoint::new("https://agent.example.com/mcp", Protocol::Mcp)
 //!     .with_transports(vec![Transport::StreamableHttp]);
 //!
@@ -85,30 +91,32 @@
 //!     "my-agent",
 //!     "agent.example.com",
 //!     "1.0.0",
-//!     "-----BEGIN CERTIFICATE REQUEST-----...",
+//!     &identity.csr_pem,
 //!     vec![endpoint],
 //! )
-//! .with_server_csr_pem("-----BEGIN CERTIFICATE REQUEST-----...");
+//! .with_server_csr_pem(&server.csr_pem);
 //!
 //! let pending = client.register_agent(&request).await?;
 //! let agent_id = pending.agent_id.expect("agent_id");
 //!
-//! // Step 2-3: Configure challenge, then verify
-//! // ... configure DNS or HTTP challenge ...
-//! let status = client.verify_acme(&agent_id).await?;
+//! // Step 3: Configure ACME challenge, then verify
+//! // ... add _acme-challenge DNS TXT record from pending.dns_records ...
+//! let _status = client.verify_acme(&agent_id).await?;
 //!
-//! // Step 4-5: Configure DNS records, then verify
+//! // Step 4: Configure DNS records, then verify
 //! // ... configure DNS records from pending.dns_records ...
-//! let status = client.verify_dns(&agent_id).await?;
+//! let _status = client.verify_dns(&agent_id).await?;
 //! # Ok(())
 //! # }
 //! ```
 
 pub mod client;
+pub mod csr;
 pub mod error;
 pub mod models;
 
 pub use client::{AnsClient, AnsClientBuilder, Auth};
+pub use csr::{AnsCsrBuilder, CsrOutput};
 pub use error::{ClientError, HttpError, Result};
 
 // Re-export types from ans-types for convenience
