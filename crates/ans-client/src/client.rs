@@ -360,6 +360,8 @@ impl AnsClient {
             req = req
                 .header(header::CONTENT_TYPE, "application/json")
                 .json(body);
+        } else if method == "POST" || method == "PUT" || method == "PATCH" {
+            req = req.header(header::CONTENT_LENGTH, "0");
         }
         self.send(req).await
     }
