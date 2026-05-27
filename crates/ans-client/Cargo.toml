@@ -34,6 +34,11 @@ thiserror = { workspace = true }
 # Secret management
 secrecy = { workspace = true }
 
+# CSR generation — aws_lc_rs feature enables RSA key generation via aws-lc-rs
+# (BoringSSL fork); the pure-Rust `rsa` crate is not used because it carries
+# RUSTSEC-2023-0071 (Marvin Attack timing side-channel in RSA decryption).
+rcgen = { workspace = true, features = ["aws_lc_rs"] }
+
 # Utilities
 chrono = { workspace = true }
 url = { workspace = true }
@@ -48,3 +53,4 @@ rstest = { workspace = true }
 test-log = { workspace = true }
 tracing-subscriber = { workspace = true }
 rand = { workspace = true }
+x509-parser = { workspace = true }
