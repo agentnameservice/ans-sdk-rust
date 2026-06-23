@@ -11,8 +11,8 @@ version = "0.1.4"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-homepage = "https://github.com/godaddy/ans-sdk-rust"
-repository = "https://github.com/godaddy/ans-sdk-rust"
+homepage = "https://github.com/agentnameservice/ans-sdk-rust"
+repository = "https://github.com/agentnameservice/ans-sdk-rust"
 
 [workspace.dependencies]
 # Internal crates
