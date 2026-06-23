@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.1.5](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-verify-v0.1.4...ans-verify-v0.1.5) (2026-06-23)
+
+
+### Bug Fixes
+
+* **deps:** upgrade hickory-resolver 0.25 → 0.26 to fix RUSTSEC-2026-0118/0119 ([#53](https://github.com/agentnameservice/ans-sdk-rust/issues/53)) ([c46e99e](https://github.com/agentnameservice/ans-sdk-rust/commit/c46e99e15fcde00613035aca53701dc71b8a280b))
+
+
+### Build System
+
+* **deps:** Bump the rust-dependencies group across 1 directory with 10 updates ([#62](https://github.com/agentnameservice/ans-sdk-rust/issues/62)) ([3d53b5d](https://github.com/agentnameservice/ans-sdk-rust/commit/3d53b5dd7f78b39d40c6ad3ad7c6969013374ffb))
+
 ## [0.1.4](https://github.com/godaddy/ans-sdk-rust/compare/ans-verify-v0.1.3...ans-verify-v0.1.4) (2026-04-15)
 
 

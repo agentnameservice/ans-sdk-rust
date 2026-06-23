@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "ans-client"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ans-types",
  "chrono",
@@ -46,7 +46,7 @@ dependencies = [
 
 [[package]]
 name = "ans-types"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "hex",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "ans-verify"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ans-types",
  "anyhow",

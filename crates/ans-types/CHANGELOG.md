@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-types-v0.1.4...ans-types-v0.1.5) (2026-06-23)
+
+
+### Miscellaneous
+
+* **ans-types:** Synchronize ans-sdk versions
+
 ## [0.1.4](https://github.com/godaddy/ans-sdk-rust/compare/ans-types-v0.1.3...ans-types-v0.1.4) (2026-04-15)
 
 
