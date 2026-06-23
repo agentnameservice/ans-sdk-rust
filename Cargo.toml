@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -16,9 +16,9 @@ repository = "https://github.com/agentnameservice/ans-sdk-rust"
 
 [workspace.dependencies]
 # Internal crates
-ans-types = { path = "crates/ans-types", version = "0.1.5" }
-ans-verify = { path = "crates/ans-verify", version = "0.1.5" }
-ans-client = { path = "crates/ans-client", version = "0.1.5" }
+ans-types = { path = "crates/ans-types", version = "0.1.6" }
+ans-verify = { path = "crates/ans-verify", version = "0.1.6" }
+ans-client = { path = "crates/ans-client", version = "0.1.6" }
 
 # Async runtime
 tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }

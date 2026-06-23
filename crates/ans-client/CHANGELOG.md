@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-client-v0.1.5...ans-client-v0.1.6) (2026-06-23)
+
+
+### Miscellaneous
+
+* **ans-client:** Synchronize ans-sdk versions
+
 ## [0.1.5](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-client-v0.1.4...ans-client-v0.1.5) (2026-06-23)
 
 
