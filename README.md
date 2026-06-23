@@ -33,13 +33,13 @@ Add to your `Cargo.toml`:
 ```toml
 [dependencies]
 # For verification
-ans-verify = { git = "https://github.com/godaddy/ans-sdk-rust" }
+ans-verify = { git = "https://github.com/agentnameservice/ans-sdk-rust" }
 
 # For API client
-ans-client = { git = "https://github.com/godaddy/ans-sdk-rust" }
+ans-client = { git = "https://github.com/agentnameservice/ans-sdk-rust" }
 
 # For shared types only
-ans-types = { git = "https://github.com/godaddy/ans-sdk-rust" }
+ans-types = { git = "https://github.com/agentnameservice/ans-sdk-rust" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
