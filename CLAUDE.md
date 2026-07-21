@@ -75,6 +75,10 @@ No local tooling required — everything happens in CI.
 - `feat!: redesign verifier API` or `BREAKING CHANGE:` footer → bumps major version
 - `chore:`, `ci:`, `docs:`, `test:` → no version bump, no changelog entry
 
+**Commit sign-off (required):**
+All commits must include a `Signed-off-by` trailer per the [Developer Certificate of Origin](https://developercertificate.org/).
+Always commit with `git commit -s` (or add the trailer manually) — unsigned commits must be amended with `git commit --amend -s` before merging.
+
 **What CI does on release (`.github/workflows/release.yml`):**
 1. Runs full CI gate (fmt, clippy, test, MSRV, audit, cargo-deny)
 2. Dry-run publish check
