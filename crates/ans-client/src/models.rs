@@ -7,6 +7,22 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+/// Deserialize a JSON `null` as the type's default value.
+///
+/// The reference Registration Authority is written in Go, whose
+/// `encoding/json` marshals a nil slice as `null` rather than omitting
+/// the key or emitting `[]` (e.g. `"pendingSteps": null` on an ACTIVE
+/// agent's verify response). `#[serde(default, deserialize_with = "null_as_default")]` alone only covers an
+/// absent key, so list fields on response models pair it with this
+/// helper to accept all three spellings: absent, `null`, and `[]`.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Communication protocol used by agents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -129,6 +145,32 @@ impl AgentEndpoint {
     }
 }
 
+/// DNS record family the Registration Authority tells the operator to
+/// publish for an agent registration.
+///
+/// Selected via
+/// [`AgentRegistrationRequest::with_discovery_profiles`]. Discovery
+/// profiles are a V2-lane feature
+/// ([`ApiVersion::V2`](crate::ApiVersion)): the V1 lane ignores the
+/// field server-side and always emits the [`AnsTxt`](Self::AnsTxt)
+/// family. Wire values are the V2 register schema's `CONSTANT_CASE` enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum DiscoveryProfile {
+    /// DNS-AID-aligned Consolidated Approach (RFC 9460): one SVCB row
+    /// per protocol endpoint at the bare FQDN plus the `_ans-badge` TXT
+    /// and TLSA trust records. The server default when the request
+    /// omits discovery profiles.
+    #[serde(rename = "ANS_DNSAID")]
+    AnsDnsaid,
+    /// Original `_ans` TXT shape (one row per protocol at
+    /// `_ans.{fqdn}`) plus an HTTPS RR at the bare FQDN and the same
+    /// trust records. Opt-in for operators with zone-edit tooling that
+    /// targets `_ans.{fqdn}`.
+    #[serde(rename = "ANS_TXT")]
+    AnsTxt,
+}
+
 /// Request to register a new agent.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,6 +205,13 @@ pub struct AgentRegistrationRequest {
     pub server_certificate_chain_pem: Option<String>,
     /// Agent endpoints.
     pub endpoints: Vec<AgentEndpoint>,
+    /// DNS record families the RA asks the operator to publish (V2
+    /// lane only — see [`DiscoveryProfile`]). Empty means the field is
+    /// omitted on the wire and the server applies its default
+    /// ([`DiscoveryProfile::AnsDnsaid`]); send both values to publish
+    /// the union during a transition.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub discovery_profiles: Vec<DiscoveryProfile>,
 }
 
 impl AgentRegistrationRequest {
@@ -184,7 +233,15 @@ impl AgentRegistrationRequest {
             server_certificate_pem: None,
             server_certificate_chain_pem: None,
             endpoints,
+            discovery_profiles: Vec::new(),
         }
+    }
+
+    /// Set the DNS discovery profiles (V2 lane only — see
+    /// [`DiscoveryProfile`]).
+    pub fn with_discovery_profiles(mut self, profiles: Vec<DiscoveryProfile>) -> Self {
+        self.discovery_profiles = profiles;
+        self
     }
 
     /// Set the agent description.
@@ -260,7 +317,11 @@ pub struct Link {
 pub struct DnsRecord {
     /// Full DNS record name.
     pub name: String,
-    /// Record type (HTTPS, TLSA, TXT).
+    /// Record type (SVCB, HTTPS, TLSA, TXT).
+    ///
+    /// Kept as a string rather than an enum so record families added by
+    /// the server (e.g. the RFC 9460 SVCB rows the `ANS_DNSAID` discovery
+    /// profile emits) deserialize without an SDK update.
     #[serde(rename = "type")]
     pub record_type: String,
     /// Record value.
@@ -383,16 +444,16 @@ pub struct RegistrationPending {
     /// Required actions.
     pub next_steps: Vec<NextStep>,
     /// ACME challenges.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub challenges: Vec<ChallengeInfo>,
     /// DNS records to configure.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub dns_records: Vec<DnsRecord>,
     /// Registration expiration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
     /// HATEOAS links.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub links: Vec<Link>,
 }
 
@@ -451,10 +512,10 @@ pub struct AgentStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<RegistrationPhase>,
     /// Completed steps.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub completed_steps: Vec<String>,
     /// Pending steps.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub pending_steps: Vec<String>,
     /// When created.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -499,7 +560,7 @@ pub struct AgentDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registration_pending: Option<RegistrationPending>,
     /// HATEOAS links.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub links: Vec<Link>,
 }
 
@@ -549,7 +610,7 @@ pub struct AgentSearchResult {
     /// Endpoints.
     pub endpoints: Vec<AgentEndpoint>,
     /// HATEOAS links.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub links: Vec<Link>,
 }
 

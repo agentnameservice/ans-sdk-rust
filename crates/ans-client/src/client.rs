@@ -99,6 +99,34 @@ impl Auth {
     }
 }
 
+/// Registration Authority API lane targeted by the agent-lifecycle and
+/// certificate methods.
+///
+/// The two lanes expose the same request/response shapes for the routes
+/// this client maps; they differ in path (`/v1/agents/...` vs
+/// `/v2/ans/agents/...`) and in which features the server enables:
+/// DNS discovery profiles
+/// ([`AgentRegistrationRequest::discovery_profiles`](crate::models::AgentRegistrationRequest))
+/// only take effect on the V2 lane, where the server default is the
+/// DNS-AID SVCB family ([`DiscoveryProfile::AnsDnsaid`](crate::models::DiscoveryProfile));
+/// the V1 lane is pinned server-side to the legacy `_ans` TXT family.
+///
+/// Routes that only exist on the V1 surface —
+/// [`search_agents`](AnsClient::search_agents),
+/// [`resolve_agent`](AnsClient::resolve_agent), and
+/// [`get_events`](AnsClient::get_events) — keep their paths
+/// regardless of this setting, so selecting [`ApiVersion::V2`] never
+/// changes the behavior of a route without a V2 twin.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ApiVersion {
+    /// The original `/v1/agents` lane (default).
+    #[default]
+    V1,
+    /// The `/v2/ans/agents` lane.
+    V2,
+}
+
 /// Builder for constructing an [`AnsClient`].
 #[derive(Debug)]
 pub struct AnsClientBuilder {
@@ -107,6 +135,7 @@ pub struct AnsClientBuilder {
     timeout: Duration,
     extra_headers: Vec<(String, String)>,
     allow_insecure: bool,
+    api_version: ApiVersion,
 }
 
 impl Default for AnsClientBuilder {
@@ -124,7 +153,30 @@ impl AnsClientBuilder {
             timeout: DEFAULT_TIMEOUT,
             extra_headers: Vec::new(),
             allow_insecure: false,
+            api_version: ApiVersion::default(),
         }
+    }
+
+    /// Select the RA API lane for agent-lifecycle and certificate routes.
+    ///
+    /// Defaults to [`ApiVersion::V1`]. Select [`ApiVersion::V2`] to
+    /// register with DNS discovery profiles — see [`ApiVersion`] for the
+    /// lane semantics.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use ans_client::{AnsClient, ApiVersion};
+    ///
+    /// let client = AnsClient::builder()
+    ///     .base_url("https://api.godaddy.com")
+    ///     .api_version(ApiVersion::V2)
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn api_version(mut self, version: ApiVersion) -> Self {
+        self.api_version = version;
+        self
     }
 
     /// Set the base URL for API requests.
@@ -260,6 +312,7 @@ impl AnsClientBuilder {
             auth: self.auth,
             http_client,
             extra_headers,
+            api_version: self.api_version,
         })
     }
 }
@@ -274,6 +327,7 @@ pub struct AnsClient {
     auth: Option<Auth>,
     http_client: Client,
     extra_headers: HeaderMap,
+    api_version: ApiVersion,
 }
 
 impl AnsClient {
@@ -294,6 +348,37 @@ impl AnsClient {
         self.base_url
             .join(path)
             .map_err(|e| ClientError::InvalidUrl(e.to_string()))
+    }
+
+    /// Lane-specific agents collection path.
+    fn agents_collection_path(&self) -> &'static str {
+        match self.api_version {
+            ApiVersion::V1 => "/v1/agents",
+            ApiVersion::V2 => "/v2/ans/agents",
+        }
+    }
+
+    /// Lane-specific registration route: the V1 lane registers at
+    /// `POST /v1/agents/register`, the V2 lane at the collection itself
+    /// (`POST /v2/ans/agents`).
+    fn register_path(&self) -> &'static str {
+        match self.api_version {
+            ApiVersion::V1 => "/v1/agents/register",
+            ApiVersion::V2 => "/v2/ans/agents",
+        }
+    }
+
+    /// Lane-specific path for one agent with an optional trailing
+    /// suffix. The agent ID is URL-encoded here; callers encode any
+    /// suffix segment carrying user input (e.g. a CSR ID).
+    fn agent_path(&self, agent_id: &str, suffix: &str) -> String {
+        let base = self.agents_collection_path();
+        let id = urlencoding::encode(agent_id);
+        if suffix.is_empty() {
+            format!("{base}/{id}")
+        } else {
+            format!("{base}/{id}/{suffix}")
+        }
     }
 
     /// Build a request with common headers and authentication.
@@ -375,6 +460,14 @@ impl AnsClient {
     /// Returns the pending registration details including required next steps
     /// for completing registration (DNS configuration, domain validation, etc.).
     ///
+    /// On the V2 lane ([`ApiVersion::V2`]) the request's
+    /// [`discovery_profiles`](AgentRegistrationRequest::discovery_profiles)
+    /// select which DNS record families the RA asks the operator to
+    /// publish (omitted → the server default,
+    /// [`DiscoveryProfile::AnsDnsaid`](crate::models::DiscoveryProfile)).
+    /// The V1 lane ignores the field server-side and always emits the
+    /// legacy `_ans` TXT family.
+    ///
     /// # Errors
     ///
     /// - [`ClientError::Conflict`] if the agent is already registered
@@ -384,7 +477,7 @@ impl AnsClient {
         &self,
         request: &AgentRegistrationRequest,
     ) -> Result<RegistrationPending> {
-        self.request("POST", "/v1/agents/register", Some(request))
+        self.request("POST", self.register_path(), Some(request))
             .await
     }
 
@@ -395,11 +488,15 @@ impl AnsClient {
     /// - [`ClientError::NotFound`] if the agent doesn't exist
     #[instrument(skip(self))]
     pub async fn get_agent(&self, agent_id: &str) -> Result<AgentDetails> {
-        let path = format!("/v1/agents/{}", urlencoding::encode(agent_id));
+        let path = self.agent_path(agent_id, "");
         self.request("GET", &path, None::<&()>).await
     }
 
     /// Search for agents.
+    ///
+    /// This search surface (its filter set and response shape) only
+    /// exists on the V1 lane, so the path is not affected by
+    /// [`ApiVersion`].
     ///
     /// # Arguments
     ///
@@ -440,6 +537,9 @@ impl AnsClient {
 
     /// Resolve an ANS name to agent details.
     ///
+    /// This route only exists on the V1 surface, so the path is not
+    /// affected by [`ApiVersion`].
+    ///
     /// # Arguments
     ///
     /// * `agent_host` - The agent's host domain
@@ -472,7 +572,7 @@ impl AnsClient {
     /// - [`ClientError::InvalidRequest`] if validation fails
     #[instrument(skip(self))]
     pub async fn verify_acme(&self, agent_id: &str) -> Result<AgentStatus> {
-        let path = format!("/v1/agents/{}/verify-acme", urlencoding::encode(agent_id));
+        let path = self.agent_path(agent_id, "verify-acme");
         self.request("POST", &path, None::<&()>).await
     }
 
@@ -486,7 +586,7 @@ impl AnsClient {
     /// - [`ClientError::InvalidRequest`] if DNS verification fails
     #[instrument(skip(self))]
     pub async fn verify_dns(&self, agent_id: &str) -> Result<AgentStatus> {
-        let path = format!("/v1/agents/{}/verify-dns", urlencoding::encode(agent_id));
+        let path = self.agent_path(agent_id, "verify-dns");
         self.request("POST", &path, None::<&()>).await
     }
 
@@ -500,10 +600,7 @@ impl AnsClient {
         &self,
         agent_id: &str,
     ) -> Result<Vec<CertificateResponse>> {
-        let path = format!(
-            "/v1/agents/{}/certificates/server",
-            urlencoding::encode(agent_id)
-        );
+        let path = self.agent_path(agent_id, "certificates/server");
         self.request("GET", &path, None::<&()>).await
     }
 
@@ -513,10 +610,7 @@ impl AnsClient {
         &self,
         agent_id: &str,
     ) -> Result<Vec<CertificateResponse>> {
-        let path = format!(
-            "/v1/agents/{}/certificates/identity",
-            urlencoding::encode(agent_id)
-        );
+        let path = self.agent_path(agent_id, "certificates/identity");
         self.request("GET", &path, None::<&()>).await
     }
 
@@ -527,10 +621,7 @@ impl AnsClient {
         agent_id: &str,
         csr_pem: &str,
     ) -> Result<CsrSubmissionResponse> {
-        let path = format!(
-            "/v1/agents/{}/certificates/server",
-            urlencoding::encode(agent_id)
-        );
+        let path = self.agent_path(agent_id, "certificates/server");
         let request = CsrSubmissionRequest {
             csr_pem: csr_pem.to_string(),
         };
@@ -544,10 +635,7 @@ impl AnsClient {
         agent_id: &str,
         csr_pem: &str,
     ) -> Result<CsrSubmissionResponse> {
-        let path = format!(
-            "/v1/agents/{}/certificates/identity",
-            urlencoding::encode(agent_id)
-        );
+        let path = self.agent_path(agent_id, "certificates/identity");
         let request = CsrSubmissionRequest {
             csr_pem: csr_pem.to_string(),
         };
@@ -557,11 +645,8 @@ impl AnsClient {
     /// Get CSR status.
     #[instrument(skip(self))]
     pub async fn get_csr_status(&self, agent_id: &str, csr_id: &str) -> Result<CsrStatusResponse> {
-        let path = format!(
-            "/v1/agents/{}/csrs/{}/status",
-            urlencoding::encode(agent_id),
-            urlencoding::encode(csr_id)
-        );
+        let suffix = format!("csrs/{}/status", urlencoding::encode(csr_id));
+        let path = self.agent_path(agent_id, &suffix);
         self.request("GET", &path, None::<&()>).await
     }
 
@@ -584,7 +669,7 @@ impl AnsClient {
         reason: RevocationReason,
         comments: Option<&str>,
     ) -> Result<AgentRevocationResponse> {
-        let path = format!("/v1/agents/{}/revoke", urlencoding::encode(agent_id));
+        let path = self.agent_path(agent_id, "revoke");
         let request = AgentRevocationRequest {
             reason,
             comments: comments.map(String::from),
@@ -599,7 +684,9 @@ impl AnsClient {
     /// Get paginated agent events.
     ///
     /// This endpoint is used by Agent Host Providers (AHPs) to track agent
-    /// registration events across the system.
+    /// registration events across the system. The events feed is a
+    /// lane-neutral route served at `/v1/agents/events` regardless of
+    /// [`ApiVersion`].
     ///
     /// # Arguments
     ///
