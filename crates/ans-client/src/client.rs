@@ -465,11 +465,16 @@ impl AnsClient {
     /// select which DNS record families the RA asks the operator to
     /// publish (omitted → the server default,
     /// [`DiscoveryProfile::AnsDnsaid`](crate::models::DiscoveryProfile)).
-    /// The V1 lane ignores the field server-side and always emits the
-    /// legacy `_ans` TXT family.
+    /// A non-empty set on the default V1 lane is rejected client-side:
+    /// the V1 lane ignores the field server-side and always emits the
+    /// `_ans` TXT family, so forwarding it would silently drop an
+    /// explicit choice — the registration would succeed with TXT
+    /// records and no signal anywhere.
     ///
     /// # Errors
     ///
+    /// - [`ClientError::Configuration`] if `discovery_profiles` is set
+    ///   without [`ApiVersion::V2`]
     /// - [`ClientError::Conflict`] if the agent is already registered
     /// - [`ClientError::InvalidRequest`] if the request is invalid
     #[instrument(skip(self, request), fields(agent_host = %request.agent_host))]
@@ -477,6 +482,12 @@ impl AnsClient {
         &self,
         request: &AgentRegistrationRequest,
     ) -> Result<RegistrationPending> {
+        if self.api_version != ApiVersion::V2 && !request.discovery_profiles.is_empty() {
+            return Err(ClientError::Configuration(
+                "discovery_profiles requires ApiVersion::V2; the V1 lane ignores the field"
+                    .to_string(),
+            ));
+        }
         self.request("POST", self.register_path(), Some(request))
             .await
     }

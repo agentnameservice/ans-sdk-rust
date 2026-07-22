@@ -12,9 +12,9 @@ use uuid::Uuid;
 /// The reference Registration Authority is written in Go, whose
 /// `encoding/json` marshals a nil slice as `null` rather than omitting
 /// the key or emitting `[]` (e.g. `"pendingSteps": null` on an ACTIVE
-/// agent's verify response). `#[serde(default, deserialize_with = "null_as_default")]` alone only covers an
-/// absent key, so list fields on response models pair it with this
-/// helper to accept all three spellings: absent, `null`, and `[]`.
+/// agent's verify response). `#[serde(default)]` alone only covers an
+/// absent key, so defaulted list fields on response models pair it with
+/// this helper to accept all three spellings: absent, `null`, and `[]`.
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -153,8 +153,18 @@ impl AgentEndpoint {
 /// profiles are a V2-lane feature
 /// ([`ApiVersion::V2`](crate::ApiVersion)): the V1 lane ignores the
 /// field server-side and always emits the [`AnsTxt`](Self::AnsTxt)
-/// family. Wire values are the V2 register schema's `CONSTANT_CASE` enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// family, so [`register_agent`](crate::AnsClient::register_agent)
+/// rejects a non-empty set on a V1-lane client. Wire values are the V2
+/// register schema's `CONSTANT_CASE` enum.
+///
+/// `Serialize`-only by design: the enum appears only in the
+/// `Serialize`-only registration request today, and deriving
+/// `Deserialize` on a `#[non_exhaustive]` enum would make one unknown
+/// future value fail a whole response parse — the failure mode the
+/// deliberately-`String` [`DnsRecord::record_type`] exists to avoid.
+/// Add a `#[serde(other)]` catch-all if this ever becomes
+/// response-visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[non_exhaustive]
 pub enum DiscoveryProfile {
     /// DNS-AID-aligned Consolidated Approach (RFC 9460): one SVCB row

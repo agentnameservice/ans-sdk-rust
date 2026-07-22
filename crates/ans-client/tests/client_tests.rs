@@ -1127,3 +1127,30 @@ async fn test_agent_status_null_step_lists_deserialize() {
     assert!(status.completed_steps.is_empty());
     assert!(status.pending_steps.is_empty());
 }
+
+/// Discovery profiles on the default V1 lane are rejected client-side
+/// before any request is sent — the V1 lane ignores the field
+/// server-side, so forwarding it would silently drop an explicit SVCB
+/// choice. Decided jointly with the Go SDK twin, which guards the same
+/// combination in RegisterAgent.
+#[tokio::test]
+async fn test_register_discovery_profiles_rejected_on_v1_lane() {
+    let server = MockServer::start().await;
+    let client = test_client(&server); // default V1 lane
+
+    // expect(0): the guard must fire before any HTTP request.
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/register"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let request =
+        sample_registration_request().with_discovery_profiles(vec![DiscoveryProfile::AnsDnsaid]);
+    let err = client.register_agent(&request).await.unwrap_err();
+    assert!(
+        matches!(err, ClientError::Configuration(ref msg) if msg.contains("ApiVersion::V2")),
+        "expected Configuration error mentioning ApiVersion::V2, got {err:?}"
+    );
+}
