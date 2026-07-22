@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.6](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-verify-v0.1.5...ans-verify-v0.1.6) (2026-07-22)
+
+
+### Build System
+
+* **deps:** Bump the rust-dependencies group across 1 directory with 5 updates ([#78](https://github.com/agentnameservice/ans-sdk-rust/issues/78)) ([9e7f63e](https://github.com/agentnameservice/ans-sdk-rust/commit/9e7f63e9ac68b94771cddaf1eb45980a55008f29))
+* **deps:** update all dependencies (p256 0.14) and enable resolver v3 ([#87](https://github.com/agentnameservice/ans-sdk-rust/issues/87)) ([d34fc25](https://github.com/agentnameservice/ans-sdk-rust/commit/d34fc25c0a0fd81c72e8a3cd969c62684f596698))
+
 ## [0.1.5](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-verify-v0.1.4...ans-verify-v0.1.5) (2026-06-23)
 
 
