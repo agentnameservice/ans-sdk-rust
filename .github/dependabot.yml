@@ -8,6 +8,11 @@ updates:
       rust-dependencies:
         patterns:
           - "*"
+        # Majors are deliberately excluded so they arrive as individual
+        # PRs with isolated review (see #79); don't fold them back in.
+        update-types:
+          - "minor"
+          - "patch"
     open-pull-requests-limit: 10
 
   - package-ecosystem: github-actions
@@ -15,3 +20,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
