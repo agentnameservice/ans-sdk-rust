@@ -50,7 +50,8 @@ From a practical perspective, contributions are as simple as:
 1. Create a branch for your PR with `git checkout -b pr/your-branch-name`
 1. Make changes on the branch of your forked repository.
 1. When committing, reference your issue (if present) and include a note about
-   the fix.
+   the fix. Sign off every commit with `git commit -s` (see
+   [Developer Certificate of Origin](#developer-certificate-of-origin)).
 1. Please also add/update unit tests for your changes.
 1. Push the changes to your fork and submit a pull request to the 'main
    development branch' branch of the projects' repository.
@@ -75,6 +76,27 @@ contributors about the change, discuss the best way to go about implementing it.
 > branch to use the upstream main branch whenever you run git pull. Then you
 > can make all of your pull request branches based on this main branch.
 > Whenever you want to update your version of main, do a regular git pull.
+
+## Developer Certificate of Origin
+
+All commits must include a `Signed-off-by` trailer certifying that you agree
+to the [Developer Certificate of Origin][dco] — that is, that you have the
+right to submit your contribution under the project's license. Git adds the
+trailer for you when you commit with the `-s` flag:
+
+```
+git commit -s
+```
+
+This appends a line like the following to your commit message:
+
+```
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+If you forget, amend with `git commit --amend -s` (or `git rebase --signoff`
+for a series of commits) and force-push your branch — unsigned commits cannot
+be merged.
 
 ## Code Review
 
@@ -115,4 +137,5 @@ guide with respect to patterns, naming, documentation and testing.
 
 [issues]: https://github.com/agentnameservice/ans-sdk-rust/issues
 [coc]: ./CODE_OF_CONDUCT.md
+[dco]: https://developercertificate.org/
 [fork]: https://help.github.com/en/articles/fork-a-repo
