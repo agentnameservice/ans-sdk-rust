@@ -108,7 +108,7 @@ pub mod client;
 pub mod error;
 pub mod models;
 
-pub use client::{AnsClient, AnsClientBuilder, Auth};
+pub use client::{AnsClient, AnsClientBuilder, ApiVersion, Auth};
 pub use error::{ClientError, HttpError, Result};
 
 // Re-export types from ans-types for convenience

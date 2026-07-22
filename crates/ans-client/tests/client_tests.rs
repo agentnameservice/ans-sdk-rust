@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Integration tests for the ANS client using wiremock.
 
-use ans_client::{AnsClient, ClientError, models::*};
+use ans_client::{AnsClient, ApiVersion, ClientError, models::*};
 use rstest::rstest;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -819,4 +819,338 @@ async fn test_revoke_agent_url_encodes_id() {
         .unwrap();
 
     assert_eq!(result.status, AgentLifecycleStatus::Revoked);
+}
+
+// =========================================================================
+// API version lane routing (ApiVersion::V2) and discovery profiles
+// =========================================================================
+
+/// Create a test client targeting the V2 lane.
+fn v2_test_client(server: &MockServer) -> AnsClient {
+    AnsClient::builder()
+        .base_url(server.uri())
+        .jwt("test-token")
+        .allow_insecure() // mock server uses http://
+        .api_version(ApiVersion::V2)
+        .build()
+        .expect("client build failed")
+}
+
+/// A V2-lane client must register at the collection itself
+/// (`POST /v2/ans/agents`), not the V1 `/v1/agents/register` route.
+#[tokio::test]
+async fn test_v2_lane_register_path() {
+    let server = MockServer::start().await;
+    let client = v2_test_client(&server);
+
+    let response_body = serde_json::json!({
+        "status": "PENDING_VALIDATION",
+        "ansName": "ans://v1.0.0.agent.example.com",
+        "agentId": "550e8400-e29b-41d4-a716-446655440000",
+        "nextSteps": []
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v2/ans/agents"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(&response_body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let pending = client
+        .register_agent(&sample_registration_request())
+        .await
+        .unwrap();
+    assert_eq!(pending.ans_name, "ans://v1.0.0.agent.example.com");
+}
+
+/// Every lane-routed agent method must target its `/v2/ans/agents`
+/// twin when the client was built with [`ApiVersion::V2`]. The two
+/// lanes serve identical shapes, so the path is the entire behavioral
+/// difference under test.
+#[tokio::test]
+async fn test_v2_lane_agent_lifecycle_paths() {
+    let server = MockServer::start().await;
+    let client = v2_test_client(&server);
+
+    let details = serde_json::json!({
+        "agentId": "agent-123",
+        "agentDisplayName": "test-agent",
+        "agentHost": "agent.example.com",
+        "ansName": "ans://v1.0.0.agent.example.com",
+        "version": "1.0.0",
+        "agentStatus": "PENDING_DNS",
+        "endpoints": []
+    });
+    Mock::given(method("GET"))
+        .and(path("/v2/ans/agents/agent-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&details))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let status = serde_json::json!({ "status": "PENDING_DNS" });
+    Mock::given(method("POST"))
+        .and(path("/v2/ans/agents/agent-123/verify-acme"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(&status))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/ans/agents/agent-123/verify-dns"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(&status))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/ans/agents/agent-123/certificates/server"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v2/ans/agents/agent-123/certificates/identity"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let submission = serde_json::json!({
+        "csrId": "550e8400-e29b-41d4-a716-446655440001"
+    });
+    Mock::given(method("POST"))
+        .and(path("/v2/ans/agents/agent-123/certificates/server"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(&submission))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v2/ans/agents/agent-123/certificates/identity"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(&submission))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let csr_status = serde_json::json!({
+        "csrId": "550e8400-e29b-41d4-a716-446655440001",
+        "type": "SERVER",
+        "status": "PENDING",
+        "submittedAt": "2024-01-01T00:00:00Z",
+        "updatedAt": "2024-01-01T00:00:00Z"
+    });
+    Mock::given(method("GET"))
+        .and(path(
+            "/v2/ans/agents/agent-123/csrs/550e8400-e29b-41d4-a716-446655440001/status",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&csr_status))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let revocation = serde_json::json!({
+        "agentId": "550e8400-e29b-41d4-a716-446655440000",
+        "ansName": "ans://v1.0.0.agent.example.com",
+        "status": "REVOKED",
+        "revokedAt": "2024-01-15T12:00:00Z",
+        "reason": "KEY_COMPROMISE",
+        "links": []
+    });
+    Mock::given(method("POST"))
+        .and(path("/v2/ans/agents/agent-123/revoke"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&revocation))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let csr = "-----BEGIN CERTIFICATE REQUEST-----\nMIIC...\n-----END CERTIFICATE REQUEST-----";
+    client.get_agent("agent-123").await.unwrap();
+    client.verify_acme("agent-123").await.unwrap();
+    client.verify_dns("agent-123").await.unwrap();
+    client.get_server_certificates("agent-123").await.unwrap();
+    client.get_identity_certificates("agent-123").await.unwrap();
+    client.submit_server_csr("agent-123", csr).await.unwrap();
+    client.submit_identity_csr("agent-123", csr).await.unwrap();
+    client
+        .get_csr_status("agent-123", "550e8400-e29b-41d4-a716-446655440001")
+        .await
+        .unwrap();
+    client
+        .revoke_agent("agent-123", RevocationReason::KeyCompromise, None)
+        .await
+        .unwrap();
+}
+
+/// Routes without a V2 twin on the server (search, resolution, events)
+/// must keep their V1 paths even on a V2-lane client, so selecting V2
+/// never changes the behavior of a route that only exists on V1.
+#[tokio::test]
+async fn test_v2_lane_keeps_v1_only_routes() {
+    let server = MockServer::start().await;
+    let client = v2_test_client(&server);
+
+    let search_body = serde_json::json!({
+        "agents": [],
+        "totalCount": 0,
+        "returnedCount": 0,
+        "limit": 20,
+        "offset": 0,
+        "hasMore": false
+    });
+    Mock::given(method("GET"))
+        .and(path("/v1/agents"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&search_body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let resolution_body = serde_json::json!({
+        "ansName": "ans://v1.0.0.agent.example.com",
+        "links": []
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/resolution"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&resolution_body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let events_body = serde_json::json!({ "items": [] });
+    Mock::given(method("GET"))
+        .and(path("/v1/agents/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&events_body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client
+        .search_agents(&SearchCriteria::default(), None, None)
+        .await
+        .unwrap();
+    client
+        .resolve_agent("agent.example.com", "*")
+        .await
+        .unwrap();
+    client.get_events(None, None, None).await.unwrap();
+}
+
+/// Discovery profiles must serialize verbatim (in order) when set...
+#[tokio::test]
+async fn test_register_discovery_profiles_serialized() {
+    let server = MockServer::start().await;
+    let client = v2_test_client(&server);
+
+    let response_body = serde_json::json!({
+        "status": "PENDING_VALIDATION",
+        "ansName": "ans://v1.0.0.agent.example.com",
+        "nextSteps": []
+    });
+    Mock::given(method("POST"))
+        .and(path("/v2/ans/agents"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(&response_body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let request = sample_registration_request()
+        .with_discovery_profiles(vec![DiscoveryProfile::AnsDnsaid, DiscoveryProfile::AnsTxt]);
+    client.register_agent(&request).await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body["discoveryProfiles"],
+        serde_json::json!(["ANS_DNSAID", "ANS_TXT"])
+    );
+}
+
+/// ...and the key must be absent (not null, not []) when unset: an
+/// omitted field means "apply the server default", and the request must
+/// not look like an explicit choice.
+#[tokio::test]
+async fn test_register_discovery_profiles_omitted_when_empty() {
+    let server = MockServer::start().await;
+    let client = v2_test_client(&server);
+
+    let response_body = serde_json::json!({
+        "status": "PENDING_VALIDATION",
+        "ansName": "ans://v1.0.0.agent.example.com",
+        "nextSteps": []
+    });
+    Mock::given(method("POST"))
+        .and(path("/v2/ans/agents"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(&response_body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client
+        .register_agent(&sample_registration_request())
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(
+        body.get("discoveryProfiles").is_none(),
+        "discoveryProfiles must be omitted when empty; got {body}"
+    );
+}
+
+/// The Go reference RA marshals nil slices as JSON `null` (not `[]`,
+/// not absent) — e.g. `"pendingSteps": null` on the verify-dns response
+/// once every step is complete. List fields on response models must
+/// tolerate all three spellings.
+#[tokio::test]
+async fn test_agent_status_null_step_lists_deserialize() {
+    let server = MockServer::start().await;
+    let client = test_client(&server);
+
+    let response_body = serde_json::json!({
+        "status": "ACTIVE",
+        "phase": "COMPLETED",
+        "completedSteps": null,
+        "pendingSteps": null,
+        "createdAt": "2024-01-01T00:00:00Z",
+        "updatedAt": "2024-01-02T00:00:00Z"
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/agent-123/verify-dns"))
+        .respond_with(ResponseTemplate::new(202).set_body_json(&response_body))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let status = client.verify_dns("agent-123").await.unwrap();
+    assert_eq!(status.status, AgentLifecycleStatus::Active);
+    assert!(status.completed_steps.is_empty());
+    assert!(status.pending_steps.is_empty());
+}
+
+/// Discovery profiles on the default V1 lane are rejected client-side
+/// before any request is sent — the V1 lane ignores the field
+/// server-side, so forwarding it would silently drop an explicit SVCB
+/// choice. Decided jointly with the Go SDK twin, which guards the same
+/// combination in RegisterAgent.
+#[tokio::test]
+async fn test_register_discovery_profiles_rejected_on_v1_lane() {
+    let server = MockServer::start().await;
+    let client = test_client(&server); // default V1 lane
+
+    // expect(0): the guard must fire before any HTTP request.
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/register"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let request =
+        sample_registration_request().with_discovery_profiles(vec![DiscoveryProfile::AnsDnsaid]);
+    let err = client.register_agent(&request).await.unwrap_err();
+    assert!(
+        matches!(err, ClientError::Configuration(ref msg) if msg.contains("ApiVersion::V2")),
+        "expected Configuration error mentioning ApiVersion::V2, got {err:?}"
+    );
 }

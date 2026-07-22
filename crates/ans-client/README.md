@@ -68,6 +68,31 @@ let request = AgentRegistrationRequest::new(
 let response = client.register_agent(&request).await?;
 ```
 
+#### DNS discovery profiles (V2 API lane)
+
+Discovery profiles select which DNS record families the Registration
+Authority asks the operator to publish. They are a V2-lane feature:
+build the client with `.api_version(ApiVersion::V2)` and (optionally)
+set profiles on the request — omitted profiles mean the server default,
+`ANS_DNSAID` (RFC 9460 SVCB records). The V1 lane (default) ignores the
+field and always emits the legacy `_ans` TXT family.
+
+```rust
+use ans_client::{AnsClient, ApiVersion, models::DiscoveryProfile};
+
+let client = AnsClient::builder()
+    .base_url("https://api.godaddy.com")
+    .api_key("your-key", "your-secret")
+    .api_version(ApiVersion::V2)
+    .build()?;
+
+// Publish the union of SVCB + legacy TXT during a transition:
+let request = request.with_discovery_profiles(vec![
+    DiscoveryProfile::AnsDnsaid,
+    DiscoveryProfile::AnsTxt,
+]);
+```
+
 ### Discovery
 
 ```rust
@@ -114,6 +139,7 @@ let client = AnsClient::builder()
     .jwt("token")
     .timeout(Duration::from_secs(30))
     .header("x-request-id", "abc-123")  // custom headers
+    .api_version(ApiVersion::V2)        // RA API lane (default: V1)
     .build()?;
 ```
 
