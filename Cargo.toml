@@ -48,7 +48,7 @@ rand = "0.10"
 x509-parser = "0.18"
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 ciborium = "0.2"
-base64 = "0.22"
+base64 = "0.23"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
