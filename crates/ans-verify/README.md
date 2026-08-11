@@ -56,6 +56,67 @@ When accepting mTLS connections from ANS agent clients:
 3. Compare identity certificate fingerprint to badge attestation
 4. Compare ANS name from URI SAN to badge
 
+## Endpoint Discovery
+
+The DNS layer also enumerates an agent's protocol endpoints from its
+published discovery records. Two discovery profiles exist (ANS-3 §6):
+
+| Profile | Records | Requirement (ANS-3 §6.1) |
+|---|---|---|
+| `ANS_TXT` | `_ans.{fqdn}` TXT rows (`v=ans1; version=…; p=…; mode=direct; url=…`) | Opt-in |
+| `ANS_DNSAID` | SVCB rows at the bare FQDN with DNS-AID SvcParams (RFC 9460) | Default |
+
+`DnsResolver::lookup_discovery` autodiscovers which profile the agent
+publishes: it queries the SVCB rows first and falls back to the `_ans` TXT
+rows only when no SVCB records exist. A lookup *error* propagates instead of
+falling back, so an outage is never masked as a profile downgrade.
+
+That probe order is an SDK convention — ANS-3 §3.1 orders DNS ahead of the
+Transparency Log and does not rank the profiles against each other. SVCB goes
+first because `ANS_DNSAID` is the default profile, so the first probe resolves
+for an agent on the default and misses only one that opted into `ANS_TXT`
+alone. SVCB rows also carry richer endpoint data (`cap`, `cap-sha256`,
+`well-known`) where a TXT row carries only a URL. One wrinkle: in the
+`["ANS_DNSAID", "ANS_TXT"]` transition union, §6.4 marks the SVCB rows
+`Required=false` and the `_ans` TXT rows `Required=true`, so in that case
+first-found-wins returns the rows with the weaker required flag. Discovery
+records carry no trust weight either way — trust comes from the badge and
+certificate fingerprints.
+
+```rust
+use ans_verify::{DiscoveryRecord, DnsResolver, HickoryDnsResolver};
+use ans_types::Fqdn;
+
+let resolver = HickoryDnsResolver::new().await?;
+let fqdn = Fqdn::new("agent.example.com")?;
+
+for record in resolver.get_discovery_records(&fqdn).await? {
+    match &record {
+        DiscoveryRecord::Svcb(svcb) => {
+            // ANS_DNSAID: connection hints + capability locator
+            println!(
+                "{:?} on port {:?}, metadata: {:?}",
+                svcb.protocol(),
+                svcb.port(),
+                svcb.metadata_url()
+            );
+        }
+        DiscoveryRecord::Txt(txt) => {
+            // ANS_TXT: direct endpoint URL
+            println!("{:?} at {}", txt.protocol(), txt.url());
+        }
+        _ => {}
+    }
+}
+```
+
+SVCB rows carry the DNS-AID draft-02 params in the RFC 9460 Private-Use
+`keyNNNNN` form: `key65400` (`cap`, the metadata URL), `key65401`
+(`cap-sha256`, base64url SHA-256 of the metadata document), `key65402`
+(`bap`, the authoritative protocol token), and `key65409` (`well-known`).
+The two profiles share the `a2a`/`mcp` protocol tokens but spell HTTP
+differently (`x-http` vs `http-api`); `AgentProtocol` normalizes both.
+
 ## Configuration
 
 ### DNS Presets
@@ -220,10 +281,14 @@ ans-verify = { ..., features = ["test-support"] }
 ```
 
 ```rust
-use ans_verify::{MockDnsResolver, MockTransparencyLogClient};
+use ans_verify::{MockDnsResolver, MockTransparencyLogClient, SvcbDiscoveryRecord};
 
 let dns = Arc::new(MockDnsResolver::new()
-    .with_records("agent.example.com", vec![badge_record]));
+    .with_records("agent.example.com", vec![badge_record])
+    .with_svcb_discovery_records(
+        "agent.example.com",
+        vec![SvcbDiscoveryRecord::new("a2a", 443)],
+    ));
 
 let tlog = Arc::new(MockTransparencyLogClient::new()
     .with_badge("https://tlog.example.com/badge", badge));

@@ -1,6 +1,10 @@
-//! DNS resolution for `_ans-badge` / `_ra-badge` TXT records and TLSA records.
+//! DNS resolution for ANS records: `_ans-badge` / `_ra-badge` trust TXT
+//! records, TLSA records, and the discovery records of both DNS discovery
+//! profiles — `ANS_DNSAID` (SVCB rows at the bare FQDN, RFC 9460) and
+//! `ANS_TXT` (`_ans.{fqdn}` TXT rows).
 
 use async_trait::async_trait;
+use base64::prelude::{BASE64_URL_SAFE_NO_PAD, Engine};
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{
     CLOUDFLARE, GOOGLE, NameServerConfig, QUAD9, ResolverConfig, ResolverOpts,
@@ -8,7 +12,8 @@ use hickory_resolver::config::{
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError as HickoryDnsError, NetError, NoRecords as HickoryNoRecords};
 use hickory_resolver::proto::op::ResponseCode;
-use hickory_resolver::proto::rr::RData;
+use hickory_resolver::proto::rr::rdata::svcb::{SVCB, SvcParamKey, SvcParamValue};
+use hickory_resolver::proto::rr::{RData, RecordType};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 /// Well-known DNS resolver configurations.
@@ -159,6 +164,522 @@ impl BadgeRecord {
     }
 }
 
+// ---------------------------------------------------------------------
+// Discovery records (ANS-3 discovery profiles)
+// ---------------------------------------------------------------------
+
+/// DNS-AID draft-02 `cap` `SvcParam` — the endpoint's capability locator
+/// (`metadataUrl`), in the RFC 9460 §14.3.1 Private Use range.
+const SVCPARAM_KEY_CAP: u16 = 65400;
+/// DNS-AID draft-02 `cap-sha256` `SvcParam` — `base64url(raw SHA-256)` of the
+/// endpoint's metadata document.
+const SVCPARAM_KEY_CAP_SHA256: u16 = 65401;
+/// DNS-AID draft-02 `bap` `SvcParam` — the authoritative agent-protocol token.
+const SVCPARAM_KEY_BAP: u16 = 65402;
+/// DNS-AID draft-02 `well-known` `SvcParam` — the RFC 8615 suffix under
+/// `https://{fqdn}/.well-known/`.
+const SVCPARAM_KEY_WELL_KNOWN: u16 = 65409;
+
+/// Agent protocol identified by a discovery record.
+///
+/// The two discovery profiles share the `a2a` and `mcp` tokens but spell the
+/// plain-HTTP protocol differently: `http-api` in `ANS_TXT`, `x-http` in
+/// `ANS_DNSAID`. Both normalize to [`AgentProtocol::HttpApi`]; unrecognized
+/// tokens are preserved verbatim in [`AgentProtocol::Other`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum AgentProtocol {
+    /// Agent-to-Agent protocol (`a2a`).
+    A2a,
+    /// Model Context Protocol (`mcp`).
+    Mcp,
+    /// Plain HTTP API (`http-api` in `ANS_TXT`, `x-http` in `ANS_DNSAID`).
+    HttpApi,
+    /// Unrecognized or future protocol token, preserved verbatim.
+    Other(String),
+}
+
+impl AgentProtocol {
+    /// Map a wire protocol token from either discovery profile.
+    pub fn from_token(token: &str) -> Self {
+        match token {
+            "a2a" => Self::A2a,
+            "mcp" => Self::Mcp,
+            "http-api" | "x-http" => Self::HttpApi,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+/// Parsed `ANS_DNSAID` SVCB discovery record from the agent's bare FQDN.
+///
+/// One record per protocol endpoint, in `ServiceMode` with the DNS-AID
+/// `SvcParams` (`cap` / `cap-sha256` / `bap` / `well-known`) carried in the
+/// RFC 9460 Private Use `keyNNNNN` form. Malformed optional params are
+/// dropped with a warning; the record itself survives as long as it is in
+/// `ServiceMode` and carries a protocol token.
+///
+/// In production these are produced by DNS lookups. Custom [`DnsResolver`]
+/// implementations that read SVCB rows from another source build them with
+/// [`SvcbDiscoveryRecord::from_parts`]. A `new` shorthand is available only
+/// when the `test-support` feature is enabled.
+#[derive(Debug, Clone)]
+pub struct SvcbDiscoveryRecord {
+    /// `SvcPriority` (`ServiceMode`, so always >= 1).
+    pub(crate) priority: u16,
+    /// `TargetName`; `.` means the owner name itself (RFC 9460 §2.5.2).
+    pub(crate) target_name: String,
+    /// Agent-protocol token from `bap` (key65402), falling back to `alpn`.
+    pub(crate) protocol_token: String,
+    /// TCP port from the `port` `SvcParam`; absent means the scheme default.
+    pub(crate) port: Option<u16>,
+    /// Capability locator (`metadataUrl`) from `cap` (key65400).
+    pub(crate) metadata_url: Option<String>,
+    /// Decoded SHA-256 of the metadata document from `cap-sha256` (key65401).
+    pub(crate) metadata_sha256: Option<[u8; 32]>,
+    /// RFC 8615 well-known suffix from `well-known` (key65409).
+    pub(crate) well_known: Option<String>,
+}
+
+impl SvcbDiscoveryRecord {
+    /// Returns the `SvcPriority` (always >= 1: `ServiceMode`).
+    pub fn priority(&self) -> u16 {
+        self.priority
+    }
+
+    /// Returns the `TargetName`; `.` means the owner name itself.
+    pub fn target_name(&self) -> &str {
+        &self.target_name
+    }
+
+    /// Returns the raw agent-protocol token (e.g. `a2a`, `mcp`, `x-http`).
+    pub fn protocol_token(&self) -> &str {
+        &self.protocol_token
+    }
+
+    /// Returns the normalized agent protocol.
+    pub fn protocol(&self) -> AgentProtocol {
+        AgentProtocol::from_token(&self.protocol_token)
+    }
+
+    /// Returns the TCP port, if the record carries a `port` `SvcParam`.
+    ///
+    /// Absence means the authority endpoint's default port applies
+    /// (RFC 9460 §7.2) — `443` for the https endpoints ANS registers.
+    pub fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    /// Returns the endpoint's capability locator (`metadataUrl`), if any.
+    pub fn metadata_url(&self) -> Option<&str> {
+        self.metadata_url.as_deref()
+    }
+
+    /// Returns the SHA-256 digest of the endpoint's metadata document, if any.
+    pub fn metadata_sha256(&self) -> Option<&[u8; 32]> {
+        self.metadata_sha256.as_ref()
+    }
+
+    /// Returns the RFC 8615 well-known suffix, if any.
+    pub fn well_known(&self) -> Option<&str> {
+        self.well_known.as_deref()
+    }
+
+    /// Build a record from already-parsed SVCB fields.
+    ///
+    /// This is the production constructor for custom [`DnsResolver`]
+    /// implementations that read SVCB rows from somewhere other than
+    /// hickory — it takes plain values rather than hickory RDATA. Attach the
+    /// optional DNS-AID params with [`with_metadata_url`](Self::with_metadata_url),
+    /// [`with_metadata_sha256`](Self::with_metadata_sha256), and
+    /// [`with_well_known`](Self::with_well_known).
+    ///
+    /// `port` of `None` means the scheme default applies (RFC 9460 §7.2).
+    ///
+    /// # Errors
+    ///
+    /// Rejects the same rows the hickory parser rejects: `priority` 0
+    /// (an `AliasMode` record, not an ANS discovery row) and an empty
+    /// `protocol_token`.
+    pub fn from_parts(
+        priority: u16,
+        target_name: impl Into<String>,
+        protocol_token: impl Into<String>,
+        port: Option<u16>,
+    ) -> Result<Self, ParseError> {
+        if priority == 0 {
+            return Err(ParseError::InvalidRecord(
+                "AliasMode SVCB record (SvcPriority 0) is not an ANS discovery record".to_string(),
+            ));
+        }
+
+        let protocol_token = protocol_token.into();
+        if protocol_token.is_empty() {
+            return Err(ParseError::MissingField(
+                "key65402 (bap) or alpn protocol token".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            priority,
+            target_name: target_name.into(),
+            protocol_token,
+            port,
+            metadata_url: None,
+            metadata_sha256: None,
+            well_known: None,
+        })
+    }
+
+    /// Set the capability locator (`cap` / key65400).
+    #[must_use]
+    pub fn with_metadata_url(mut self, url: impl Into<String>) -> Self {
+        self.metadata_url = Some(url.into());
+        self
+    }
+
+    /// Set the metadata digest (`cap-sha256` / key65401).
+    #[must_use]
+    pub fn with_metadata_sha256(mut self, digest: [u8; 32]) -> Self {
+        self.metadata_sha256 = Some(digest);
+        self
+    }
+
+    /// Set the well-known suffix (`well-known` / key65409).
+    #[must_use]
+    pub fn with_well_known(mut self, suffix: impl Into<String>) -> Self {
+        self.well_known = Some(suffix.into());
+        self
+    }
+
+    /// Parse from SVCB RDATA.
+    ///
+    /// Errors when the record is not usable as an ANS discovery row: an
+    /// `AliasMode` record (`SvcPriority` 0), or a row with no protocol token in
+    /// either `bap` (key65402) or `alpn`. Malformed *optional* params
+    /// (`cap`, `cap-sha256`, `well-known`) are dropped with a warning.
+    pub(crate) fn from_rdata(svcb: &SVCB) -> Result<Self, ParseError> {
+        if svcb.svc_priority == 0 {
+            return Err(ParseError::InvalidRecord(
+                "AliasMode SVCB record (SvcPriority 0) is not an ANS discovery record".to_string(),
+            ));
+        }
+
+        let mut alpn_token = None;
+        let mut port = None;
+        let mut metadata_url = None;
+        let mut metadata_sha256 = None;
+        let mut bap_token = None;
+        let mut well_known = None;
+
+        // RFC 9460 §2.1: each SvcParamKey appears at most once; first wins.
+        for (key, value) in &svcb.svc_params {
+            match (key, value) {
+                (SvcParamKey::Alpn, SvcParamValue::Alpn(alpn)) if alpn_token.is_none() => {
+                    alpn_token = alpn.0.first().cloned();
+                }
+                (SvcParamKey::Port, SvcParamValue::Port(p)) if port.is_none() => {
+                    port = Some(*p);
+                }
+                (SvcParamKey::Key(SVCPARAM_KEY_CAP), SvcParamValue::Unknown(raw))
+                    if metadata_url.is_none() =>
+                {
+                    metadata_url = parse_cap_url(&raw.0);
+                }
+                (SvcParamKey::Key(SVCPARAM_KEY_CAP_SHA256), SvcParamValue::Unknown(raw))
+                    if metadata_sha256.is_none() =>
+                {
+                    metadata_sha256 = parse_cap_sha256(&raw.0);
+                }
+                (SvcParamKey::Key(SVCPARAM_KEY_BAP), SvcParamValue::Unknown(raw))
+                    if bap_token.is_none() =>
+                {
+                    bap_token = std::str::from_utf8(&raw.0)
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                }
+                (SvcParamKey::Key(SVCPARAM_KEY_WELL_KNOWN), SvcParamValue::Unknown(raw))
+                    if well_known.is_none() =>
+                {
+                    well_known = std::str::from_utf8(&raw.0)
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+                }
+                _ => {}
+            }
+        }
+
+        // key65402 (bap) is authoritative; alpn is the fallback carrier.
+        let protocol_token = bap_token.or(alpn_token).ok_or_else(|| {
+            ParseError::MissingField("key65402 (bap) or alpn protocol token".to_string())
+        })?;
+
+        Ok(Self {
+            priority: svcb.svc_priority,
+            target_name: svcb.target_name.to_string(),
+            protocol_token,
+            port,
+            metadata_url,
+            metadata_sha256,
+            well_known,
+        })
+    }
+}
+
+/// Decode a `cap` (key65400) `SvcParam` value into a validated URL string.
+fn parse_cap_url(raw: &[u8]) -> Option<String> {
+    let Ok(s) = std::str::from_utf8(raw) else {
+        tracing::warn!("Dropping non-UTF-8 cap (key65400) SvcParam");
+        return None;
+    };
+    if url::Url::parse(s).is_err() {
+        tracing::warn!(value = %s, "Dropping invalid cap (key65400) URL");
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// Decode a `cap-sha256` (key65401) `SvcParam` value: base64url, no padding,
+/// raw 32-byte SHA-256.
+fn parse_cap_sha256(raw: &[u8]) -> Option<[u8; 32]> {
+    let decoded = std::str::from_utf8(raw)
+        .ok()
+        .and_then(|s| BASE64_URL_SAFE_NO_PAD.decode(s).ok());
+    let Some(bytes) = decoded else {
+        tracing::warn!("Dropping undecodable cap-sha256 (key65401) SvcParam");
+        return None;
+    };
+    match <[u8; 32]>::try_from(bytes) {
+        Ok(digest) => Some(digest),
+        Err(bytes) => {
+            tracing::warn!(
+                len = bytes.len(),
+                "Dropping cap-sha256 (key65401) with wrong digest length"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl SvcbDiscoveryRecord {
+    /// Create an `SvcbDiscoveryRecord` for testing (`ServiceMode`, target `.`).
+    ///
+    /// Infallible shorthand for the common test shape. In production, records
+    /// come from DNS lookups or [`SvcbDiscoveryRecord::from_parts`].
+    pub fn new(protocol_token: impl Into<String>, port: u16) -> Self {
+        Self {
+            priority: 1,
+            target_name: ".".to_string(),
+            protocol_token: protocol_token.into(),
+            port: Some(port),
+            metadata_url: None,
+            metadata_sha256: None,
+            well_known: None,
+        }
+    }
+}
+
+/// Parsed `ANS_TXT` discovery record from `_ans.{fqdn}` TXT.
+///
+/// Wire form: `v=ans1; version=v{version}; p={token}; mode=direct; url={agentUrl}`.
+/// One record per protocol endpoint. `v`, `p`, and `url` are required;
+/// `version` is parsed leniently for runtime compatibility with legacy
+/// records.
+///
+/// In production, construct via [`TxtDiscoveryRecord::parse`]. A `new`
+/// constructor is available only when the `test-support` feature is enabled.
+#[derive(Debug, Clone)]
+pub struct TxtDiscoveryRecord {
+    /// Format version (e.g. "ans1").
+    pub(crate) format_version: String,
+    /// Agent version this endpoint belongs to (optional — parsed leniently).
+    pub(crate) version: Option<Version>,
+    /// Agent-protocol token from `p=` (e.g. `a2a`, `mcp`, `http-api`).
+    pub(crate) protocol_token: String,
+    /// Connection mode from `mode=`; the profile always emits `direct`.
+    pub(crate) mode: Option<String>,
+    /// The endpoint URL (`agentUrl`), verbatim.
+    pub(crate) url: String,
+}
+
+impl TxtDiscoveryRecord {
+    /// Returns the format version (e.g. "ans1").
+    pub fn format_version(&self) -> &str {
+        &self.format_version
+    }
+
+    /// Returns the agent version this endpoint belongs to, if specified.
+    pub fn version(&self) -> Option<&Version> {
+        self.version.as_ref()
+    }
+
+    /// Returns the raw agent-protocol token (e.g. `a2a`, `mcp`, `http-api`).
+    pub fn protocol_token(&self) -> &str {
+        &self.protocol_token
+    }
+
+    /// Returns the normalized agent protocol.
+    pub fn protocol(&self) -> AgentProtocol {
+        AgentProtocol::from_token(&self.protocol_token)
+    }
+
+    /// Returns the connection mode; ANS-3 §3.1 clients follow [`Self::url`]
+    /// directly when this is `direct` (the only mode the profile emits).
+    pub fn mode(&self) -> Option<&str> {
+        self.mode.as_deref()
+    }
+
+    /// Returns the endpoint URL (`agentUrl`).
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Parse from a `_ans` TXT record string.
+    ///
+    /// Accepts both spaced and unspaced field separators:
+    /// - `v=ans1; version=v1.0.0; p=a2a; mode=direct; url=https://...`
+    /// - `v=ans1;version=v1.0.0;p=a2a;mode=direct;url=https://...`
+    pub fn parse(txt: &str) -> Result<Self, ParseError> {
+        let mut format_version = None;
+        let mut version = None;
+        let mut protocol_token = None;
+        let mut mode = None;
+        let mut url = None;
+
+        for part in txt.split(';') {
+            let part = part.trim();
+            if let Some(v) = part.strip_prefix("v=") {
+                format_version = Some(v.to_string());
+            } else if let Some(v) = part.strip_prefix("version=") {
+                version = Version::parse(v).ok();
+            } else if let Some(p) = part.strip_prefix("p=") {
+                protocol_token = Some(p.to_string());
+            } else if let Some(m) = part.strip_prefix("mode=") {
+                mode = Some(m.to_string());
+            } else if let Some(u) = part.strip_prefix("url=") {
+                // Validate URL syntax but store as String to avoid exposing url::Url
+                url::Url::parse(u).map_err(|e| ParseError::InvalidUrl(e.to_string()))?;
+                url = Some(u.to_string());
+            }
+        }
+
+        let format_version =
+            format_version.ok_or_else(|| ParseError::MissingField("v".to_string()))?;
+        let protocol_token =
+            protocol_token.ok_or_else(|| ParseError::MissingField("p".to_string()))?;
+        let url = url.ok_or_else(|| ParseError::MissingField("url".to_string()))?;
+
+        tracing::debug!(
+            format_version = %format_version,
+            version = ?version,
+            protocol = %protocol_token,
+            url = %url,
+            "Parsed _ans discovery TXT record"
+        );
+
+        Ok(Self {
+            format_version,
+            version,
+            protocol_token,
+            mode,
+            url,
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TxtDiscoveryRecord {
+    /// Create a `TxtDiscoveryRecord` for testing (`mode=direct`).
+    ///
+    /// In production, use [`TxtDiscoveryRecord::parse`] to construct from
+    /// DNS TXT record data.
+    pub fn new(
+        format_version: impl Into<String>,
+        version: Option<Version>,
+        protocol_token: impl Into<String>,
+        url: impl Into<String>,
+    ) -> Self {
+        Self {
+            format_version: format_version.into(),
+            version,
+            protocol_token: protocol_token.into(),
+            mode: Some("direct".to_string()),
+            url: url.into(),
+        }
+    }
+}
+
+/// A discovery record from whichever profile DNS autodiscovery found.
+///
+/// Produced by [`DnsResolver::lookup_discovery`], which probes the
+/// `ANS_DNSAID` SVCB rows at the bare FQDN first, then the `ANS_TXT` rows at
+/// `_ans.{fqdn}`.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum DiscoveryRecord {
+    /// An `ANS_DNSAID` SVCB row from the agent's bare FQDN.
+    Svcb(SvcbDiscoveryRecord),
+    /// An `ANS_TXT` row from `_ans.{fqdn}`.
+    Txt(TxtDiscoveryRecord),
+}
+
+impl DiscoveryRecord {
+    /// Returns the raw agent-protocol token from the underlying record.
+    pub fn protocol_token(&self) -> &str {
+        match self {
+            Self::Svcb(record) => record.protocol_token(),
+            Self::Txt(record) => record.protocol_token(),
+        }
+    }
+
+    /// Returns the normalized agent protocol.
+    pub fn protocol(&self) -> AgentProtocol {
+        AgentProtocol::from_token(self.protocol_token())
+    }
+
+    /// Returns the discovery-profile registry ID that produced this record
+    /// (`"ANS_DNSAID"` or `"ANS_TXT"`).
+    pub fn profile_id(&self) -> &'static str {
+        match self {
+            Self::Svcb(_) => "ANS_DNSAID",
+            Self::Txt(_) => "ANS_TXT",
+        }
+    }
+}
+
+/// Apply RFC 9460 §2.4.1 `RRset` semantics and parse each usable row.
+///
+/// If the `RRset` contains an `AliasMode` record, every `ServiceMode` record MUST
+/// be ignored — the zone is doing SVCB aliasing, not ANS discovery.
+/// Otherwise, malformed rows are skipped with a warning so one bad row
+/// cannot hide its valid siblings.
+fn collect_svcb_discovery(rows: &[&SVCB], fqdn: &Fqdn) -> Vec<SvcbDiscoveryRecord> {
+    if rows.iter().any(|svcb| svcb.svc_priority == 0) {
+        tracing::warn!(
+            fqdn = %fqdn,
+            "SVCB RRset contains an AliasMode record; ignoring ServiceMode rows (RFC 9460 §2.4.1)"
+        );
+        return Vec::new();
+    }
+
+    rows.iter()
+        .filter_map(|svcb| match SvcbDiscoveryRecord::from_rdata(svcb) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                tracing::warn!(
+                    fqdn = %fqdn,
+                    error = %error,
+                    "Skipping malformed SVCB discovery record"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// DNS lookup result distinguishing between "not found" and "error".
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -169,10 +690,15 @@ pub enum DnsLookupResult<T> {
     NotFound,
 }
 
-/// DNS resolver trait for looking up badge records and TLSA records.
+/// DNS resolver trait for looking up badge, TLSA, and discovery records.
 ///
 /// Badge records are queried from `_ans-badge.{fqdn}` (primary) with
 /// fallback to `_ra-badge.{fqdn}` (legacy).
+///
+/// Discovery records are queried per profile: `ANS_DNSAID` SVCB rows at the
+/// bare FQDN and `ANS_TXT` rows at `_ans.{fqdn}`. The provided
+/// [`lookup_discovery`](Self::lookup_discovery) method autodiscovers which
+/// profile an agent publishes by probing them in turn.
 #[async_trait]
 pub trait DnsResolver: Send + Sync {
     /// Query badge TXT records for an FQDN.
@@ -189,6 +715,40 @@ pub trait DnsResolver: Send + Sync {
         fqdn: &Fqdn,
         port: u16,
     ) -> Result<DnsLookupResult<TlsaRecord>, DnsError>;
+
+    /// Query `ANS_DNSAID` SVCB discovery records at the bare FQDN.
+    ///
+    /// One record per protocol endpoint. Implementations must honor
+    /// RFC 9460 §2.4.1: an `RRset` containing an `AliasMode` record yields no
+    /// discovery records.
+    ///
+    /// Defaults to [`DnsLookupResult::NotFound`] — "this resolver serves no
+    /// `ANS_DNSAID` records" — so resolvers written before discovery existed
+    /// keep compiling. Override it to serve the profile, building rows with
+    /// [`SvcbDiscoveryRecord::from_parts`].
+    async fn lookup_svcb_discovery(
+        &self,
+        fqdn: &Fqdn,
+    ) -> Result<DnsLookupResult<SvcbDiscoveryRecord>, DnsError> {
+        let _ = fqdn;
+        Ok(DnsLookupResult::NotFound)
+    }
+
+    /// Query `ANS_TXT` discovery records at `_ans.{fqdn}`.
+    ///
+    /// One record per protocol endpoint.
+    ///
+    /// Defaults to [`DnsLookupResult::NotFound`] — "this resolver serves no
+    /// `ANS_TXT` records" — so resolvers written before discovery existed keep
+    /// compiling. Override it to serve the profile, building rows with
+    /// [`TxtDiscoveryRecord::parse`].
+    async fn lookup_txt_discovery(
+        &self,
+        fqdn: &Fqdn,
+    ) -> Result<DnsLookupResult<TxtDiscoveryRecord>, DnsError> {
+        let _ = fqdn;
+        Ok(DnsLookupResult::NotFound)
+    }
 
     /// Query all badge records and return them.
     /// Convenience method that unwraps the result.
@@ -244,6 +804,71 @@ pub trait DnsResolver: Send + Sync {
         });
 
         Ok(Some(records.remove(0)))
+    }
+
+    /// Autodiscover the discovery profile an agent publishes.
+    ///
+    /// Probes each profile in turn, stopping at the first that resolves: the
+    /// `ANS_DNSAID` SVCB rows at the bare FQDN, then the `ANS_TXT` rows at
+    /// `_ans.{fqdn}`.
+    ///
+    /// **The probe order is an SDK convention, not spec-defined.** ANS-3 §3.1
+    /// orders DNS ahead of the Transparency Log; it does not rank the discovery
+    /// profiles against each other. The `[ANS_TXT, ANS_DNSAID]` order in §6.4
+    /// is the registry's emission order, not a read-side ranking.
+    ///
+    /// SVCB is probed first because `ANS_DNSAID` is the spec default profile
+    /// (ANS-3 §6.1) and `ANS_TXT` is opt-in, so the first probe resolves for an
+    /// agent on the default and misses only one that opted into `ANS_TXT`
+    /// alone. SVCB rows also carry richer endpoint data — a capability locator
+    /// (`cap`), its digest (`cap-sha256`), and a well-known suffix — where an
+    /// `ANS_TXT` row carries only a URL.
+    ///
+    /// One wrinkle worth knowing: in the `["ANS_DNSAID", "ANS_TXT"]` transition
+    /// union both families are published, and §6.4 flips the SVCB rows to
+    /// `Required=false` while the `_ans` TXT rows keep `Required=true`. In that
+    /// one case first-found-wins returns the rows carrying the weaker required
+    /// flag, and a stale SVCB row wins over a fresh TXT row if the two drift
+    /// apart.
+    ///
+    /// That does not affect trust: discovery records carry no trust weight, and
+    /// ANS-3 §9 forbids scoring an agent down for its profile choice. Trust
+    /// still derives from the badge and certificate fingerprints alone.
+    ///
+    /// Only `NotFound` triggers the fallback — a lookup *error* propagates so
+    /// an outage is never masked as a profile downgrade.
+    async fn lookup_discovery(
+        &self,
+        fqdn: &Fqdn,
+    ) -> Result<DnsLookupResult<DiscoveryRecord>, DnsError> {
+        match self.lookup_svcb_discovery(fqdn).await? {
+            DnsLookupResult::Found(records) => Ok(DnsLookupResult::Found(
+                records.into_iter().map(DiscoveryRecord::Svcb).collect(),
+            )),
+            DnsLookupResult::NotFound => {
+                tracing::debug!(
+                    fqdn = %fqdn,
+                    "No ANS_DNSAID SVCB discovery records, falling back to ANS_TXT"
+                );
+                match self.lookup_txt_discovery(fqdn).await? {
+                    DnsLookupResult::Found(records) => Ok(DnsLookupResult::Found(
+                        records.into_iter().map(DiscoveryRecord::Txt).collect(),
+                    )),
+                    DnsLookupResult::NotFound => Ok(DnsLookupResult::NotFound),
+                }
+            }
+        }
+    }
+
+    /// Autodiscover discovery records and return them.
+    /// Convenience method that unwraps the result.
+    async fn get_discovery_records(&self, fqdn: &Fqdn) -> Result<Vec<DiscoveryRecord>, DnsError> {
+        match self.lookup_discovery(fqdn).await? {
+            DnsLookupResult::Found(records) => Ok(records),
+            DnsLookupResult::NotFound => Err(DnsError::NotFound {
+                fqdn: fqdn.to_string(),
+            }),
+        }
     }
 }
 
@@ -409,16 +1034,19 @@ impl HickoryDnsResolver {
 }
 
 impl HickoryDnsResolver {
-    /// Query badge TXT records at a specific DNS name.
-    async fn query_badge_txt(
+    /// Query TXT records at a DNS name, returning each record's
+    /// character-strings concatenated (RFC 1035 §3.3.14).
+    ///
+    /// Returns `None` when the name has no TXT records.
+    async fn query_txt_strings(
         &self,
         query_name: &str,
         fqdn: &Fqdn,
-    ) -> Result<DnsLookupResult<BadgeRecord>, DnsError> {
+    ) -> Result<Option<Vec<String>>, DnsError> {
         let response = match self.resolver.txt_lookup(query_name).await {
             Ok(response) => response,
             Err(NetError::Dns(HickoryDnsError::NoRecordsFound(_))) => {
-                return Ok(DnsLookupResult::NotFound);
+                return Ok(None);
             }
             Err(NetError::Timeout) => {
                 return Err(DnsError::Timeout {
@@ -433,17 +1061,37 @@ impl HickoryDnsResolver {
             }
         };
 
-        let mut records = Vec::new();
-        for record in response.answers() {
-            let RData::TXT(txt) = &record.data else {
-                continue;
-            };
-            let txt_data: String = txt
-                .txt_data
-                .iter()
-                .map(|d| String::from_utf8_lossy(d).to_string())
-                .collect::<String>();
+        let strings = response
+            .answers()
+            .iter()
+            .filter_map(|record| {
+                let RData::TXT(txt) = &record.data else {
+                    return None;
+                };
+                Some(
+                    txt.txt_data
+                        .iter()
+                        .map(|d| String::from_utf8_lossy(d))
+                        .collect::<String>(),
+                )
+            })
+            .collect();
 
+        Ok(Some(strings))
+    }
+
+    /// Query badge TXT records at a specific DNS name.
+    async fn query_badge_txt(
+        &self,
+        query_name: &str,
+        fqdn: &Fqdn,
+    ) -> Result<DnsLookupResult<BadgeRecord>, DnsError> {
+        let Some(strings) = self.query_txt_strings(query_name, fqdn).await? else {
+            return Ok(DnsLookupResult::NotFound);
+        };
+
+        let mut records = Vec::new();
+        for txt_data in strings {
             match BadgeRecord::parse(&txt_data) {
                 Ok(badge) => records.push(badge),
                 Err(_) => {
@@ -479,6 +1127,79 @@ impl DnsResolver for HickoryDnsResolver {
                 tracing::debug!(query = %fallback, "Primary not found, falling back to _ra-badge");
                 self.query_badge_txt(&fallback, fqdn).await
             }
+        }
+    }
+
+    async fn lookup_svcb_discovery(
+        &self,
+        fqdn: &Fqdn,
+    ) -> Result<DnsLookupResult<SvcbDiscoveryRecord>, DnsError> {
+        tracing::debug!(query = %fqdn, "Querying ANS_DNSAID SVCB discovery records");
+
+        let response = match self.resolver.lookup(fqdn.as_str(), RecordType::SVCB).await {
+            Ok(response) => response,
+            Err(NetError::Dns(HickoryDnsError::NoRecordsFound(_))) => {
+                return Ok(DnsLookupResult::NotFound);
+            }
+            Err(NetError::Timeout) => {
+                return Err(DnsError::Timeout {
+                    fqdn: fqdn.to_string(),
+                });
+            }
+            Err(e) => {
+                return Err(DnsError::LookupFailed {
+                    fqdn: fqdn.to_string(),
+                    reason: e.to_string(),
+                });
+            }
+        };
+
+        let rows: Vec<&SVCB> = response
+            .answers()
+            .iter()
+            .filter_map(|record| match &record.data {
+                RData::SVCB(svcb) => Some(svcb),
+                _ => None,
+            })
+            .collect();
+
+        let records = collect_svcb_discovery(&rows, fqdn);
+        if records.is_empty() {
+            Ok(DnsLookupResult::NotFound)
+        } else {
+            Ok(DnsLookupResult::Found(records))
+        }
+    }
+
+    async fn lookup_txt_discovery(
+        &self,
+        fqdn: &Fqdn,
+    ) -> Result<DnsLookupResult<TxtDiscoveryRecord>, DnsError> {
+        let query_name = fqdn.ans_discovery_name();
+        tracing::debug!(query = %query_name, "Querying ANS_TXT discovery records");
+
+        let Some(strings) = self.query_txt_strings(&query_name, fqdn).await? else {
+            return Ok(DnsLookupResult::NotFound);
+        };
+
+        let mut records = Vec::new();
+        for txt_data in strings {
+            match TxtDiscoveryRecord::parse(&txt_data) {
+                Ok(record) => records.push(record),
+                Err(_) => {
+                    tracing::warn!(
+                        fqdn = %fqdn,
+                        record = %txt_data,
+                        "Skipping malformed _ans discovery TXT record"
+                    );
+                }
+            }
+        }
+
+        if records.is_empty() {
+            Ok(DnsLookupResult::NotFound)
+        } else {
+            Ok(DnsLookupResult::Found(records))
         }
     }
 
@@ -620,8 +1341,12 @@ fn matches_dnssec_pattern(err_str: &str) -> bool {
 pub struct MockDnsResolver {
     records: std::collections::HashMap<String, Vec<BadgeRecord>>,
     tlsa_records: std::collections::HashMap<String, Vec<TlsaRecord>>,
+    svcb_discovery_records: std::collections::HashMap<String, Vec<SvcbDiscoveryRecord>>,
+    txt_discovery_records: std::collections::HashMap<String, Vec<TxtDiscoveryRecord>>,
     errors: std::collections::HashMap<String, DnsError>,
     tlsa_errors: std::collections::HashMap<String, DnsError>,
+    svcb_discovery_errors: std::collections::HashMap<String, DnsError>,
+    txt_discovery_errors: std::collections::HashMap<String, DnsError>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -644,6 +1369,28 @@ impl MockDnsResolver {
         self
     }
 
+    /// Add `ANS_DNSAID` SVCB discovery records for an FQDN.
+    pub fn with_svcb_discovery_records(
+        mut self,
+        fqdn: &str,
+        records: Vec<SvcbDiscoveryRecord>,
+    ) -> Self {
+        self.svcb_discovery_records
+            .insert(fqdn.to_lowercase(), records);
+        self
+    }
+
+    /// Add `ANS_TXT` discovery records for an FQDN.
+    pub fn with_txt_discovery_records(
+        mut self,
+        fqdn: &str,
+        records: Vec<TxtDiscoveryRecord>,
+    ) -> Self {
+        self.txt_discovery_records
+            .insert(fqdn.to_lowercase(), records);
+        self
+    }
+
     /// Configure an error for an FQDN.
     pub fn with_error(mut self, fqdn: &str, error: DnsError) -> Self {
         self.errors.insert(fqdn.to_lowercase(), error);
@@ -658,6 +1405,23 @@ impl MockDnsResolver {
     pub fn with_tlsa_error(mut self, fqdn: &str, port: u16, error: DnsError) -> Self {
         let key = format!("{}:{}", fqdn.to_lowercase(), port);
         self.tlsa_errors.insert(key, error);
+        self
+    }
+
+    /// Configure an error for `ANS_DNSAID` SVCB discovery lookups on an FQDN.
+    ///
+    /// This allows the SVCB query to fail independently of the `_ans` TXT
+    /// query — useful for testing that autodiscovery propagates errors
+    /// instead of silently falling back.
+    pub fn with_svcb_discovery_error(mut self, fqdn: &str, error: DnsError) -> Self {
+        self.svcb_discovery_errors
+            .insert(fqdn.to_lowercase(), error);
+        self
+    }
+
+    /// Configure an error for `ANS_TXT` discovery lookups on an FQDN.
+    pub fn with_txt_discovery_error(mut self, fqdn: &str, error: DnsError) -> Self {
+        self.txt_discovery_errors.insert(fqdn.to_lowercase(), error);
         self
     }
 }
@@ -699,6 +1463,52 @@ impl DnsResolver for MockDnsResolver {
 
         // Return configured records or NotFound
         match self.tlsa_records.get(&key) {
+            Some(records) if !records.is_empty() => Ok(DnsLookupResult::Found(records.clone())),
+            _ => Ok(DnsLookupResult::NotFound),
+        }
+    }
+
+    async fn lookup_svcb_discovery(
+        &self,
+        fqdn: &Fqdn,
+    ) -> Result<DnsLookupResult<SvcbDiscoveryRecord>, DnsError> {
+        let key = fqdn.as_str().to_lowercase();
+
+        // Check for SVCB-specific error first (takes priority)
+        if let Some(error) = self.svcb_discovery_errors.get(&key) {
+            return Err(error.clone());
+        }
+
+        // Check for general FQDN error
+        if let Some(error) = self.errors.get(&key) {
+            return Err(error.clone());
+        }
+
+        // Return configured records or NotFound
+        match self.svcb_discovery_records.get(&key) {
+            Some(records) if !records.is_empty() => Ok(DnsLookupResult::Found(records.clone())),
+            _ => Ok(DnsLookupResult::NotFound),
+        }
+    }
+
+    async fn lookup_txt_discovery(
+        &self,
+        fqdn: &Fqdn,
+    ) -> Result<DnsLookupResult<TxtDiscoveryRecord>, DnsError> {
+        let key = fqdn.as_str().to_lowercase();
+
+        // Check for TXT-discovery-specific error first (takes priority)
+        if let Some(error) = self.txt_discovery_errors.get(&key) {
+            return Err(error.clone());
+        }
+
+        // Check for general FQDN error
+        if let Some(error) = self.errors.get(&key) {
+            return Err(error.clone());
+        }
+
+        // Return configured records or NotFound
+        match self.txt_discovery_records.get(&key) {
             Some(records) if !records.is_empty() => Ok(DnsLookupResult::Found(records.clone())),
             _ => Ok(DnsLookupResult::NotFound),
         }
@@ -1244,5 +2054,698 @@ mod tests {
     fn test_badge_record_no_version() {
         let record = BadgeRecord::new("ra-badge1", None, "https://example.com/badge");
         assert_eq!(record.version(), None);
+    }
+
+    // -----------------------------------------------------------------
+    // Discovery records: ANS_DNSAID (SVCB) and ANS_TXT (`_ans` TXT)
+    //
+    // Wire shapes are normative per the ans-registry discovery profiles:
+    // - discovery-profiles/ans-dnsaid.md (SVCB, DNS-AID SvcParams)
+    // - discovery-profiles/ans-txt.md (`_ans` TXT rows)
+    // - ans-3-dns-publication.md §3.1 (discoverer fallback chain)
+    // -----------------------------------------------------------------
+
+    use hickory_resolver::proto::rr::Name;
+    use hickory_resolver::proto::rr::rdata::svcb::{
+        Alpn, SVCB, SvcParamKey, SvcParamValue, Unknown,
+    };
+
+    /// SHA-256 digest from the ans-dnsaid.md §10 worked example:
+    /// `SHA256:098d650cc6d280dee4c0f47489a75cf17b9bfbbae53051806d4e084108b2ff27`
+    const SAMPLE_DIGEST: [u8; 32] = [
+        0x09, 0x8d, 0x65, 0x0c, 0xc6, 0xd2, 0x80, 0xde, 0xe4, 0xc0, 0xf4, 0x74, 0x89, 0xa7, 0x5c,
+        0xf1, 0x7b, 0x9b, 0xfb, 0xba, 0xe5, 0x30, 0x51, 0x80, 0x6d, 0x4e, 0x08, 0x41, 0x08, 0xb2,
+        0xff, 0x27,
+    ];
+    /// `base64url(SAMPLE_DIGEST)`, no padding — as it appears in key65401.
+    const SAMPLE_DIGEST_B64URL: &str = "CY1lDMbSgN7kwPR0iadc8Xub-7rlMFGAbU4IQQiy_yc";
+
+    /// Build a DNS-AID Private-Use `SvcParam` (key65400–key65409).
+    fn dnsaid_param(key: u16, value: &str) -> (SvcParamKey, SvcParamValue) {
+        (
+            SvcParamKey::Key(key),
+            SvcParamValue::Unknown(Unknown(value.as_bytes().to_vec())),
+        )
+    }
+
+    fn alpn_param(token: &str) -> (SvcParamKey, SvcParamValue) {
+        (
+            SvcParamKey::Alpn,
+            SvcParamValue::Alpn(Alpn(vec![token.to_string()])),
+        )
+    }
+
+    fn port_param(port: u16) -> (SvcParamKey, SvcParamValue) {
+        (SvcParamKey::Port, SvcParamValue::Port(port))
+    }
+
+    // ── AgentProtocol token mapping ──────────────────────────────────
+
+    #[test]
+    fn test_agent_protocol_from_token() {
+        assert_eq!(AgentProtocol::from_token("a2a"), AgentProtocol::A2a);
+        assert_eq!(AgentProtocol::from_token("mcp"), AgentProtocol::Mcp);
+        // ANS_TXT spells the HTTP protocol `http-api`; ANS_DNSAID spells it
+        // `x-http`. Both normalize to the same variant.
+        assert_eq!(
+            AgentProtocol::from_token("http-api"),
+            AgentProtocol::HttpApi
+        );
+        assert_eq!(AgentProtocol::from_token("x-http"), AgentProtocol::HttpApi);
+        // Future/extension tokens pass through unchanged.
+        assert_eq!(
+            AgentProtocol::from_token("x-grpc"),
+            AgentProtocol::Other("x-grpc".to_string())
+        );
+    }
+
+    // ── SvcbDiscoveryRecord::from_rdata ──────────────────────────────
+
+    /// Full A2A row from the ans-dnsaid.md §10 worked example:
+    /// `1 . alpn=a2a port=443 key65400=… key65401=… key65402=a2a key65409=agent-card.json`
+    #[test]
+    fn test_svcb_from_rdata_full_row() {
+        let svcb = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                alpn_param("a2a"),
+                port_param(443),
+                dnsaid_param(
+                    65400,
+                    "https://agent.example.com/.well-known/agent-card.json",
+                ),
+                dnsaid_param(65401, SAMPLE_DIGEST_B64URL),
+                dnsaid_param(65402, "a2a"),
+                dnsaid_param(65409, "agent-card.json"),
+            ],
+        );
+
+        let record = SvcbDiscoveryRecord::from_rdata(&svcb).unwrap();
+        assert_eq!(record.priority(), 1);
+        assert_eq!(record.target_name(), ".");
+        assert_eq!(record.protocol_token(), "a2a");
+        assert_eq!(record.protocol(), AgentProtocol::A2a);
+        assert_eq!(record.port(), Some(443));
+        assert_eq!(
+            record.metadata_url(),
+            Some("https://agent.example.com/.well-known/agent-card.json")
+        );
+        assert_eq!(record.metadata_sha256(), Some(&SAMPLE_DIGEST));
+        assert_eq!(record.well_known(), Some("agent-card.json"));
+    }
+
+    /// Minimal MCP row from the worked example: `1 . alpn=mcp port=443 key65402=mcp`.
+    #[test]
+    fn test_svcb_from_rdata_minimal_row() {
+        let svcb = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                alpn_param("mcp"),
+                port_param(443),
+                dnsaid_param(65402, "mcp"),
+            ],
+        );
+
+        let record = SvcbDiscoveryRecord::from_rdata(&svcb).unwrap();
+        assert_eq!(record.protocol_token(), "mcp");
+        assert_eq!(record.protocol(), AgentProtocol::Mcp);
+        assert_eq!(record.port(), Some(443));
+        assert_eq!(record.metadata_url(), None);
+        assert_eq!(record.metadata_sha256(), None);
+        assert_eq!(record.well_known(), None);
+    }
+
+    /// key65402 (bap) is the authoritative protocol field; alpn is the fallback
+    /// when bap is absent.
+    #[test]
+    fn test_svcb_from_rdata_protocol_falls_back_to_alpn() {
+        let svcb = SVCB::new(1, Name::root(), vec![alpn_param("a2a"), port_param(443)]);
+
+        let record = SvcbDiscoveryRecord::from_rdata(&svcb).unwrap();
+        assert_eq!(record.protocol_token(), "a2a");
+    }
+
+    /// bap wins over alpn when both are present and disagree.
+    #[test]
+    fn test_svcb_from_rdata_bap_authoritative_over_alpn() {
+        let svcb = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                alpn_param("h2"),
+                port_param(443),
+                dnsaid_param(65402, "mcp"),
+            ],
+        );
+
+        let record = SvcbDiscoveryRecord::from_rdata(&svcb).unwrap();
+        assert_eq!(record.protocol_token(), "mcp");
+    }
+
+    /// A row with neither bap nor alpn carries no ANS protocol — malformed.
+    #[test]
+    fn test_svcb_from_rdata_missing_protocol() {
+        let svcb = SVCB::new(1, Name::root(), vec![port_param(443)]);
+        assert!(SvcbDiscoveryRecord::from_rdata(&svcb).is_err());
+    }
+
+    /// An empty bap value with no alpn is treated as a missing protocol.
+    #[test]
+    fn test_svcb_from_rdata_empty_bap_is_missing() {
+        let svcb = SVCB::new(
+            1,
+            Name::root(),
+            vec![port_param(443), dnsaid_param(65402, "")],
+        );
+        assert!(SvcbDiscoveryRecord::from_rdata(&svcb).is_err());
+    }
+
+    /// Non-UTF-8 bap bytes are ignored in favor of the alpn fallback.
+    #[test]
+    fn test_svcb_from_rdata_invalid_utf8_bap_falls_back_to_alpn() {
+        let svcb = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                alpn_param("a2a"),
+                port_param(443),
+                (
+                    SvcParamKey::Key(65402),
+                    SvcParamValue::Unknown(Unknown(vec![0xff, 0xfe])),
+                ),
+            ],
+        );
+
+        let record = SvcbDiscoveryRecord::from_rdata(&svcb).unwrap();
+        assert_eq!(record.protocol_token(), "a2a");
+    }
+
+    /// `AliasMode` rows (`SvcPriority` 0) are not ANS discovery rows.
+    #[test]
+    fn test_svcb_from_rdata_alias_mode_rejected() {
+        let target = Name::from_utf8("svc.example.net.").unwrap();
+        let svcb = SVCB::new(0, target, vec![]);
+        assert!(SvcbDiscoveryRecord::from_rdata(&svcb).is_err());
+    }
+
+    /// A port param is optional at the RFC 9460 level; absent means
+    /// "authority endpoint's port" (the scheme default).
+    #[test]
+    fn test_svcb_from_rdata_no_port() {
+        let svcb = SVCB::new(
+            1,
+            Name::root(),
+            vec![alpn_param("mcp"), dnsaid_param(65402, "mcp")],
+        );
+
+        let record = SvcbDiscoveryRecord::from_rdata(&svcb).unwrap();
+        assert_eq!(record.port(), None);
+    }
+
+    /// A malformed cap-sha256 (bad base64url) drops the digest but keeps
+    /// the row — connection info is still valid.
+    #[test]
+    fn test_svcb_from_rdata_invalid_digest_base64_dropped() {
+        let svcb = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                alpn_param("a2a"),
+                port_param(443),
+                dnsaid_param(65401, "!!!not-base64url!!!"),
+                dnsaid_param(65402, "a2a"),
+            ],
+        );
+
+        let record = SvcbDiscoveryRecord::from_rdata(&svcb).unwrap();
+        assert_eq!(record.metadata_sha256(), None);
+    }
+
+    /// A digest that decodes to the wrong length is dropped.
+    #[test]
+    fn test_svcb_from_rdata_wrong_length_digest_dropped() {
+        // base64url of 16 bytes, not 32
+        let short = "AAAAAAAAAAAAAAAAAAAAAA";
+        let svcb = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                alpn_param("a2a"),
+                port_param(443),
+                dnsaid_param(65401, short),
+                dnsaid_param(65402, "a2a"),
+            ],
+        );
+
+        let record = SvcbDiscoveryRecord::from_rdata(&svcb).unwrap();
+        assert_eq!(record.metadata_sha256(), None);
+    }
+
+    /// A cap URL that is not a valid URL is dropped; the row survives.
+    #[test]
+    fn test_svcb_from_rdata_invalid_metadata_url_dropped() {
+        let svcb = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                alpn_param("a2a"),
+                port_param(443),
+                dnsaid_param(65400, "not a url"),
+                dnsaid_param(65402, "a2a"),
+            ],
+        );
+
+        let record = SvcbDiscoveryRecord::from_rdata(&svcb).unwrap();
+        assert_eq!(record.metadata_url(), None);
+    }
+
+    // ── SvcbDiscoveryRecord::from_parts ──────────────────────────────
+
+    /// The production constructor for third-party resolvers: plain values in,
+    /// optional DNS-AID params attached through the builders.
+    #[test]
+    fn test_svcb_from_parts_full_row() {
+        let record = SvcbDiscoveryRecord::from_parts(1, ".", "a2a", Some(443))
+            .unwrap()
+            .with_metadata_url("https://agent.example.com/.well-known/agent-card.json")
+            .with_metadata_sha256(SAMPLE_DIGEST)
+            .with_well_known("agent-card.json");
+
+        assert_eq!(record.priority(), 1);
+        assert_eq!(record.target_name(), ".");
+        assert_eq!(record.protocol_token(), "a2a");
+        assert_eq!(record.protocol(), AgentProtocol::A2a);
+        assert_eq!(record.port(), Some(443));
+        assert_eq!(
+            record.metadata_url(),
+            Some("https://agent.example.com/.well-known/agent-card.json")
+        );
+        assert_eq!(record.metadata_sha256(), Some(&SAMPLE_DIGEST));
+        assert_eq!(record.well_known(), Some("agent-card.json"));
+    }
+
+    /// Without the builders, the optional params stay absent, and `None` port
+    /// means "scheme default" rather than a sentinel value.
+    #[test]
+    fn test_svcb_from_parts_minimal_row() {
+        let record = SvcbDiscoveryRecord::from_parts(3, "svc.example.net.", "mcp", None).unwrap();
+
+        assert_eq!(record.priority(), 3);
+        assert_eq!(record.target_name(), "svc.example.net.");
+        assert_eq!(record.protocol(), AgentProtocol::Mcp);
+        assert_eq!(record.port(), None);
+        assert_eq!(record.metadata_url(), None);
+        assert_eq!(record.metadata_sha256(), None);
+        assert_eq!(record.well_known(), None);
+    }
+
+    /// `from_parts` enforces the same invariants as `from_rdata`, so the
+    /// `priority() >= 1` guarantee holds for externally built records too.
+    #[test]
+    fn test_svcb_from_parts_alias_mode_rejected() {
+        assert!(SvcbDiscoveryRecord::from_parts(0, "svc.example.net.", "a2a", Some(443)).is_err());
+    }
+
+    /// A row with no protocol token carries no ANS endpoint.
+    #[test]
+    fn test_svcb_from_parts_empty_protocol_rejected() {
+        assert!(SvcbDiscoveryRecord::from_parts(1, ".", "", Some(443)).is_err());
+    }
+
+    /// Unknown tokens normalize to `Other` but the raw token is preserved,
+    /// same as when the row arrives over the wire.
+    #[test]
+    fn test_svcb_from_parts_preserves_unknown_token() {
+        let record = SvcbDiscoveryRecord::from_parts(1, ".", "x-custom", None).unwrap();
+        assert_eq!(record.protocol_token(), "x-custom");
+        assert_eq!(
+            record.protocol(),
+            AgentProtocol::Other("x-custom".to_string())
+        );
+    }
+
+    // ── RRset-level SVCB handling (RFC 9460 §2.4.1) ──────────────────
+
+    /// If an `RRset` contains an `AliasMode` record, all `ServiceMode` records
+    /// in the set MUST be ignored.
+    #[test]
+    fn test_collect_svcb_alias_mode_poisons_rrset() {
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+        let alias = SVCB::new(0, Name::from_utf8("svc.example.net.").unwrap(), vec![]);
+        let service = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                alpn_param("a2a"),
+                port_param(443),
+                dnsaid_param(65402, "a2a"),
+            ],
+        );
+
+        let records = collect_svcb_discovery(&[&alias, &service], &fqdn);
+        assert!(records.is_empty());
+    }
+
+    /// Malformed rows are skipped; valid siblings survive.
+    #[test]
+    fn test_collect_svcb_skips_malformed_rows() {
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+        let valid = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                alpn_param("a2a"),
+                port_param(443),
+                dnsaid_param(65402, "a2a"),
+            ],
+        );
+        let malformed = SVCB::new(1, Name::root(), vec![port_param(8443)]);
+
+        let records = collect_svcb_discovery(&[&valid, &malformed], &fqdn);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].protocol_token(), "a2a");
+    }
+
+    /// A multi-endpoint `RRset` yields one record per row.
+    #[test]
+    fn test_collect_svcb_multi_endpoint() {
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+        let a2a = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                alpn_param("a2a"),
+                port_param(443),
+                dnsaid_param(65402, "a2a"),
+            ],
+        );
+        let mcp = SVCB::new(
+            1,
+            Name::root(),
+            vec![
+                alpn_param("mcp"),
+                port_param(8443),
+                dnsaid_param(65402, "mcp"),
+            ],
+        );
+
+        let records = collect_svcb_discovery(&[&a2a, &mcp], &fqdn);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].port(), Some(443));
+        assert_eq!(records[1].port(), Some(8443));
+    }
+
+    // ── TxtDiscoveryRecord::parse ────────────────────────────────────
+
+    #[test]
+    fn test_parse_txt_discovery_full_row() {
+        let txt = "v=ans1; version=v2.1.0; p=a2a; mode=direct; url=https://agent.example.com/a2a";
+        let record = TxtDiscoveryRecord::parse(txt).unwrap();
+
+        assert_eq!(record.format_version(), "ans1");
+        assert_eq!(record.version(), Some(&Version::new(2, 1, 0)));
+        assert_eq!(record.protocol_token(), "a2a");
+        assert_eq!(record.protocol(), AgentProtocol::A2a);
+        assert_eq!(record.mode(), Some("direct"));
+        assert_eq!(record.url(), "https://agent.example.com/a2a");
+    }
+
+    #[test]
+    fn test_parse_txt_discovery_no_spaces() {
+        let txt = "v=ans1;version=v1.0.0;p=mcp;mode=direct;url=https://agent.example.com:8443/mcp";
+        let record = TxtDiscoveryRecord::parse(txt).unwrap();
+
+        assert_eq!(record.protocol_token(), "mcp");
+        assert_eq!(record.url(), "https://agent.example.com:8443/mcp");
+    }
+
+    #[test]
+    fn test_parse_txt_discovery_http_api_token() {
+        let txt =
+            "v=ans1; version=v1.0.0; p=http-api; mode=direct; url=https://agent.example.com/api";
+        let record = TxtDiscoveryRecord::parse(txt).unwrap();
+        assert_eq!(record.protocol(), AgentProtocol::HttpApi);
+    }
+
+    #[test]
+    fn test_parse_txt_discovery_missing_version_is_lenient() {
+        let txt = "v=ans1; p=a2a; mode=direct; url=https://agent.example.com/a2a";
+        let record = TxtDiscoveryRecord::parse(txt).unwrap();
+        assert_eq!(record.version(), None);
+    }
+
+    #[test]
+    fn test_parse_txt_discovery_missing_url() {
+        let txt = "v=ans1; version=v1.0.0; p=a2a; mode=direct";
+        assert!(TxtDiscoveryRecord::parse(txt).is_err());
+    }
+
+    #[test]
+    fn test_parse_txt_discovery_missing_protocol() {
+        let txt = "v=ans1; version=v1.0.0; mode=direct; url=https://agent.example.com/a2a";
+        assert!(TxtDiscoveryRecord::parse(txt).is_err());
+    }
+
+    #[test]
+    fn test_parse_txt_discovery_missing_format_version() {
+        let txt = "version=v1.0.0; p=a2a; mode=direct; url=https://agent.example.com/a2a";
+        assert!(TxtDiscoveryRecord::parse(txt).is_err());
+    }
+
+    #[test]
+    fn test_parse_txt_discovery_invalid_url() {
+        let txt = "v=ans1; version=v1.0.0; p=a2a; mode=direct; url=not-a-url";
+        assert!(TxtDiscoveryRecord::parse(txt).is_err());
+    }
+
+    // ── DiscoveryRecord unified accessors ────────────────────────────
+
+    #[test]
+    fn test_discovery_record_accessors() {
+        let svcb = DiscoveryRecord::Svcb(SvcbDiscoveryRecord::new("x-http", 443));
+        assert_eq!(svcb.protocol_token(), "x-http");
+        assert_eq!(svcb.protocol(), AgentProtocol::HttpApi);
+        assert_eq!(svcb.profile_id(), "ANS_DNSAID");
+
+        let txt = DiscoveryRecord::Txt(TxtDiscoveryRecord::new(
+            "ans1",
+            Some(Version::new(1, 0, 0)),
+            "http-api",
+            "https://agent.example.com/api",
+        ));
+        assert_eq!(txt.protocol_token(), "http-api");
+        assert_eq!(txt.protocol(), AgentProtocol::HttpApi);
+        assert_eq!(txt.profile_id(), "ANS_TXT");
+    }
+
+    // ── Mock resolver: per-profile lookups ───────────────────────────
+
+    #[tokio::test]
+    async fn test_mock_svcb_discovery_found() {
+        let record = SvcbDiscoveryRecord::new("a2a", 443)
+            .with_metadata_url("https://agent.example.com/.well-known/agent-card.json")
+            .with_metadata_sha256(SAMPLE_DIGEST)
+            .with_well_known("agent-card.json");
+
+        let resolver =
+            MockDnsResolver::new().with_svcb_discovery_records("agent.example.com", vec![record]);
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+
+        match resolver.lookup_svcb_discovery(&fqdn).await.unwrap() {
+            DnsLookupResult::Found(records) => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].protocol_token(), "a2a");
+                assert_eq!(records[0].metadata_sha256(), Some(&SAMPLE_DIGEST));
+            }
+            DnsLookupResult::NotFound => panic!("Expected Found"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mock_txt_discovery_found() {
+        let record = TxtDiscoveryRecord::new(
+            "ans1",
+            Some(Version::new(1, 0, 0)),
+            "a2a",
+            "https://agent.example.com/a2a",
+        );
+
+        let resolver =
+            MockDnsResolver::new().with_txt_discovery_records("agent.example.com", vec![record]);
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+
+        match resolver.lookup_txt_discovery(&fqdn).await.unwrap() {
+            DnsLookupResult::Found(records) => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].url(), "https://agent.example.com/a2a");
+            }
+            DnsLookupResult::NotFound => panic!("Expected Found"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mock_discovery_lookups_not_found() {
+        let resolver = MockDnsResolver::new();
+        let fqdn = Fqdn::new("unknown.example.com").unwrap();
+
+        assert!(matches!(
+            resolver.lookup_svcb_discovery(&fqdn).await.unwrap(),
+            DnsLookupResult::NotFound
+        ));
+        assert!(matches!(
+            resolver.lookup_txt_discovery(&fqdn).await.unwrap(),
+            DnsLookupResult::NotFound
+        ));
+    }
+
+    // ── Autodiscovery chain (SDK probe order) ────────────────────────
+
+    /// SVCB is probed first; when present it wins.
+    #[tokio::test]
+    async fn test_lookup_discovery_prefers_svcb() {
+        let resolver = MockDnsResolver::new()
+            .with_svcb_discovery_records(
+                "agent.example.com",
+                vec![SvcbDiscoveryRecord::new("a2a", 443)],
+            )
+            .with_txt_discovery_records(
+                "agent.example.com",
+                vec![TxtDiscoveryRecord::new(
+                    "ans1",
+                    None,
+                    "a2a",
+                    "https://agent.example.com/a2a",
+                )],
+            );
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+
+        match resolver.lookup_discovery(&fqdn).await.unwrap() {
+            DnsLookupResult::Found(records) => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].profile_id(), "ANS_DNSAID");
+            }
+            DnsLookupResult::NotFound => panic!("Expected Found"),
+        }
+    }
+
+    /// No SVCB records → fall back to the `_ans` TXT profile.
+    #[tokio::test]
+    async fn test_lookup_discovery_falls_back_to_txt() {
+        let resolver = MockDnsResolver::new().with_txt_discovery_records(
+            "agent.example.com",
+            vec![TxtDiscoveryRecord::new(
+                "ans1",
+                Some(Version::new(1, 0, 0)),
+                "mcp",
+                "https://agent.example.com/mcp",
+            )],
+        );
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+
+        match resolver.lookup_discovery(&fqdn).await.unwrap() {
+            DnsLookupResult::Found(records) => {
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].profile_id(), "ANS_TXT");
+            }
+            DnsLookupResult::NotFound => panic!("Expected Found"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lookup_discovery_neither_profile_published() {
+        let resolver = MockDnsResolver::new();
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+
+        assert!(matches!(
+            resolver.lookup_discovery(&fqdn).await.unwrap(),
+            DnsLookupResult::NotFound
+        ));
+    }
+
+    /// An SVCB lookup *error* (not NotFound) propagates — no silent TXT
+    /// fallback that could mask infrastructure problems.
+    #[tokio::test]
+    async fn test_lookup_discovery_svcb_error_propagates() {
+        let resolver = MockDnsResolver::new()
+            .with_svcb_discovery_error(
+                "agent.example.com",
+                DnsError::Timeout {
+                    fqdn: "agent.example.com".to_string(),
+                },
+            )
+            .with_txt_discovery_records(
+                "agent.example.com",
+                vec![TxtDiscoveryRecord::new(
+                    "ans1",
+                    None,
+                    "a2a",
+                    "https://agent.example.com/a2a",
+                )],
+            );
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+
+        assert!(matches!(
+            resolver.lookup_discovery(&fqdn).await,
+            Err(DnsError::Timeout { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_lookup_discovery_txt_error_propagates() {
+        let resolver = MockDnsResolver::new().with_txt_discovery_error(
+            "agent.example.com",
+            DnsError::LookupFailed {
+                fqdn: "agent.example.com".to_string(),
+                reason: "boom".to_string(),
+            },
+        );
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+
+        assert!(matches!(
+            resolver.lookup_discovery(&fqdn).await,
+            Err(DnsError::LookupFailed { .. })
+        ));
+    }
+
+    /// The mock's general per-FQDN error applies to discovery lookups too,
+    /// consistent with badge and TLSA lookups.
+    #[tokio::test]
+    async fn test_mock_general_error_applies_to_discovery() {
+        let resolver = MockDnsResolver::new().with_error(
+            "agent.example.com",
+            DnsError::Timeout {
+                fqdn: "agent.example.com".to_string(),
+            },
+        );
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+
+        assert!(resolver.lookup_svcb_discovery(&fqdn).await.is_err());
+        assert!(resolver.lookup_txt_discovery(&fqdn).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_discovery_records_found() {
+        let resolver = MockDnsResolver::new().with_svcb_discovery_records(
+            "agent.example.com",
+            vec![
+                SvcbDiscoveryRecord::new("a2a", 443),
+                SvcbDiscoveryRecord::new("mcp", 8443),
+            ],
+        );
+        let fqdn = Fqdn::new("agent.example.com").unwrap();
+
+        let records = resolver.get_discovery_records(&fqdn).await.unwrap();
+        assert_eq!(records.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_discovery_records_not_found_is_error() {
+        let resolver = MockDnsResolver::new();
+        let fqdn = Fqdn::new("unknown.example.com").unwrap();
+
+        let result = resolver.get_discovery_records(&fqdn).await;
+        assert!(matches!(result, Err(DnsError::NotFound { .. })));
     }
 }

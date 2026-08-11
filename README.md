@@ -26,6 +26,13 @@ Verification relies on:
 - **DANE/TLSA records** (optional) for additional certificate binding via DNSSEC
 - **SCITT verification** (optional) for offline-capable trust via signed status tokens and Merkle inclusion receipts
 
+Endpoint discovery reads the DNS discovery records of whichever profile the
+agent publishes, probing SVCB first and falling back to `_ans` TXT:
+- **`ANS_DNSAID` SVCB records** at the bare FQDN carrying DNS-AID SvcParams (RFC 9460) — the spec default profile per ANS-3 §6.1
+- **`ANS_TXT` `_ans` TXT records** (`p={protocol}; url={endpoint}`) — opt-in
+
+The probe order is an SDK convention, not a spec requirement.
+
 ## Installation
 
 Add to your `Cargo.toml`:

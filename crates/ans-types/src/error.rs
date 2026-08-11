@@ -60,4 +60,8 @@ pub enum ParseError {
     /// Missing required field
     #[error("Missing required field: {0}")]
     MissingField(String),
+
+    /// Record is structurally invalid for its expected form
+    #[error("Invalid record: {0}")]
+    InvalidRecord(String),
 }
