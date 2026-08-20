@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-types-v0.1.5...ans-types-v0.1.6) (2026-08-20)
+
+
+### Features
+
+* add SVCB endpoint discovery with profile autodiscovery ([#99](https://github.com/agentnameservice/ans-sdk-rust/issues/99)) ([8cfd887](https://github.com/agentnameservice/ans-sdk-rust/commit/8cfd8877280f4e042da40db0da1469ff71b940f0))
+
 ## [0.1.5](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-types-v0.1.4...ans-types-v0.1.5) (2026-06-23)
 
 
