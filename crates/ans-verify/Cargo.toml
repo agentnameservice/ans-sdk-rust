@@ -59,17 +59,22 @@ futures-util = { workspace = true }
 # SCITT verification (optional, behind "scitt" feature)
 ciborium = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
-base64 = { workspace = true, optional = true }
+# Used unconditionally for SVCB cap-sha256 (base64url) decoding; also by scitt.
+base64 = { workspace = true }
 tokio-util = { workspace = true, optional = true }
 
 [features]
 default = []
 rustls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
-scitt = ["dep:ciborium", "dep:p256", "dep:base64", "dep:tokio-util"]
+scitt = ["dep:ciborium", "dep:p256", "dep:tokio-util"]
 test-support = []
 
 [[test]]
 name = "verification_scenarios"
+required-features = ["test-support"]
+
+[[test]]
+name = "discovery_scenarios"
 required-features = ["test-support"]
 
 [[test]]

@@ -63,6 +63,14 @@ impl Fqdn {
         format!("_ra-badge.{}", self.0)
     }
 
+    /// Get the `_ans` subdomain for this FQDN (`ANS_TXT` discovery records).
+    ///
+    /// The `ANS_DNSAID` SVCB discovery records live at the bare FQDN itself
+    /// ([`Fqdn::as_str`]), not at a child label.
+    pub fn ans_discovery_name(&self) -> String {
+        format!("_ans.{}", self.0)
+    }
+
     /// Get the TLSA record name for this FQDN and port.
     pub fn tlsa_name(&self, port: u16) -> String {
         format!("_{port}._tcp.{}", self.0)
@@ -342,6 +350,12 @@ mod tests {
         fn test_tlsa_name() {
             let fqdn = Fqdn::new("agent.example.com").unwrap();
             assert_eq!(fqdn.tlsa_name(443), "_443._tcp.agent.example.com");
+        }
+
+        #[test]
+        fn test_ans_discovery_name() {
+            let fqdn = Fqdn::new("agent.example.com").unwrap();
+            assert_eq!(fqdn.ans_discovery_name(), "_ans.agent.example.com");
         }
 
         #[test]

@@ -48,9 +48,50 @@
 //! }
 //! ```
 //!
+//! ## Endpoint Discovery
+//!
+//! Beyond trust verification, the DNS layer can enumerate an agent's
+//! protocol endpoints from its published discovery records.
+//! [`DnsResolver::lookup_discovery`] autodiscovers which discovery profile
+//! the agent publishes: it probes the `ANS_DNSAID` SVCB rows at the bare FQDN
+//! (RFC 9460) first, then the `ANS_TXT` rows at `_ans.{fqdn}`. That probe
+//! order is an SDK convention rather than a spec requirement — see
+//! [`DnsResolver::lookup_discovery`] for why, and for what it means in the
+//! `ANS_TXT` / `ANS_DNSAID` transition union.
+//!
+//! ```rust,no_run
+//! use ans_verify::{DiscoveryRecord, DnsResolver, HickoryDnsResolver};
+//! use ans_types::Fqdn;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let resolver = HickoryDnsResolver::new().await?;
+//! let fqdn = Fqdn::new("agent.example.com")?;
+//!
+//! for record in resolver.get_discovery_records(&fqdn).await? {
+//!     match &record {
+//!         DiscoveryRecord::Svcb(svcb) => {
+//!             println!(
+//!                 "{:?} endpoint on port {:?}, metadata at {:?}",
+//!                 svcb.protocol(),
+//!                 svcb.port(),
+//!                 svcb.metadata_url()
+//!             );
+//!         }
+//!         DiscoveryRecord::Txt(txt) => {
+//!             println!("{:?} endpoint at {}", txt.protocol(), txt.url());
+//!         }
+//!         _ => {}
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! ## Features
 //!
 //! - DNS-based badge discovery via `_ans-badge` TXT records (with `_ra-badge` fallback)
+//! - Endpoint discovery via `ANS_DNSAID` SVCB records (RFC 9460, DNS-AID `SvcParams`)
+//!   with automatic fallback to `ANS_TXT` `_ans` TXT records
 //! - Transparency Log API integration for badge retrieval
 //! - Certificate fingerprint verification (SHA-256)
 //! - Optional DANE/TLSA verification with configurable policies
@@ -87,7 +128,10 @@ pub use dane::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use dns::MockDnsResolver;
-pub use dns::{BadgeRecord, DnsResolver, DnsResolverConfig, HickoryDnsResolver};
+pub use dns::{
+    AgentProtocol, BadgeRecord, DiscoveryRecord, DnsLookupResult, DnsResolver, DnsResolverConfig,
+    HickoryDnsResolver, SvcbDiscoveryRecord, TxtDiscoveryRecord,
+};
 pub use error::{
     AnsError, AnsResult, DaneError, DnsError, HttpError, TlogError, VerificationError,
 };

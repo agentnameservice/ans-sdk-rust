@@ -104,7 +104,7 @@ ans-client (depends on ans-types)
 
 **`ans-types`** — Shared domain types with no external dependencies beyond serialization:
 
-- `Fqdn`: Validated FQDN with `ans_badge_name()` / `ra_badge_name()` methods for DNS queries
+- `Fqdn`: Validated FQDN with `ans_badge_name()` / `ra_badge_name()` / `ans_discovery_name()` methods for DNS queries
 - `AnsName`: URI format parser (`ans://v1.0.0.agent.example.com`)
 - `Version`: Semantic version comparison
 - `Badge`, `BadgePayload`, `BadgeStatus`: Transparency log badge structures
@@ -115,7 +115,8 @@ ans-client (depends on ans-types)
 - `AnsVerifier`: High-level facade combining server and client verification
 - `ServerVerifier`: Client-side TLS verification (verifies server certificates)
 - `ClientVerifier`: Server-side mTLS verification (verifies client identity certificates)
-- `DnsResolver` trait + `HickoryDnsResolver`: DNS `_ans-badge` / `_ra-badge` TXT record lookup
+- `DnsResolver` trait + `HickoryDnsResolver`: DNS `_ans-badge` / `_ra-badge` TXT record lookup, plus discovery-record lookup for both discovery profiles
+- Endpoint discovery: `SvcbDiscoveryRecord` (`ANS_DNSAID` SVCB rows at the bare FQDN, DNS-AID SvcParams per RFC 9460), `TxtDiscoveryRecord` (`ANS_TXT` rows at `_ans.{fqdn}`), unified as `DiscoveryRecord` with `AgentProtocol` normalization
 - `TransparencyLogClient` trait + `HttpTransparencyLogClient`: Badge API client
 - `BadgeCache`: TTL-based Moka cache for badge responses
 - DANE/TLSA verification via `DanePolicy` and `TlsaRecord`
@@ -170,6 +171,43 @@ Key rules:
 - Badge fallback only when SCITT headers are completely absent
 - Terminal status (`REVOKED`/`EXPIRED`) = always reject regardless of policy
 
+### DNS Discovery Profiles
+
+Endpoint discovery (separate from the badge/TLSA trust records) supports both
+ANS-3 discovery profiles:
+
+- **`ANS_TXT`** (opt-in, ANS-3 §6.1): one `_ans.{fqdn}` TXT record per
+  endpoint (`v=ans1; version=v{semver}; p={token}; mode=direct; url={agentUrl}`)
+- **`ANS_DNSAID`** (spec default): one SVCB record per endpoint at the bare FQDN,
+  DNS-AID params in RFC 9460 Private-Use form — `key65400` (cap/metadataUrl),
+  `key65401` (cap-sha256), `key65402` (bap, authoritative protocol token),
+  `key65409` (well-known suffix)
+
+`DnsResolver::lookup_discovery` autodiscovers the published profile: SVCB
+first, `_ans` TXT fallback, first source found wins; lookup errors propagate
+without falling back. **The probe order is an SDK convention, not spec-defined**
+— ANS-3 §3.1 orders DNS ahead of the Transparency Log and does not rank the
+profiles, and the `[ANS_TXT, ANS_DNSAID]` order in §6.4 is the registry's
+emission order, not a read-side ranking. SVCB goes first because `ANS_DNSAID`
+is the default profile, so the first probe resolves for an agent on the
+default. One wrinkle: §6.4 flips SVCB to `Required=false` in the `ANS_TXT`
+transition union, so in that case first-found-wins returns the rows with the
+weaker required flag. Don't "fix" the order by citing §3.1.
+
+**`ANS_DNSAID` is the default profile and `ANS_TXT` is opt-in** (ANS-3 §6.1).
+This flipped in ans-registry#42, merged 2026-07-23 — before that `ANS_TXT` was
+the default. A local `ans-registry` checkout older than that date shows the old
+direction, so check the table on `main` before "correcting" these docs.
+
+An SVCB RRset containing an AliasMode record yields no discovery records
+(RFC 9460 §2.4.1). Protocol tokens normalize via `AgentProtocol` (`x-http` and
+`http-api` both map to `HttpApi`).
+
+Both `lookup_svcb_discovery` and `lookup_txt_discovery` are provided trait
+methods defaulting to `NotFound`, so external `DnsResolver` implementations
+stay source-compatible. Custom resolvers build rows with
+`SvcbDiscoveryRecord::from_parts` / `TxtDiscoveryRecord::parse`.
+
 ### Key Traits
 
 All async traits use `#[async_trait]`:
@@ -178,8 +216,10 @@ All async traits use `#[async_trait]`:
 // DNS resolution - implement for custom resolvers
 pub trait DnsResolver: Send + Sync {
     async fn lookup_badge(&self, fqdn: &Fqdn) -> Result<DnsLookupResult<BadgeRecord>, DnsError>;
-    async fn find_badge_for_version(&self, fqdn: &Fqdn, version: &Version) -> Result<Option<BadgeRecord>, DnsError>;
-    async fn get_tlsa_records(&self, fqdn: &Fqdn, port: u16) -> Result<Vec<TlsaRecord>, DaneError>;
+    async fn lookup_svcb_discovery(&self, fqdn: &Fqdn) -> Result<DnsLookupResult<SvcbDiscoveryRecord>, DnsError>;
+    async fn lookup_txt_discovery(&self, fqdn: &Fqdn) -> Result<DnsLookupResult<TxtDiscoveryRecord>, DnsError>;
+    // provided: lookup_discovery / get_discovery_records (autodiscovery chain),
+    // find_badge_for_version, get_tlsa_records, ...
 }
 
 // Transparency log client - implement for custom backends
@@ -197,7 +237,9 @@ use ans_verify::{MockDnsResolver, MockTransparencyLogClient};
 
 let dns = Arc::new(MockDnsResolver::new()
     .with_records("agent.example.com", vec![badge_record])
-    .with_tlsa_records("agent.example.com", 443, vec![tlsa_record]));
+    .with_tlsa_records("agent.example.com", 443, vec![tlsa_record])
+    .with_svcb_discovery_records("agent.example.com", vec![SvcbDiscoveryRecord::new("a2a", 443)])
+    .with_txt_discovery_records("agent.example.com", vec![txt_discovery_record]));
 
 let tlog = Arc::new(MockTransparencyLogClient::new()
     .with_badge("https://tlog.example.com/badge", badge));
@@ -226,6 +268,9 @@ Test fixtures use `rstest` for parameterized tests and `test-log` for tracing ou
 
 - **Badge**: Registration record from the transparency log containing agent metadata and certificate fingerprints
 - **`_ans-badge` record**: DNS TXT record at `_ans-badge.{fqdn}` pointing to badge URL (legacy: `_ra-badge`)
+- **Discovery profile**: Named DNS record family for endpoint discovery — `ANS_DNSAID` (SVCB, the spec default) or `ANS_TXT` (`_ans` TXT, opt-in); both share the same trust records
+- **SVCB discovery record**: RFC 9460 SVCB row at the bare FQDN, one per endpoint, carrying DNS-AID SvcParams in Private-Use `keyNNNNN` form (`ANS_DNSAID` profile)
+- **`_ans` record**: DNS TXT record at `_ans.{fqdn}`, one per endpoint, carrying protocol token and endpoint URL (`ANS_TXT` profile)
 - **ANS Name**: URI format `ans://v{major}.{minor}.{patch}.{fqdn}` in certificate URI SAN
 - **Server cert**: Public CA certificate for TLS server identity
 - **Identity cert**: ANS Private CA certificate for mTLS client authentication
