@@ -885,7 +885,13 @@ impl fmt::Debug for HickoryDnsResolver {
     }
 }
 
-#[allow(clippy::unused_async)] // kept async for API consistency; callers use .await
+// The constructors below stay `async` for API consistency even though they do
+// no awaiting, so callers can write `HickoryDnsResolver::with_preset(..).await`
+// alongside every other resolver entry point. Clippy 1.98 split this diagnostic
+// out of `unused_async` into `unused_async_trait_impl`, so both names are listed;
+// `unknown_lints` keeps the newer name from warning on older toolchains (MSRV is
+// 1.88).
+#[allow(unknown_lints, clippy::unused_async, clippy::unused_async_trait_impl)]
 impl HickoryDnsResolver {
     /// Create a new resolver with system configuration.
     ///
