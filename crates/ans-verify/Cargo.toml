@@ -136,3 +136,8 @@ required-features = ["scitt"]
 name = "inspect_scitt"
 path = "examples/inspect_scitt.rs"
 required-features = ["scitt"]
+
+[[example]]
+name = "local_dpop"
+path = "examples/local_dpop.rs"
+required-features = ["scitt", "test-support"]

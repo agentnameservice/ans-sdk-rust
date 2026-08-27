@@ -262,6 +262,12 @@ Outbound minting: `Signer` / `attach_identity`. Inbound: `verify_caller` (three-
 
 Callee hardening: `VerifyCallerOptions::with_trusted_authority` rejects requests for authorities this callee does not answer as (ANS-6 §7.7), and `with_artifact_cache` (`VerifiedArtifactCache`) skips re-verifying a status token or receipt whose exact bytes verified before, while still enforcing token expiry (§4.6). On an unknown signing key, `PopError::is_unknown_key_id()` signals the refresh-and-retry pattern (§9.5) — pair with `RefreshableKeyStore::refresh_if_cooldown_elapsed`.
 
+A self-contained example runs both sides of the flow in-memory, including replay rejection, the authority allowlist, and the artifact cache:
+
+```bash
+cargo run -p ans-verify --features scitt,test-support --example local_dpop
+```
+
 ## Traits
 
 Implement these traits for custom backends:

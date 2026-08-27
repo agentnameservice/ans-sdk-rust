@@ -37,6 +37,9 @@ RUST_LOG=ans_verify=debug cargo run -p ans-verify --example verify_mtls_client
 RUST_LOG=ans_verify=debug cargo run -p ans-verify --features scitt --example verify_server_scitt
 RUST_LOG=ans_verify=debug cargo run -p ans-verify --features scitt --example verify_mtls_scitt
 
+# Run the self-contained DPoP / Flavor B example (both sides, in-memory)
+cargo run -p ans-verify --features scitt,test-support --example local_dpop
+
 # Check formatting and lints
 cargo fmt --all -- --check
 cargo clippy --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt

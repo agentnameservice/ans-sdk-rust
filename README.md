@@ -326,6 +326,12 @@ let identity = verify_caller(
 
 Pass the reconstructed public request URL into `verify_caller` (`htu` comparison). Record `jti` only after binding — `verify_caller` does this; `verify_proof` records immediately and is possession-only. Harden the callee with `VerifyCallerOptions::with_trusted_authority` (authority allowlist) and `with_artifact_cache` (reuse verified status tokens and receipts across requests).
 
+Run both sides of the flow locally with the self-contained example:
+
+```bash
+cargo run -p ans-verify --features scitt,test-support --example local_dpop
+```
+
 ## Configuration
 
 ### Verifier Builder Options
