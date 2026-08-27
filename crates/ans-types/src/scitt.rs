@@ -71,8 +71,10 @@ pub enum CertType {
 impl std::str::FromStr for CertType {
     type Err = String;
 
+    /// Case-insensitive: ANS-6 §4.4 — implementations have emitted the CBOR
+    /// form in lowercase, so consumers compare the type case-insensitively.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
+        match s.to_ascii_uppercase().as_str() {
             "X509-DV-SERVER" => Ok(Self::X509DvServer),
             "X509-OV-CLIENT" => Ok(Self::X509OvClient),
             other => Err(format!("unknown cert_type: {other}")),
@@ -175,6 +177,19 @@ pub struct StatusTokenPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cert_type_parse_is_case_insensitive() {
+        assert_eq!(
+            "x509-ov-client".parse::<CertType>().unwrap(),
+            CertType::X509OvClient
+        );
+        assert_eq!(
+            "X509-DV-Server".parse::<CertType>().unwrap(),
+            CertType::X509DvServer
+        );
+        assert!("X509-EV-SERVER".parse::<CertType>().is_err());
+    }
 
     #[test]
     fn verification_tier_is_scitt() {

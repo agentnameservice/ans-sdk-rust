@@ -62,11 +62,12 @@ p256 = { workspace = true, optional = true }
 # Used unconditionally for SVCB cap-sha256 (base64url) decoding; also by scitt.
 base64 = { workspace = true }
 tokio-util = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 
 [features]
 default = []
 rustls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
-scitt = ["dep:ciborium", "dep:p256", "dep:tokio-util"]
+scitt = ["dep:ciborium", "dep:p256", "dep:tokio-util", "dep:rand"]
 test-support = []
 
 [[test]]

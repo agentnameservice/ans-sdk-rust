@@ -171,6 +171,18 @@ Key rules:
 - Badge fallback only when SCITT headers are completely absent
 - Terminal status (`REVOKED`/`EXPIRED`) = always reject regardless of policy
 
+### DPoP / Flavor B (feature = "scitt")
+
+Application-layer proof of possession for A2A traffic that crosses TLS-terminating proxies (`Signer`, `verify_caller`, `verify_proof`):
+
+1. Caller mints a compact DPoP proof (`DPoP` header) with `x5c` bound to the identity certificate
+2. Callee verifies possession, then binds the proof fingerprint to `validIdentityCerts` on the status token
+3. Optional receipt leaf identity is taken from the V2 envelope (`.payload.producer.event.ansName` / `ansId`)
+4. Missing status token is a hard reject — Flavor B does not fall back to the badge tier
+5. `jti` is recorded in the replay cache only after binding succeeds
+
+The comparison URL for `htu` is the callee's job (pass the reconstructed URL into `verify_caller`). Callee hardening lives on `VerifyCallerOptions`: `trusted_authorities` (§7.7 preflight allowlist, `UNTRUSTED_AUTHORITY` on miss) and `artifact_cache` (`VerifiedArtifactCache`, §4.6 — cached status tokens still enforce `exp`; the possession proof is never cached). `PopError::is_unknown_key_id()` is the §9.5 trigger to refresh root keys once (cooldown-gated) and retry.
+
 ### DNS Discovery Profiles
 
 Endpoint discovery (separate from the badge/TLSA trust records) supports both
@@ -280,3 +292,4 @@ Test fixtures use `rstest` for parameterized tests and `test-log` for tracing ou
 - **Status Token**: COSE_Sign1-signed current-status claim with certificate fingerprint arrays
 - **COSE_Sign1**: CBOR Object Signing (RFC 9052) — used for receipt and status token signatures
 - **C2SP key**: Key format `{issuer}+{key_id_hex}+{spki_base64}` for transparency log root keys
+- **DPoP / Flavor B**: RFC 9449 proof of possession in the `DPoP` header, bound to the identity certificate via `x5c` and to the transparency log via the status token (no mTLS required)

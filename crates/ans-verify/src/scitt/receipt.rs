@@ -78,7 +78,7 @@ struct Vdp {
 ///
 /// # Errors
 ///
-/// - Structural/CBOR errors from [`parse_cose_sign1`]
+/// - Structural/CBOR errors from `COSE_Sign1` parsing
 /// - [`ScittError::InvalidProtectedHeader`] if `vds` is missing or not 1
 /// - [`ScittError::UnknownKeyId`] if `kid` is not in `key_store`
 /// - [`ScittError::SignatureInvalid`] if ECDSA verification fails

@@ -30,7 +30,7 @@ use super::root_keys::ScittKeyStore;
 
 /// Maximum clock skew tolerance (24 hours). Larger values would make tokens
 /// effectively non-expirable.
-const MAX_CLOCK_SKEW_TOLERANCE_SECS: u64 = 24 * 60 * 60;
+pub const MAX_CLOCK_SKEW_TOLERANCE_SECS: u64 = 24 * 60 * 60;
 
 /// A status token whose COSE signature has been verified and expiry checked.
 #[derive(Debug, Clone)]
@@ -44,8 +44,9 @@ pub struct VerifiedStatusToken {
 
 /// Verify a SCITT status token: COSE signature + expiry + status check.
 ///
-/// Uses the system clock for expiry checks. See [`verify_status_token_at`]
-/// for a variant that accepts an explicit timestamp (useful in tests).
+/// Uses the system clock for expiry checks. See
+/// [`verify_status_token_at`](crate::verify_status_token_at) for a variant
+/// that accepts an explicit timestamp (useful in tests).
 ///
 /// # Steps
 /// 1. Parse `COSE_Sign1` structure
@@ -327,12 +328,19 @@ fn parse_cert_entries(arr: Vec<ciborium::Value>) -> Result<Vec<CertEntry>, Scitt
                 || matches!(&k, ciborium::Value::Text(s) if s == "cert_type");
 
             if is_fingerprint {
-                if let ciborium::Value::Text(fp_str) = v {
-                    fingerprint =
+                fingerprint = match v {
+                    ciborium::Value::Text(fp_str) => {
                         Some(CertFingerprint::parse(&fp_str).map_err(|e| {
                             ScittError::CborDecodeError(format!("fingerprint: {e}"))
-                        })?);
-                }
+                        })?)
+                    }
+                    ciborium::Value::Bytes(b) if b.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        Some(CertFingerprint::from_bytes(arr))
+                    }
+                    _ => None,
+                };
             } else if is_cert_type && let ciborium::Value::Text(t) = v {
                 cert_type = Some(t.parse::<CertType>().map_err(ScittError::CborDecodeError)?);
             }

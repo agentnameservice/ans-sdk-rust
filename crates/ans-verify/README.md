@@ -233,6 +233,35 @@ cargo run -p ans-verify --features scitt --example inspect_scitt -- \
   --agent-id b8a46f57-5599-4b4d-9a53-0313e5529694
 ```
 
+### DPoP / Flavor B (A2A without mTLS)
+
+When TLS is terminated at a proxy, the callee authenticates the caller from three artifacts on the HTTP request: a DPoP proof (`DPoP`), a status token (`X-ANS-Status-Token`), and a SCITT receipt (`X-SCITT-Receipt`). Missing status token is a hard reject.
+
+```rust
+use ans_verify::{
+    MemoryReplayCache, Signer, VerifyCallerOptions, attach_identity, verify_caller,
+};
+
+// Caller
+let proof = attach_identity(&signer, "POST", "https://payments.example.com/api/task", None)?;
+
+// Callee — pass the reconstructed request URL, not the proxy's local address
+let identity = verify_caller(
+    &proof,
+    &headers,
+    "POST",
+    "https://payments.example.com/api/task",
+    &key_store,
+    &replay,
+    VerifyCallerOptions::default(),
+)
+.await?;
+```
+
+Outbound minting: `Signer` / `attach_identity`. Inbound: `verify_caller` (three-proof bind) or `verify_proof` (possession only). Replay protection: `ReplayCache` / `MemoryReplayCache`.
+
+Callee hardening: `VerifyCallerOptions::with_trusted_authority` rejects requests for authorities this callee does not answer as (ANS-6 §7.7), and `with_artifact_cache` (`VerifiedArtifactCache`) skips re-verifying a status token or receipt whose exact bytes verified before, while still enforcing token expiry (§4.6). On an unknown signing key, `PopError::is_unknown_key_id()` signals the refresh-and-retry pattern (§9.5) — pair with `RefreshableKeyStore::refresh_if_cooldown_elapsed`.
+
 ## Traits
 
 Implement these traits for custom backends:
@@ -305,7 +334,7 @@ let verifier = ServerVerifier::builder()
 | Feature | Description |
 |---|---|
 | `rustls` | Enables `AnsServerCertVerifier` and `AnsClientCertVerifier` for rustls TLS integration |
-| `scitt` | Enables SCITT verification: `ScittKeyStore`, `verify_status_token`, `verify_receipt`, `ScittHeaderSupplier`, `HttpScittClient` |
+| `scitt` | Enables SCITT verification and ANS-6 DPoP: `ScittKeyStore`, `verify_status_token`, `verify_receipt`, `ScittHeaderSupplier`, `HttpScittClient`, `Signer`, `verify_caller` |
 | `test-support` | Exposes `MockDnsResolver`, `MockTransparencyLogClient`, and `MockScittClient` for use in downstream integration tests |
 
 ## License

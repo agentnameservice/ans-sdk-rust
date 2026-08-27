@@ -275,10 +275,11 @@ impl VerificationOutcome {
 
     /// Check if the agent is in a terminal status (revoked, expired, etc.).
     ///
-    /// Returns `true` for both badge-detected terminal status ([`InvalidStatus`])
-    /// and SCITT-detected terminal status ([`ScittError::TerminalStatus`] /
-    /// [`ScittError::AgentTerminal`]). Callers should use this instead of
-    /// pattern-matching individual variants.
+    /// Returns `true` for both badge-detected terminal status
+    /// ([`Self::InvalidStatus`]) and SCITT-detected terminal status
+    /// (`ScittError::TerminalStatus` / `ScittError::AgentTerminal`).
+    /// Callers should use this instead of pattern-matching individual
+    /// variants.
     pub fn is_terminal_status(&self) -> bool {
         match self {
             Self::InvalidStatus { status, .. } => status.should_reject(),
