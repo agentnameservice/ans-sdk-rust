@@ -144,7 +144,7 @@ Server verification (`verify_server`):
 3. Fetch badge from transparency log API
 4. Validate badge status (`Active`/`Warning`/`Deprecated` allowed)
 5. Compare server certificate fingerprint to badge's `attestations.server_cert.fingerprint`
-6. Compare certificate CN to badge's `agent.host`
+6. Anchor to the dialed host (ANS-6 §5.1): badge's `agent.host` and the certificate host must both equal the FQDN the caller dialed — badge fields alone verify a consistent story, not the right peer
 7. Optional: DANE/TLSA verification if policy enabled
 
 Client verification (`verify_client`) for mTLS:
@@ -180,9 +180,10 @@ Application-layer proof of possession for A2A traffic that crosses TLS-terminati
 
 1. Caller mints a compact DPoP proof (`DPoP` header) with `x5c` bound to the identity certificate
 2. Callee verifies possession, then binds the proof fingerprint to `validIdentityCerts` on the status token
-3. Optional receipt leaf identity is taken from the V2 envelope (`.payload.producer.event.ansName` / `ansId`)
-4. Missing status token is a hard reject — Flavor B does not fall back to the badge tier
-5. `jti` is recorded in the replay cache only after binding succeeds
+3. The `x5c[0]` validity period must contain `now` (± pop skew) — fingerprint arrays never prune rotated-away certs, so the certificate's dates are its only expiry (ANS-6 §7.5)
+4. Optional receipt leaf identity is taken from the V2 envelope (`.payload.producer.event.ansName` / `ansId`)
+5. Missing status token is a hard reject — Flavor B does not fall back to the badge tier
+6. `jti` is recorded in the replay cache only after binding succeeds
 
 The comparison URL for `htu` is the callee's job (pass the reconstructed URL into `verify_caller`). Callee hardening lives on `VerifyCallerOptions`: `trusted_authorities` (§7.7 preflight allowlist, `UNTRUSTED_AUTHORITY` on miss) and `artifact_cache` (`VerifiedArtifactCache`, §4.6 — cached status tokens still enforce `exp`; the possession proof is never cached). `PopError::is_unknown_key_id()` is the §9.5 trigger to refresh root keys once (cooldown-gated) and retry.
 

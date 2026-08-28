@@ -611,6 +611,42 @@ async fn test_3_3_dns_san_mismatch() {
     );
 }
 
+/// ANS-6 §5.1 dialed-host anchor: a badge and certificate that agree with
+/// each other but name a different host than the caller dialed → reject.
+/// Without the anchor a spoofed `_ans-badge` record pointing at a consistent
+/// (badge, cert) pair for another agent would verify.
+#[tokio::test]
+async fn test_3_3b_badge_host_not_dialed_host() {
+    let dialed_host = "victim.example.com";
+    let other_host = "attacker.example.com";
+    // Badge and cert consistently name attacker.example.com.
+    let b = badge(other_host, "v1.0.0", SERVER_FP, IDENTITY_FP);
+
+    let dns = Arc::new(MockDnsResolver::new().with_records(
+        dialed_host,
+        vec![dns_record(Some(Version::new(1, 0, 0)), BADGE_URL_V1)],
+    ));
+    let tlog = Arc::new(MockTransparencyLogClient::new().with_badge(BADGE_URL_V1, b));
+
+    let verifier = server_verifier(dns, tlog).await;
+    let outcome = verifier
+        .verify(
+            &Fqdn::new(dialed_host).unwrap(),
+            &server_cert(other_host, SERVER_FP),
+        )
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            VerificationOutcome::HostnameMismatch { ref expected, ref actual, .. }
+                if expected == dialed_host && actual == other_host
+        ),
+        "Expected HostnameMismatch anchored to the dialed host, got: {:?}",
+        outcome
+    );
+}
+
 /// §3.4 Fingerprint mismatch after renewal, refresh resolves → pass.
 ///
 /// Simulates: verifier has cached stale badge (old fingerprint), server renewed

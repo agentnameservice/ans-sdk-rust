@@ -207,9 +207,12 @@ pub enum VerificationOutcome {
 
     /// Hostname does not match badge.
     HostnameMismatch {
-        /// Expected hostname from badge.
+        /// The host the verification is anchored to. For server verification
+        /// this is the host the caller dialed (ANS-6 §5.1); for client
+        /// verification it is the badge's `agent.host`.
         expected: String,
-        /// Actual hostname from certificate.
+        /// The hostname that failed the comparison (badge `agent.host` or
+        /// certificate host).
         actual: String,
         /// The badge that didn't match.
         badge: Badge,
@@ -551,7 +554,7 @@ impl ServerVerifier {
             if !cached_badges.is_empty() {
                 tracing::debug!(fqdn = %fqdn, count = cached_badges.len(), "Scanning cached badges");
                 for cached in &cached_badges {
-                    let outcome = self.verify_against_badge(&cached.badge, server_cert, true);
+                    let outcome = self.verify_against_badge(&cached.badge, server_cert, fqdn, true);
                     if outcome.is_success() {
                         tracing::debug!(fqdn = %fqdn, "Cache hit — badge matched");
                         return outcome;
@@ -680,7 +683,7 @@ impl ServerVerifier {
                 }
             }
 
-            let outcome = self.verify_against_badge(&badge, server_cert, true);
+            let outcome = self.verify_against_badge(&badge, server_cert, fqdn, true);
 
             match &outcome {
                 VerificationOutcome::Verified { .. } => {
@@ -887,7 +890,7 @@ impl ServerVerifier {
                 }
             }
 
-            let outcome = self.verify_against_badge(&badge, server_cert, true);
+            let outcome = self.verify_against_badge(&badge, server_cert, fqdn, true);
 
             match &outcome {
                 VerificationOutcome::Verified { .. } => {
@@ -947,6 +950,7 @@ impl ServerVerifier {
         &self,
         badge: &Badge,
         cert: &CertIdentity,
+        dialed: &Fqdn,
         is_server: bool,
     ) -> VerificationOutcome {
         let cert_type = if is_server { "server" } else { "identity" };
@@ -992,25 +996,43 @@ impl ServerVerifier {
         }
         tracing::debug!("Fingerprint matches");
 
-        // Compare hostname
-        let expected_host = badge.agent_host();
-        let actual_host = cert.fqdn().unwrap_or("");
+        // Compare hostnames, anchored to the host the caller dialed (ANS-6
+        // §5.1): badge fields alone verify a consistent story, not the right
+        // peer, so both the badge's agent.host and the certificate's host
+        // must equal the dialed name.
+        let dialed_host = dialed.as_str();
+        let badge_host = badge.agent_host();
+        let cert_host = cert.fqdn().unwrap_or("");
 
         tracing::debug!(
-            expected = %expected_host,
-            actual = %actual_host,
-            "Comparing hostnames"
+            dialed = %dialed_host,
+            badge = %badge_host,
+            cert = %cert_host,
+            "Comparing hostnames against the dialed host"
         );
 
-        if !actual_host.eq_ignore_ascii_case(expected_host) {
+        if !badge_host.eq_ignore_ascii_case(dialed_host) {
             tracing::error!(
-                expected = %expected_host,
-                actual = %actual_host,
-                "Hostname MISMATCH"
+                dialed = %dialed_host,
+                badge = %badge_host,
+                "Badge agent.host does not match the dialed host"
             );
             return VerificationOutcome::HostnameMismatch {
-                expected: expected_host.to_string(),
-                actual: actual_host.to_string(),
+                expected: dialed_host.to_string(),
+                actual: badge_host.to_string(),
+                badge: badge.clone(),
+            };
+        }
+
+        if !cert_host.eq_ignore_ascii_case(dialed_host) {
+            tracing::error!(
+                dialed = %dialed_host,
+                cert = %cert_host,
+                "Certificate hostname does not match the dialed host"
+            );
+            return VerificationOutcome::HostnameMismatch {
+                expected: dialed_host.to_string(),
+                actual: cert_host.to_string(),
                 badge: badge.clone(),
             };
         }
@@ -1038,7 +1060,8 @@ impl ServerVerifier {
                 if let Some(cache) = &self.cache {
                     for cached in cache.get_all_for_fqdn(fqdn).await {
                         if cached.fetched_at.elapsed() < max_staleness {
-                            let outcome = self.verify_against_badge(&cached.badge, cert, true);
+                            let outcome =
+                                self.verify_against_badge(&cached.badge, cert, fqdn, true);
                             if outcome.is_success() {
                                 return outcome;
                             }
@@ -1083,7 +1106,8 @@ impl ServerVerifier {
                 if let Some(cache) = &self.cache {
                     for cached in cache.get_all_for_fqdn(fqdn).await {
                         if cached.fetched_at.elapsed() < max_staleness {
-                            let outcome = self.verify_against_badge(&cached.badge, cert, true);
+                            let outcome =
+                                self.verify_against_badge(&cached.badge, cert, fqdn, true);
                             if outcome.is_success() {
                                 return outcome;
                             }
@@ -1919,6 +1943,7 @@ impl AnsVerifier {
                     key_store,
                     config,
                     true,
+                    Some(parsed_fqdn.as_str()),
                     scitt_cache,
                 )
                 .await;
@@ -1993,6 +2018,7 @@ impl AnsVerifier {
                     key_store,
                     config,
                     false,
+                    None,
                     scitt_cache,
                 )
                 .await;
@@ -2053,6 +2079,7 @@ impl AnsVerifier {
             key_store,
             config,
             true,
+            Some(fqdn.as_str()),
             scitt_cache,
         )
         .await
@@ -2096,6 +2123,7 @@ impl AnsVerifier {
             key_store,
             config,
             false,
+            None,
             scitt_cache,
         )
         .await
@@ -2125,6 +2153,12 @@ impl AnsVerifier {
     /// The `is_server` flag controls which cert array to match:
     /// - `true`: matches against `valid_server_certs`
     /// - `false`: matches against `valid_identity_certs`
+    ///
+    /// `dialed_host` anchors server verification to the host the caller
+    /// dialed (ANS-6 §5.2): the status token's `ansName` host must equal it.
+    /// Client verification passes `None` — there the certificate's own CN is
+    /// the anchor. The check runs on cache hits too, since the outcome cache
+    /// is keyed by artifact bytes, not by the dialed host.
     #[cfg(feature = "scitt")]
     #[allow(clippy::too_many_lines)] // verification + caching flow reads best as a single method
     async fn try_scitt_verification(
@@ -2133,6 +2167,7 @@ impl AnsVerifier {
         key_store: &Arc<crate::scitt::RefreshableKeyStore>,
         config: &ScittConfig,
         is_server: bool,
+        dialed_host: Option<&str>,
         cache: Option<&crate::scitt::ScittVerificationCache>,
     ) -> Option<VerificationOutcome> {
         let token_bytes = headers.status_token.as_ref()?;
@@ -2151,6 +2186,9 @@ impl AnsVerifier {
                 .await
         {
             tracing::debug!("SCITT verification cache hit (Layer 2 — full outcome)");
+            if let Some(e) = Self::check_dialed_host(&outcome.verified_token.payload, dialed_host) {
+                return Some(e);
+            }
             return Some(VerificationOutcome::ScittVerified {
                 status_token: (*outcome.verified_token).clone(),
                 tier: outcome.tier,
@@ -2236,6 +2274,11 @@ impl AnsVerifier {
             ));
         }
 
+        // ── Dialed-host anchor (server verification, ANS-6 §5.2) ────────
+        if let Some(e) = Self::check_dialed_host(&verified_token.payload, dialed_host) {
+            return Some(e);
+        }
+
         // ── Receipt verification (Layer 1 cached) ──────────────────────
         let tier = if let Some(receipt_bytes) = &headers.receipt {
             // Safety: receipt_hash is always Some when receipt bytes are present
@@ -2304,6 +2347,35 @@ impl AnsVerifier {
             matched_fingerprint: cert.fingerprint().clone(),
             badge: None,
         })
+    }
+
+    /// ANS-6 §5.2: for server verification, the status token's `ansName`
+    /// host must equal the host the caller resolved and dialed — the
+    /// artifacts alone verify a consistent story, not the right peer.
+    ///
+    /// Returns `Some(rejection)` on mismatch, `None` when the check passes
+    /// or no dialed host applies (client verification).
+    #[cfg(feature = "scitt")]
+    fn check_dialed_host(
+        payload: &ans_types::StatusTokenPayload,
+        dialed_host: Option<&str>,
+    ) -> Option<VerificationOutcome> {
+        let dialed = dialed_host?;
+        let token_host = payload.ans_name.fqdn().as_str();
+        if !token_host.eq_ignore_ascii_case(dialed) {
+            tracing::error!(
+                dialed = %dialed,
+                token = %token_host,
+                "Status token host does not match the dialed host"
+            );
+            return Some(VerificationOutcome::ScittError(
+                crate::scitt::ScittError::HostMismatch {
+                    expected: dialed.to_string(),
+                    actual: token_host.to_string(),
+                },
+            ));
+        }
+        None
     }
 }
 

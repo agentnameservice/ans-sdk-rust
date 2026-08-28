@@ -39,6 +39,14 @@ fn make_tl_key(seed: u8) -> (SigningKey, ScittKeyStore) {
 }
 
 fn identity_material(seed: u8, ans_name: &str) -> (SigningKey, Vec<u8>, CertFingerprint) {
+    identity_material_with_validity(seed, ans_name, None)
+}
+
+fn identity_material_with_validity(
+    seed: u8,
+    ans_name: &str,
+    validity: Option<((i32, u8, u8), (i32, u8, u8))>,
+) -> (SigningKey, Vec<u8>, CertFingerprint) {
     let signing_key = SigningKey::from_slice(&[seed; 32]).unwrap();
     let pkcs8 = signing_key.to_pkcs8_der().unwrap();
     let key_pair = KeyPair::try_from(pkcs8.as_bytes()).unwrap();
@@ -48,6 +56,10 @@ fn identity_material(seed: u8, ans_name: &str) -> (SigningKey, Vec<u8>, CertFing
         .as_str()
         .to_string();
     let mut params = CertificateParams::default();
+    if let Some((nb, na)) = validity {
+        params.not_before = rcgen::date_time_ymd(nb.0, nb.1, nb.2);
+        params.not_after = rcgen::date_time_ymd(na.0, na.1, na.2);
+    }
     params
         .distinguished_name
         .push(DnType::CommonName, host.clone());
@@ -416,6 +428,30 @@ async fn stale_proof_rejected() {
     .await
     .unwrap_err();
     assert_eq!(err.kind, PopErrorKind::ProofStale);
+}
+
+#[tokio::test]
+async fn cert_outside_validity_window_rejected() {
+    // NOW is in 2026 — a 2020–2021 certificate is expired and a 2030–2031
+    // certificate is not yet valid (ANS-6 §7.4 step 3 / §7.5).
+    for validity in [((2020, 1, 1), (2021, 1, 1)), ((2030, 1, 1), (2031, 1, 1))] {
+        let (key, cert, _) = identity_material_with_validity(26, ANS_NAME, Some(validity));
+        let signer = signer_at_now(key, cert);
+        let proof = signer.sign(METHOD, URL, None).unwrap();
+        let err = verify_proof(
+            &proof,
+            METHOD,
+            URL,
+            &replay(),
+            VerifyProofOptions {
+                now: Some(NOW),
+                ..VerifyProofOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, PopErrorKind::CertInvalid);
+    }
 }
 
 #[tokio::test]

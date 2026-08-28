@@ -25,6 +25,10 @@ const BUCKET_WIDTH_SECS: i64 = 5;
 /// non-error `false` means the key was stored. An error (for example capacity)
 /// MUST fail closed — never silently admit a possibly-replayed proof.
 ///
+/// Implementations backed by a shared store MUST consult it with a deadline:
+/// a timeout is a rejection, never a skip (ANS-6 §9.6) — skipping the `jti`
+/// check reopens the replay exposure single-use proofs exist to close.
+///
 /// `key` is a fixed-width digest of the proof's `jti`, never the raw claim.
 #[async_trait]
 pub trait ReplayCache: Send + Sync {

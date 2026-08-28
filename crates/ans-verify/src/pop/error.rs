@@ -20,7 +20,7 @@ pub enum PopErrorKind {
     ReplayCacheFull,
     /// JWS signature does not verify under the `x5c[0]` key.
     SignatureInvalid,
-    /// Missing, unparseable, or non-P-256 `x5c` leaf.
+    /// Missing, unparseable, non-P-256, or out-of-validity `x5c` leaf.
     CertInvalid,
     /// Header `jwk` does not match the `x5c[0]` public key.
     KeyMismatch,

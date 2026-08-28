@@ -422,6 +422,41 @@ async fn test_s1_1_valid_token_server_verify() {
     }
 }
 
+/// ANS-6 §5.2 dialed-host anchor: a valid status token whose `ansName` names
+/// a different host than the one the caller dialed → reject, even though the
+/// certificate fingerprint is in `validServerCerts`.
+#[tokio::test]
+async fn test_s1_1b_token_host_not_dialed_host() {
+    let dialed_host = "other.example.com";
+    let (signing_key, store) = make_key_and_store(1);
+    let store = Arc::new(store);
+    // Token names HOST (agent.example.com), caller dials other.example.com.
+    let token = make_server_token(&signing_key, SERVER_FP);
+
+    let verifier = make_scitt_verifier(
+        dialed_host,
+        SERVER_FP,
+        IDENTITY_FP,
+        store,
+        ScittTierPolicy::ScittWithBadgeFallback,
+    )
+    .await;
+    let cert = server_cert(dialed_host, SERVER_FP);
+    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+
+    let outcome = verifier
+        .verify_server_with_scitt(dialed_host, &cert, &headers)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            VerificationOutcome::ScittError(ScittError::HostMismatch { ref expected, ref actual })
+                if expected == dialed_host && actual == HOST
+        ),
+        "Expected HostMismatch anchored to the dialed host, got: {outcome:?}"
+    );
+}
+
 /// S1.2: Valid status token, mTLS verify → ScittVerified
 #[tokio::test]
 async fn test_s1_2_valid_token_mtls_verify() {

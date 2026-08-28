@@ -115,13 +115,17 @@ impl VerifyCallerOptions {
 ///
 /// The `htu` check is only as trustworthy as `raw_url`. Its authority MUST
 /// come from configuration or a header the fronting proxy sets and strips
-/// from clients — never from the request's own `Host` or a client-supplied
-/// `X-Forwarded-*` — and it MUST be joined with **this request's** path.
-/// A `Host`-derived URL lets a proof captured for another origin replay
-/// here; a constant URL collapses `htu` to one value across all paths.
-/// Setting [`VerifyCallerOptions::trusted_authorities`] adds the allowlist
-/// half of the §7.7 defense: a `raw_url` for a foreign authority is then
-/// rejected before any proof verification.
+/// from clients — deriving it from the request's own `Host` or a
+/// client-supplied `X-Forwarded-*` is a MUST NOT — and it MUST be joined
+/// with **this request's** path. A `Host`-derived URL lets a proof captured
+/// for another origin replay here; a constant URL collapses `htu` to one
+/// value across all paths. Setting
+/// [`VerifyCallerOptions::trusted_authorities`] adds the allowlist half of
+/// the §7.7 defense: a `raw_url` for a foreign authority is then rejected
+/// before any proof verification. §7.7 requires deployments to fail startup
+/// when neither an allowlist nor an externally-configured URL is wired —
+/// this library cannot see your startup, so enforce that in the embedding
+/// service.
 ///
 /// Callers should also run the request-level preflight first: reject the
 /// request via [`super::reject_duplicate_header`] when `DPoP`,

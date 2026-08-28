@@ -59,9 +59,9 @@ pub struct VerifyProofOptions {
 /// Verify a compact `DPoP` proof against an HTTP method and URL.
 ///
 /// Order: size cap, compact structure, pinned `typ`/`alg` plus required
-/// `jwk`/`x5c`, P-256 leaf, jwk↔x5c key equality, signature, `htm`,
-/// normalized `htu`, `ath` ↔ presented token, `iat` window, `jti` presence
-/// and size, then replay commit.
+/// `jwk`/`x5c`, P-256 leaf within its validity window, jwk↔x5c key equality,
+/// signature, `htm`, normalized `htu`, `ath` ↔ presented token, `iat` window,
+/// `jti` presence and size, then replay commit.
 ///
 /// A proof verified here is well-formed but **not trusted**: nothing has
 /// established that its certificate belongs to a live ANS agent. Prefer
@@ -100,12 +100,13 @@ pub fn verify_proof_unrecorded(
         .skew
         .filter(|d| *d > Duration::ZERO)
         .unwrap_or(DEFAULT_POP_SKEW);
+    let skew_secs = i64::try_from(skew.as_secs()).unwrap_or(i64::MAX);
     let now = opts.now.unwrap_or_else(|| chrono::Utc::now().timestamp());
 
     let (header_b64, payload_b64, sig_b64) = split_compact_jws(proof_jws)?;
     let header = decode_proof_header(header_b64)?;
     accept_es256_dpop(&header)?;
-    let (cert_der, pub_key) = leaf_cert(&header)?;
+    let (cert_der, pub_key) = leaf_cert(&header, now, skew_secs)?;
     match_jwk_to_cert(&header.jwk, &pub_key)?;
     let signing_input = jws_signing_input(header_b64, payload_b64);
     verify_es256(&pub_key, signing_input.as_bytes(), sig_b64)?;
@@ -126,7 +127,6 @@ pub fn verify_proof_unrecorded(
         ));
     }
 
-    let skew_secs = i64::try_from(skew.as_secs()).unwrap_or(i64::MAX);
     Ok(ProofResult {
         fingerprint: CertFingerprint::from_der(&cert_der),
         jkt: jwk_thumbprint(&pub_key)?,
