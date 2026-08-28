@@ -70,6 +70,11 @@ rustls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
 scitt = ["dep:ciborium", "dep:p256", "dep:tokio-util", "dep:rand"]
 test-support = []
 
+[[bench]]
+name = "scitt_verification"
+harness = false
+required-features = ["scitt", "test-support"]
+
 [[test]]
 name = "verification_scenarios"
 required-features = ["test-support"]
@@ -87,6 +92,7 @@ name = "scitt_real_data"
 required-features = ["test-support", "scitt"]
 
 [dev-dependencies]
+criterion = { version = "0.7", features = ["async_tokio"] }
 tokio-test = { workspace = true }
 wiremock = { workspace = true }
 rstest = { workspace = true }

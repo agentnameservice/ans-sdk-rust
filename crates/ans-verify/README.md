@@ -268,6 +268,12 @@ A self-contained example runs both sides of the flow in-memory, including replay
 cargo run -p ans-verify --features scitt,test-support --example local_dpop
 ```
 
+Criterion benchmarks cover offline verification (status token, receipt at log sizes up to 2^30 entries, proof minting, and the full caller flow cold vs. artifact-cache warm):
+
+```bash
+cargo bench -p ans-verify --features scitt,test-support
+```
+
 ## Traits
 
 Implement these traits for custom backends:
