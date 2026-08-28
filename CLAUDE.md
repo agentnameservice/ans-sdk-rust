@@ -42,6 +42,8 @@ cargo run -p ans-verify --features scitt,test-support --example local_dpop
 
 # Run SCITT/DPoP verification benchmarks (criterion)
 cargo bench -p ans-verify --features scitt,test-support
+# ... with ring-backed ECDSA verification (fast-verify feature)
+cargo bench -p ans-verify --features scitt,test-support,fast-verify
 
 # Check formatting and lints
 cargo fmt --all -- --check

@@ -63,11 +63,16 @@ p256 = { workspace = true, optional = true }
 base64 = { workspace = true }
 tokio-util = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
 
 [features]
 default = []
 rustls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
 scitt = ["dep:ciborium", "dep:p256", "dep:tokio-util", "dep:rand"]
+# Assembly-optimized ECDSA P-256 verification via ring (~3x faster than the
+# pure-Rust p256 default). ring is the same backend the `rustls` feature
+# already links for TLS.
+fast-verify = ["scitt", "dep:ring"]
 test-support = []
 
 [[bench]]

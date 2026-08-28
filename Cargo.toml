@@ -47,6 +47,7 @@ rsa = { version = "0.9", features = ["pem"] }
 rand = "0.10"
 x509-parser = "0.18"
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+ring = "0.17"
 ciborium = "0.2"
 base64 = "0.23"
 
@@ -73,7 +74,7 @@ tokio-util = "0.7"
 futures-util = "0.3"
 
 # Caching
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 
 # Testing
 tokio-test = "0.4"
@@ -81,6 +82,13 @@ wiremock = "0.6"
 rstest = "0.26"
 test-log = { version = "0.2", features = ["trace"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Benchmarks measure pure-Rust field arithmetic, which benefits from LTO and
+# a single codegen unit. Profiles only apply to builds in this workspace —
+# dependents' binaries choose their own.
+[profile.bench]
+lto = "thin"
+codegen-units = 1
 
 [workspace.lints.clippy]
 # ── Pedantic (opinionated but high-value) ──

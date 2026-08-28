@@ -347,6 +347,7 @@ let verifier = ServerVerifier::builder()
 |---|---|
 | `rustls` | Enables `AnsServerCertVerifier` and `AnsClientCertVerifier` for rustls TLS integration |
 | `scitt` | Enables SCITT verification and ANS-6 DPoP: `ScittKeyStore`, `verify_status_token`, `verify_receipt`, `ScittHeaderSupplier`, `HttpScittClient`, `Signer`, `verify_caller` |
+| `fast-verify` | Swaps ECDSA P-256 *verification* to `ring`'s assembly implementation (~3x faster; implies `scitt`). The default stays pure-Rust `p256`. `ring` is the same backend the `rustls` feature already links |
 | `test-support` | Exposes `MockDnsResolver`, `MockTransparencyLogClient`, and `MockScittClient` for use in downstream integration tests |
 
 ## License

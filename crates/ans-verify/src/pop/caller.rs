@@ -17,7 +17,6 @@ use crate::scitt::{
     MAX_CLOCK_SKEW_TOLERANCE_SECS, ScittHeaders, ScittKeyStore, VerifiedReceipt,
     matches_identity_cert, verify_receipt, verify_status_token_at,
 };
-use crate::verify::CertIdentity;
 
 /// Default status-token clock-skew tolerance (matches [`crate::ScittConfig`]).
 const DEFAULT_STATUS_SKEW: Duration = Duration::from_secs(60);
@@ -186,7 +185,13 @@ pub async fn verify_caller(
         skew: opts.pop_skew,
         now: Some(now),
     };
-    let proof = verify_proof_unrecorded(proof_jws, method, raw_url, &proof_opts)?;
+    let proof = verify_proof_unrecorded(
+        proof_jws,
+        method,
+        raw_url,
+        &proof_opts,
+        opts.artifact_cache.as_ref(),
+    )?;
 
     let status_skew = opts.status_skew.unwrap_or(DEFAULT_STATUS_SKEW);
     let status = verified_status_payload(
@@ -297,10 +302,7 @@ fn bind_caller(
         ));
     }
 
-    let cert = CertIdentity::from_der(&proof.cert_der).map_err(|e| {
-        PopError::with_source(PopErrorKind::CertInvalid, "parse proof certificate", e)
-    })?;
-    let cert_ans = cert.ans_name().ok_or_else(|| {
+    let cert_ans = proof.ans_name.as_ref().ok_or_else(|| {
         PopError::new(
             PopErrorKind::BindingFailed,
             "proof certificate has no ans:// URI SAN",

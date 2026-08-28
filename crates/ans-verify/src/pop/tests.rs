@@ -455,6 +455,68 @@ async fn cert_outside_validity_window_rejected() {
 }
 
 #[tokio::test]
+async fn cached_cert_still_enforces_validity() {
+    // ~30 days after NOW — past the cert's 2026-09-01 notAfter.
+    const LATER: i64 = NOW + 2_592_000;
+    fn frozen_much_later() -> i64 {
+        LATER
+    }
+
+    let (id_key, cert, fp) =
+        identity_material_with_validity(27, ANS_NAME, Some(((2020, 1, 1), (2026, 9, 1))));
+    let (tl_key, store) = make_tl_key(12);
+    let agent_id = Uuid::nil();
+    let token = make_status_token(&tl_key, agent_id, ANS_NAME, &fp);
+    let receipt = make_receipt(&tl_key, agent_id, ANS_NAME);
+    let cache = VerifiedArtifactCache::new(8);
+    let signer = Signer::new(id_key, cert).unwrap();
+
+    let proof = signer
+        .clone()
+        .with_clock(frozen_now)
+        .sign(METHOD, URL, None)
+        .unwrap();
+    verify_caller(
+        &proof,
+        &headers(&receipt, &token),
+        METHOD,
+        URL,
+        &store,
+        &replay(),
+        VerifyCallerOptions {
+            now: Some(NOW),
+            ..VerifyCallerOptions::default()
+        }
+        .with_artifact_cache(cache.clone()),
+    )
+    .await
+    .unwrap();
+
+    // The parsed cert is cached now; a request after notAfter must still
+    // reject — validity is time-dependent and never cached.
+    let proof2 = signer
+        .with_clock(frozen_much_later)
+        .sign(METHOD, URL, None)
+        .unwrap();
+    let err = verify_caller(
+        &proof2,
+        &headers(&receipt, &token),
+        METHOD,
+        URL,
+        &store,
+        &MemoryReplayCache::new(16).with_clock(frozen_much_later),
+        VerifyCallerOptions {
+            now: Some(LATER),
+            ..VerifyCallerOptions::default()
+        }
+        .with_artifact_cache(cache),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::CertInvalid);
+}
+
+#[tokio::test]
 async fn verify_caller_binds_three_proofs() {
     let (id_key, cert, fp) = identity_material(13, ANS_NAME);
     let (tl_key, store) = make_tl_key(1);

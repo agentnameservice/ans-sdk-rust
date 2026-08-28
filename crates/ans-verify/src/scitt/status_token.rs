@@ -21,10 +21,9 @@ use std::collections::BTreeMap;
 
 use ans_types::{BadgeStatus, CertEntry, CertFingerprint, CertType, StatusTokenPayload};
 use p256::ecdsa::Signature;
-use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
 use uuid::Uuid;
 
-use super::cose::{compute_sig_structure_digest, parse_cose_sign1};
+use super::cose::{build_sig_structure, parse_cose_sign1};
 use super::error::ScittError;
 use super::root_keys::ScittKeyStore;
 
@@ -90,7 +89,7 @@ pub fn verify_status_token_at(
     let parsed = parse_cose_sign1(token_bytes)?;
 
     // Step 2: verify ECDSA P-256 signature
-    let digest = compute_sig_structure_digest(&parsed.protected_bytes, &parsed.payload)?;
+    let sig_structure = build_sig_structure(&parsed.protected_bytes, &parsed.payload)?;
     let kid_hex = hex::encode(parsed.protected.kid);
     let sig = Signature::from_slice(&parsed.signature).map_err(|_| {
         tracing::warn!(kid = %kid_hex, "ECDSA signature encoding invalid");
@@ -100,10 +99,10 @@ pub fn verify_status_token_at(
     })?;
     let trusted_key = key_store.get(parsed.protected.kid)?;
     tracing::debug!(kid = %kid_hex, key_domain = %trusted_key.name, "Key lookup succeeded");
-    trusted_key.key.verify_prehash(&digest, &sig).map_err(|_| {
+    if !crate::p256_verify::verify_p256_sha256(&trusted_key.key, &sig_structure, &sig) {
         tracing::warn!(kid = %kid_hex, "ECDSA signature verification failed");
-        ScittError::SignatureInvalid
-    })?;
+        return Err(ScittError::SignatureInvalid);
+    }
     tracing::debug!(kid = %kid_hex, "ECDSA signature verified");
 
     // Step 2b: bind iss claim to signing key domain (mirrors receipt.rs)
@@ -374,6 +373,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::scitt::cose::compute_sig_structure_digest;
     use crate::scitt::root_keys::ScittKeyStore;
 
     use base64::Engine as _;

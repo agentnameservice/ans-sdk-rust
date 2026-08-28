@@ -19,6 +19,7 @@
 
 use std::io::Cursor;
 
+#[cfg(any(test, feature = "test-support"))]
 use sha2::{Digest, Sha256};
 
 use super::error::ScittError;
@@ -309,12 +310,15 @@ pub fn build_sig_structure(protected_bytes: &[u8], payload: &[u8]) -> Result<Vec
     Ok(out)
 }
 
-/// Returns the SHA-256 digest of the `Sig_structure`, ready for ECDSA `verify_prehash`.
+/// Returns the SHA-256 digest of the `Sig_structure`, ready for ECDSA
+/// `sign_prehash` — used by test fixtures that mint COSE artifacts.
+/// Verification hashes via the backend in `crate::p256_verify` instead.
 ///
 /// # Errors
 ///
 /// Returns [`ScittError::CborDecodeError`] if CBOR serialization fails (should not
 /// happen with well-formed inputs).
+#[cfg(any(test, feature = "test-support"))]
 pub fn compute_sig_structure_digest(
     protected_bytes: &[u8],
     payload: &[u8],

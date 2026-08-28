@@ -6,6 +6,7 @@ use ans_types::StatusTokenPayload;
 use moka::future::Cache;
 use sha2::{Digest, Sha256};
 
+use super::proof::LeafCert;
 use crate::scitt::VerifiedReceipt;
 
 /// Default maximum cached entries per artifact type.
@@ -18,7 +19,9 @@ pub const DEFAULT_ARTIFACT_CACHE_ENTRIES: u64 = 1024;
 /// cache in [`super::VerifyCallerOptions`] lets [`super::verify_caller`]
 /// re-run cryptographic verification only when the presented bytes change or
 /// a cached token's `exp` passes. The `DPoP` possession proof is never
-/// cached — it is single-use by design.
+/// cached — it is single-use by design — but the parsed `x5c[0]` certificate
+/// is reused for identical entry bytes; its validity window and signature
+/// still check on every request.
 ///
 /// Scope one cache per trusted-key-store configuration: a hit vouches for
 /// the exact bytes under the key store they first verified against.
@@ -28,6 +31,11 @@ pub const DEFAULT_ARTIFACT_CACHE_ENTRIES: u64 = 1024;
 pub struct VerifiedArtifactCache {
     status_tokens: Cache<[u8; 32], Arc<StatusTokenPayload>>,
     receipts: Cache<[u8; 32], Arc<VerifiedReceipt>>,
+    // Parsed x5c[0] entries, keyed by the entry's base64 bytes. Entries are
+    // pure functions of their key preimage (no trust decision is cached);
+    // the time-dependent validity check still runs per request. Sync cache:
+    // the proof path has no await points.
+    proof_certs: moka::sync::Cache<[u8; 32], Arc<LeafCert>>,
 }
 
 impl std::fmt::Debug for VerifiedArtifactCache {
@@ -35,6 +43,7 @@ impl std::fmt::Debug for VerifiedArtifactCache {
         f.debug_struct("VerifiedArtifactCache")
             .field("status_tokens", &self.status_tokens.entry_count())
             .field("receipts", &self.receipts.entry_count())
+            .field("proof_certs", &self.proof_certs.entry_count())
             .finish()
     }
 }
@@ -60,6 +69,7 @@ impl VerifiedArtifactCache {
         Self {
             status_tokens: Cache::new(max_entries),
             receipts: Cache::new(max_entries),
+            proof_certs: moka::sync::Cache::new(max_entries),
         }
     }
 
@@ -82,5 +92,13 @@ impl VerifiedArtifactCache {
 
     pub(crate) async fn store_receipt(&self, key: [u8; 32], receipt: Arc<VerifiedReceipt>) {
         self.receipts.insert(key, receipt).await;
+    }
+
+    pub(crate) fn proof_cert(&self, key: &[u8; 32]) -> Option<Arc<LeafCert>> {
+        self.proof_certs.get(key)
+    }
+
+    pub(crate) fn store_proof_cert(&self, key: [u8; 32], cert: Arc<LeafCert>) {
+        self.proof_certs.insert(key, cert);
     }
 }

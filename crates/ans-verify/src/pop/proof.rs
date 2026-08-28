@@ -89,35 +89,71 @@ pub fn accept_es256_dpop(header: &ProofHeader) -> Result<(), PopError> {
     Ok(())
 }
 
-pub fn leaf_cert(
-    header: &ProofHeader,
-    now: i64,
-    skew_secs: i64,
-) -> Result<(Vec<u8>, VerifyingKey), PopError> {
-    let der = BASE64_STANDARD.decode(&header.x5c[0]).map_err(|e| {
+/// Everything derivable from an `x5c[0]` entry alone. A pure function of the
+/// entry's bytes, so [`super::VerifiedArtifactCache`] can cache it keyed by
+/// those bytes — only the time-dependent [`check_cert_validity`] runs per
+/// request.
+#[derive(Debug, Clone)]
+pub struct LeafCert {
+    /// DER of the certificate.
+    pub der: Vec<u8>,
+    /// The certificate's ECDSA P-256 public key.
+    pub key: VerifyingKey,
+    /// SHA-256 fingerprint of `der`.
+    pub fingerprint: ans_types::CertFingerprint,
+    /// RFC 7638 thumbprint of `key`.
+    pub jkt: String,
+    /// The certificate's `ans://` URI SAN, when present.
+    pub ans_name: Option<ans_types::AnsName>,
+    /// Validity bounds as Unix seconds.
+    pub not_before: i64,
+    /// Validity bounds as Unix seconds.
+    pub not_after: i64,
+}
+
+pub fn parse_leaf_cert(x5c0: &str) -> Result<LeafCert, PopError> {
+    let der = BASE64_STANDARD.decode(x5c0).map_err(|e| {
         PopError::with_source(PopErrorKind::CertInvalid, "x5c[0] std-base64 decode", e)
     })?;
     let (_, cert) = x509_parser::parse_x509_certificate(&der)
         .map_err(|e| PopError::with_source(PopErrorKind::CertInvalid, "x5c[0] parse", e))?;
-    // ANS-6 §7.5: fingerprint arrays never prune a rotated-away certificate,
-    // so the certificate's own dates are the only expiry the system carries
-    // for it. The freshness skew is allowed on both bounds.
     let not_before = cert.validity().not_before.timestamp();
     let not_after = cert.validity().not_after.timestamp();
-    if now < not_before.saturating_sub(skew_secs) || now > not_after.saturating_add(skew_secs) {
-        return Err(PopError::new(
-            PopErrorKind::CertInvalid,
-            "x5c[0] validity period does not contain the current time",
-        ));
-    }
-    let verifying_key = VerifyingKey::from_public_key_der(cert.public_key().raw).map_err(|e| {
+    let key = VerifyingKey::from_public_key_der(cert.public_key().raw).map_err(|e| {
         PopError::with_source(
             PopErrorKind::CertInvalid,
             "x5c[0] key is not ECDSA P-256",
             e,
         )
     })?;
-    Ok((der, verifying_key))
+    let identity = crate::verify::CertIdentity::from_der(&der).map_err(|e| {
+        PopError::with_source(PopErrorKind::CertInvalid, "parse proof certificate", e)
+    })?;
+    Ok(LeafCert {
+        fingerprint: ans_types::CertFingerprint::from_der(&der),
+        jkt: jwk_thumbprint(&key)?,
+        ans_name: identity.ans_name(),
+        der,
+        key,
+        not_before,
+        not_after,
+    })
+}
+
+/// ANS-6 §7.5: fingerprint arrays never prune a rotated-away certificate, so
+/// the certificate's own dates are the only expiry the system carries for
+/// it. The freshness skew is allowed on both bounds. Time-dependent — runs
+/// on every request, including artifact-cache hits.
+pub fn check_cert_validity(cert: &LeafCert, now: i64, skew_secs: i64) -> Result<(), PopError> {
+    if now < cert.not_before.saturating_sub(skew_secs)
+        || now > cert.not_after.saturating_add(skew_secs)
+    {
+        return Err(PopError::new(
+            PopErrorKind::CertInvalid,
+            "x5c[0] validity period does not contain the current time",
+        ));
+    }
+    Ok(())
 }
 
 pub fn public_jwk(pub_key: &VerifyingKey) -> Result<ProofJwk, PopError> {

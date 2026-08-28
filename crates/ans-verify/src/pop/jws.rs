@@ -2,7 +2,7 @@
 
 use base64::Engine as _;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use p256::ecdsa::signature::hazmat::{PrehashSigner as _, PrehashVerifier as _};
+use p256::ecdsa::signature::hazmat::PrehashSigner as _;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use sha2::{Digest, Sha256};
 
@@ -73,11 +73,12 @@ pub fn verify_es256(
             "signature is not a valid P1363 encoding",
         )
     })?;
-    let digest = Sha256::digest(signing_input);
-    pub_key.verify_prehash(&digest, &signature).map_err(|_| {
-        PopError::new(
+    if crate::p256_verify::verify_p256_sha256(pub_key, signing_input, &signature) {
+        Ok(())
+    } else {
+        Err(PopError::new(
             PopErrorKind::SignatureInvalid,
             "ECDSA signature verification failed",
-        )
-    })
+        ))
+    }
 }

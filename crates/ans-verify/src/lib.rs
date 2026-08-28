@@ -116,6 +116,9 @@ mod rustls_verifier;
 mod scitt;
 
 #[cfg(feature = "scitt")]
+mod p256_verify;
+
+#[cfg(feature = "scitt")]
 mod pop;
 
 // Re-export types from ans-types for convenience
@@ -170,6 +173,8 @@ pub use pop::{
     normalize_htu, reject_duplicate_header, request_authority, verify_caller, verify_proof,
 };
 
+#[cfg(all(feature = "scitt", any(test, feature = "test-support")))]
+pub use p256_verify::verify_p256_sha256;
 #[cfg(all(feature = "scitt", any(test, feature = "test-support")))]
 pub use scitt::{
     MockScittClient, ParsedCoseSign1, compute_sig_structure_digest, matches_identity_cert,

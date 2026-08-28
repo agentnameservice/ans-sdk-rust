@@ -8,6 +8,10 @@
 //!
 //! ```bash
 //! cargo bench -p ans-verify --features scitt,test-support
+//! # ring-backed ECDSA verification (~3x faster verifies):
+//! cargo bench -p ans-verify --features scitt,test-support,fast-verify
+//! # squeeze the pure-Rust backend further:
+//! RUSTFLAGS="-C target-cpu=native" cargo bench -p ans-verify --features scitt,test-support
 //! ```
 
 use std::hint::black_box;
@@ -408,10 +412,12 @@ fn bench_dpop(c: &mut Criterion) {
 }
 
 /// The primitive that dominates every tier: one ECDSA P-256 operation.
+/// `verify` measures the selected backend — pure-Rust `p256` by default,
+/// ring under `fast-verify`. Signing is always `p256`.
 fn bench_ecdsa(c: &mut Criterion) {
-    use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
     let key = SigningKey::from_slice(&[5u8; 32]).unwrap();
-    let digest: [u8; 32] = Sha256::digest(b"bench payload").into();
+    let message = b"bench payload";
+    let digest: [u8; 32] = Sha256::digest(message).into();
     let (sig, _): (p256::ecdsa::Signature, _) = key.sign_prehash(&digest).unwrap();
     let verifying_key = key.verifying_key();
 
@@ -423,11 +429,13 @@ fn bench_ecdsa(c: &mut Criterion) {
             sig
         });
     });
-    group.bench_function("verify_prehash", |b| {
+    group.bench_function("verify", |b| {
         b.iter(|| {
-            verifying_key
-                .verify_prehash(black_box(&digest), &sig)
-                .unwrap();
+            assert!(ans_verify::verify_p256_sha256(
+                verifying_key,
+                black_box(message.as_slice()),
+                &sig
+            ));
         });
     });
     group.finish();

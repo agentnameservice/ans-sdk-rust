@@ -1,16 +1,18 @@
 //! Cryptographic verification of a `DPoP` proof (possession only).
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use ans_types::CertFingerprint;
+use ans_types::{AnsName, CertFingerprint};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq as _;
 
+use super::cache::VerifiedArtifactCache;
 use super::error::{PopError, PopErrorKind};
 use super::jws::{b64url_encode, jws_signing_input, split_compact_jws, verify_es256};
 use super::proof::{
-    accept_es256_dpop, access_token_hash, decode_proof_header, decode_proof_payload,
-    jwk_thumbprint, leaf_cert, match_jwk_to_cert, normalize_htu,
+    accept_es256_dpop, access_token_hash, check_cert_validity, decode_proof_header,
+    decode_proof_payload, match_jwk_to_cert, normalize_htu, parse_leaf_cert,
 };
 use super::replay::ReplayCache;
 
@@ -40,6 +42,9 @@ pub struct ProofResult {
     /// Proof `iat` as Unix seconds.
     pub issued_at: i64,
     pub(crate) replay_exp: i64,
+    /// The certificate's `ans://` URI SAN, extracted during cert parsing so
+    /// the binding step does not re-parse the DER.
+    pub(crate) ans_name: Option<AnsName>,
 }
 
 /// Options for [`verify_proof`].
@@ -79,16 +84,19 @@ pub async fn verify_proof(
     replay: &dyn ReplayCache,
     opts: VerifyProofOptions,
 ) -> Result<ProofResult, PopError> {
-    let result = verify_proof_unrecorded(proof_jws, method, raw_url, &opts)?;
+    let result = verify_proof_unrecorded(proof_jws, method, raw_url, &opts, None)?;
     commit_replay(&result, replay).await?;
     Ok(result)
 }
 
+/// `cert_cache`: when set, the parsed `x5c[0]` is reused for identical entry
+/// bytes; the validity window still checks against `now` on every call.
 pub fn verify_proof_unrecorded(
     proof_jws: &str,
     method: &str,
     raw_url: &str,
     opts: &VerifyProofOptions,
+    cert_cache: Option<&VerifiedArtifactCache>,
 ) -> Result<ProofResult, PopError> {
     if proof_jws.len() > MAX_PROOF_SIZE {
         return Err(PopError::new(
@@ -106,10 +114,23 @@ pub fn verify_proof_unrecorded(
     let (header_b64, payload_b64, sig_b64) = split_compact_jws(proof_jws)?;
     let header = decode_proof_header(header_b64)?;
     accept_es256_dpop(&header)?;
-    let (cert_der, pub_key) = leaf_cert(&header, now, skew_secs)?;
-    match_jwk_to_cert(&header.jwk, &pub_key)?;
+    let leaf = match cert_cache {
+        Some(cache) => {
+            let key = VerifiedArtifactCache::key(header.x5c[0].as_bytes());
+            if let Some(leaf) = cache.proof_cert(&key) {
+                leaf
+            } else {
+                let leaf = Arc::new(parse_leaf_cert(&header.x5c[0])?);
+                cache.store_proof_cert(key, leaf.clone());
+                leaf
+            }
+        }
+        None => Arc::new(parse_leaf_cert(&header.x5c[0])?),
+    };
+    check_cert_validity(&leaf, now, skew_secs)?;
+    match_jwk_to_cert(&header.jwk, &leaf.key)?;
     let signing_input = jws_signing_input(header_b64, payload_b64);
-    verify_es256(&pub_key, signing_input.as_bytes(), sig_b64)?;
+    verify_es256(&leaf.key, signing_input.as_bytes(), sig_b64)?;
     let payload = decode_proof_payload(payload_b64)?;
     check_http_binding(&payload, method, raw_url)?;
     check_token_binding(&payload, opts.access_token.as_deref())?;
@@ -128,8 +149,9 @@ pub fn verify_proof_unrecorded(
     }
 
     Ok(ProofResult {
-        fingerprint: CertFingerprint::from_der(&cert_der),
-        jkt: jwk_thumbprint(&pub_key)?,
+        fingerprint: leaf.fingerprint.clone(),
+        jkt: leaf.jkt.clone(),
+        ans_name: leaf.ans_name.clone(),
         jti: payload.jti,
         htu: payload.htu,
         issued_at: payload.iat,
@@ -137,7 +159,7 @@ pub fn verify_proof_unrecorded(
             .iat
             .saturating_add(skew_secs)
             .saturating_add(REPLAY_GRACE_SECS),
-        cert_der,
+        cert_der: leaf.der.clone(),
     })
 }
 
