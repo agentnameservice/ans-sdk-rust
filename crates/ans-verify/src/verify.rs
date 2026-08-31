@@ -465,7 +465,15 @@ pub enum FailurePolicy {
     #[default]
     FailClosed,
 
-    /// Use cached badge if available, otherwise reject.
+    /// On an *indeterminate* lookup failure (DNS SERVFAIL/timeout, TL
+    /// unreachable), accept a cached badge up to `max_staleness` old
+    /// (ANS-6 §9.2). This may serve entries past the cache's freshness TTL,
+    /// so the cache's [`CacheConfig::hard_ttl`](crate::CacheConfig) should
+    /// be at least `max_staleness`.
+    ///
+    /// NXDOMAIN never takes this path: an affirmatively absent badge record
+    /// is a determinate answer — possibly the post-revocation state — and
+    /// rejects regardless of policy (ANS-6 §9.1).
     FailOpenWithCache {
         /// Maximum age of cached badge to accept.
         max_staleness: Duration,
@@ -1054,11 +1062,18 @@ impl ServerVerifier {
         fqdn: &Fqdn,
         cert: &CertIdentity,
     ) -> VerificationOutcome {
+        // ANS-6 §9.1: NXDOMAIN is a determinate answer — possibly the
+        // post-revocation state — not a lookup failure. Reject without
+        // consulting the cache: fail-open-with-cache applies to an
+        // unreachable TL, never to a record that is affirmatively gone.
+        if matches!(error, DnsError::NotFound { .. }) {
+            return VerificationOutcome::DnsError(error);
+        }
         match self.failure_policy {
             FailurePolicy::FailClosed => VerificationOutcome::DnsError(error),
             FailurePolicy::FailOpenWithCache { max_staleness } => {
                 if let Some(cache) = &self.cache {
-                    for cached in cache.get_all_for_fqdn(fqdn).await {
+                    for cached in cache.get_all_for_fqdn_allow_stale(fqdn).await {
                         if cached.fetched_at.elapsed() < max_staleness {
                             let outcome =
                                 self.verify_against_badge(&cached.badge, cert, fqdn, true);
@@ -1079,6 +1094,10 @@ impl ServerVerifier {
         fqdn: &Fqdn,
         cert: &CertIdentity,
     ) -> VerificationOutcome {
+        // ANS-6 §9.1: a wrapped NXDOMAIN is equally determinate — no cache.
+        if let AnsError::Dns(e @ DnsError::NotFound { .. }) = error {
+            return VerificationOutcome::DnsError(e);
+        }
         match self.failure_policy {
             FailurePolicy::FailClosed => match error {
                 AnsError::TransparencyLog(e) => VerificationOutcome::TlogError(e),
@@ -1104,7 +1123,7 @@ impl ServerVerifier {
             },
             FailurePolicy::FailOpenWithCache { max_staleness } => {
                 if let Some(cache) = &self.cache {
-                    for cached in cache.get_all_for_fqdn(fqdn).await {
+                    for cached in cache.get_all_for_fqdn_allow_stale(fqdn).await {
                         if cached.fetched_at.elapsed() < max_staleness {
                             let outcome =
                                 self.verify_against_badge(&cached.badge, cert, fqdn, true);
@@ -1618,11 +1637,16 @@ impl ClientVerifier {
         cert: &CertIdentity,
         ans_name: &AnsName,
     ) -> VerificationOutcome {
+        // ANS-6 §9.1/§6.6: NXDOMAIN is determinate — possibly post-revocation.
+        // Reject without consulting the cache.
+        if matches!(error, DnsError::NotFound { .. }) {
+            return VerificationOutcome::DnsError(error);
+        }
         match self.failure_policy {
             FailurePolicy::FailClosed => VerificationOutcome::DnsError(error),
             FailurePolicy::FailOpenWithCache { max_staleness } => {
                 if let Some(cache) = &self.cache
-                    && let Some(cached) = cache.get_by_fqdn_version(fqdn, version).await
+                    && let Some(cached) = cache.get_by_fqdn_version_allow_stale(fqdn, version).await
                     && cached.fetched_at.elapsed() < max_staleness
                 {
                     return self.verify_client_against_badge(&cached.badge, cert, ans_name);
@@ -1644,7 +1668,7 @@ impl ClientVerifier {
             FailurePolicy::FailClosed => VerificationOutcome::TlogError(error),
             FailurePolicy::FailOpenWithCache { max_staleness } => {
                 if let Some(cache) = &self.cache
-                    && let Some(cached) = cache.get_by_fqdn_version(fqdn, version).await
+                    && let Some(cached) = cache.get_by_fqdn_version_allow_stale(fqdn, version).await
                     && cached.fetched_at.elapsed() < max_staleness
                 {
                     return self.verify_client_against_badge(&cached.badge, cert, ans_name);

@@ -1349,7 +1349,10 @@ pub struct MockDnsResolver {
     tlsa_records: std::collections::HashMap<String, Vec<TlsaRecord>>,
     svcb_discovery_records: std::collections::HashMap<String, Vec<SvcbDiscoveryRecord>>,
     txt_discovery_records: std::collections::HashMap<String, Vec<TxtDiscoveryRecord>>,
-    errors: std::collections::HashMap<String, DnsError>,
+    // Interior-mutable so a resolver already shared with a verifier can
+    // change behavior mid-test (e.g. records first, NXDOMAIN after a
+    // simulated revocation). Clones share the error map.
+    errors: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, DnsError>>>,
     tlsa_errors: std::collections::HashMap<String, DnsError>,
     svcb_discovery_errors: std::collections::HashMap<String, DnsError>,
     txt_discovery_errors: std::collections::HashMap<String, DnsError>,
@@ -1398,9 +1401,20 @@ impl MockDnsResolver {
     }
 
     /// Configure an error for an FQDN.
-    pub fn with_error(mut self, fqdn: &str, error: DnsError) -> Self {
-        self.errors.insert(fqdn.to_lowercase(), error);
+    pub fn with_error(self, fqdn: &str, error: DnsError) -> Self {
+        self.set_error(fqdn, error);
         self
+    }
+
+    /// Set (or replace) the badge-lookup error for an FQDN after
+    /// construction. Takes `&self`, so a resolver already shared with a
+    /// verifier can change behavior mid-test — e.g. serve records first,
+    /// then NXDOMAIN after a simulated revocation.
+    pub fn set_error(&self, fqdn: &str, error: DnsError) {
+        self.errors
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(fqdn.to_lowercase(), error);
     }
 
     /// Configure a TLSA-specific error for an FQDN and port.
@@ -1439,7 +1453,12 @@ impl DnsResolver for MockDnsResolver {
         let key = fqdn.as_str().to_lowercase();
 
         // Check for configured error first
-        if let Some(error) = self.errors.get(&key) {
+        if let Some(error) = self
+            .errors
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
             return Err(error.clone());
         }
 
@@ -1463,7 +1482,12 @@ impl DnsResolver for MockDnsResolver {
         }
 
         // Check for general FQDN error
-        if let Some(error) = self.errors.get(&fqdn.as_str().to_lowercase()) {
+        if let Some(error) = self
+            .errors
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&fqdn.as_str().to_lowercase())
+        {
             return Err(error.clone());
         }
 
@@ -1486,7 +1510,12 @@ impl DnsResolver for MockDnsResolver {
         }
 
         // Check for general FQDN error
-        if let Some(error) = self.errors.get(&key) {
+        if let Some(error) = self
+            .errors
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
             return Err(error.clone());
         }
 
@@ -1509,7 +1538,12 @@ impl DnsResolver for MockDnsResolver {
         }
 
         // Check for general FQDN error
-        if let Some(error) = self.errors.get(&key) {
+        if let Some(error) = self
+            .errors
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
             return Err(error.clone());
         }
 
