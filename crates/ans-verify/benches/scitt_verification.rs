@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Benchmarks for offline SCITT verification and the ANS-6 Flavor B `DPoP` flow.
+//! Benchmarks for offline SCITT verification and the ANS-6 Method B `DPoP` flow.
 //!
 //! Everything measured here runs in-process with no network I/O — the point
 //! of the SCITT tier. The dominant cost of each verification is one or more

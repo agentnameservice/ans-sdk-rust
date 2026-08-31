@@ -63,3 +63,21 @@ pub fn attach_identity(
     let token = authorization.and_then(access_token_from_authorization);
     signer.sign(method, url, token)
 }
+
+/// [`attach_identity`] for content-bearing requests: also binds the request
+/// content via `ans_content_digest` (ANS-6 §7.13). Empty content mints no
+/// claim.
+///
+/// # Errors
+///
+/// Returns a [`PopError`] if signing fails.
+pub fn attach_identity_with_content(
+    signer: &Signer,
+    method: &str,
+    url: &str,
+    authorization: Option<&str>,
+    content: &[u8],
+) -> Result<String, PopError> {
+    let token = authorization.and_then(access_token_from_authorization);
+    signer.sign_with_content(method, url, token, content)
+}

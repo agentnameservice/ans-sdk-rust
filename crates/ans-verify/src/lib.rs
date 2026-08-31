@@ -100,7 +100,7 @@
 //! - Response caching with configurable TTL
 //! - Async-first design with tokio
 //! - Optional rustls integration for TLS handshake verification
-//! - Optional SCITT `DPoP` (ANS-6 Flavor B) for application-layer A2A authentication
+//! - Optional SCITT `DPoP` (ANS-6 Method B) for application-layer A2A authentication
 
 mod cache;
 mod dane;
@@ -166,11 +166,12 @@ pub use scitt::{
 
 #[cfg(feature = "scitt")]
 pub use pop::{
-    CallerIdentity, DEFAULT_ARTIFACT_CACHE_ENTRIES, DEFAULT_POP_SKEW, DEFAULT_REPLAY_MAX_ENTRIES,
-    DPOP_HEADER, MAX_JTI_SIZE, MAX_PROOF_SIZE, MemoryReplayCache, PopError, PopErrorKind,
-    ProofResult, ReplayCache, Signer, VerifiedArtifactCache, VerifyCallerOptions,
-    VerifyProofOptions, access_token_from_authorization, attach_identity, normalize_authority,
-    normalize_htu, reject_duplicate_header, request_authority, verify_caller, verify_proof,
+    ANS_PROFILE_REVISION, CallerIdentity, DEFAULT_ARTIFACT_CACHE_ENTRIES, DEFAULT_POP_SKEW,
+    DEFAULT_REPLAY_MAX_ENTRIES, DPOP_HEADER, MAX_JTI_SIZE, MAX_PROOF_SIZE, MemoryReplayCache,
+    PopError, PopErrorKind, ProofResult, ReplayCache, Signer, VerifiedArtifactCache,
+    VerifyCallerOptions, VerifyProofOptions, access_token_from_authorization, attach_identity,
+    attach_identity_with_content, normalize_authority, normalize_htu, reject_duplicate_header,
+    request_authority, verify_caller, verify_proof,
 };
 
 #[cfg(all(feature = "scitt", any(test, feature = "test-support")))]

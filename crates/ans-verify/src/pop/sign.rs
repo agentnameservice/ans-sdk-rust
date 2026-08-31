@@ -7,11 +7,13 @@ use p256::pkcs8::{DecodePrivateKey as _, DecodePublicKey as _};
 use rand::Rng as _;
 use x509_parser::prelude::FromDer as _;
 
+use sha2::{Digest, Sha256};
+
 use super::error::{PopError, PopErrorKind};
 use super::jws::sign_es256;
 use super::proof::{
-    DPOP_ALG, DPOP_TYP, ProofHeader, ProofJwk, ProofPayload, encode_proof_parts, jwk_thumbprint,
-    normalize_htu, public_jwk,
+    ANS_PROFILE_REVISION, DPOP_ALG, DPOP_TYP, ProofHeader, ProofJwk, ProofPayload,
+    encode_proof_parts, jwk_thumbprint, normalize_htu, public_jwk,
 };
 
 /// Mints `DPoP` proofs for an agent's outbound A2A requests.
@@ -107,7 +109,9 @@ impl Signer {
     /// Produce a compact `DPoP` proof binding `method` and `raw_url`.
     ///
     /// Pass `access_token` to bind an OAuth 2.0 access token via `ath`
-    /// (`Authorization: DPoP <token>`).
+    /// (`Authorization: DPoP <token>`). Requests that carry content should
+    /// use [`Self::sign_with_content`] so the body is bound too (ANS-6
+    /// §7.13).
     ///
     /// # Errors
     ///
@@ -118,6 +122,35 @@ impl Signer {
         method: &str,
         raw_url: &str,
         access_token: Option<&str>,
+    ) -> Result<String, PopError> {
+        self.sign_inner(method, raw_url, access_token, None)
+    }
+
+    /// Produce a proof that also binds the request content via
+    /// `ans_content_digest` (ANS-6 §7.13). Empty `content` mints no claim —
+    /// a zero-length body carries none.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`PopError`] if the URL cannot be normalized, JTI generation
+    /// fails, or signing fails.
+    pub fn sign_with_content(
+        &self,
+        method: &str,
+        raw_url: &str,
+        access_token: Option<&str>,
+        content: &[u8],
+    ) -> Result<String, PopError> {
+        let digest = (!content.is_empty()).then(|| Sha256::digest(content).into());
+        self.sign_inner(method, raw_url, access_token, digest)
+    }
+
+    fn sign_inner(
+        &self,
+        method: &str,
+        raw_url: &str,
+        access_token: Option<&str>,
+        content_sha256: Option<[u8; 32]>,
     ) -> Result<String, PopError> {
         let htu = normalize_htu(raw_url)?;
         let jti = new_jti();
@@ -138,6 +171,8 @@ impl Signer {
             iat: (self.now)(),
             jti,
             ath: access_token.map(super::proof::access_token_hash),
+            ans_profile: Some(ANS_PROFILE_REVISION),
+            ans_content_digest: content_sha256.map(|d| super::jws::b64url_encode(&d)),
         };
         let (header_b64, payload_b64) = encode_proof_parts(&header, &payload)?;
         let signing_input = super::jws::jws_signing_input(&header_b64, &payload_b64);

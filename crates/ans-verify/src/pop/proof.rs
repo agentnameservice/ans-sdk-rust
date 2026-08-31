@@ -34,6 +34,10 @@ pub struct ProofJwk {
     pub y: String,
 }
 
+/// The Method-B profile revision this implementation mints and verifies
+/// (ANS-6 §7.12). Absence of the `ans_profile` claim means revision 1.
+pub const ANS_PROFILE_REVISION: u64 = 1;
+
 #[derive(Debug, Deserialize)]
 pub struct ProofPayload {
     pub htm: String,
@@ -42,6 +46,10 @@ pub struct ProofPayload {
     pub jti: String,
     #[serde(default)]
     pub ath: Option<String>,
+    #[serde(default)]
+    pub ans_profile: Option<u64>,
+    #[serde(default)]
+    pub ans_content_digest: Option<String>,
 }
 
 pub fn decode_proof_header(header_b64: &str) -> Result<ProofHeader, PopError> {
@@ -329,6 +337,10 @@ pub fn encode_proof_parts(
         jti: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
         ath: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ans_profile: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ans_content_digest: Option<&'a str>,
     }
     let header_json = serde_json::to_vec(&HeaderOut {
         typ: &header.typ,
@@ -348,6 +360,8 @@ pub fn encode_proof_parts(
         iat: payload.iat,
         jti: &payload.jti,
         ath: payload.ath.as_deref(),
+        ans_profile: payload.ans_profile,
+        ans_content_digest: payload.ans_content_digest.as_deref(),
     })
     .map_err(|e| PopError::with_source(PopErrorKind::MalformedProof, "marshal proof payload", e))?;
     Ok((b64url_encode(&header_json), b64url_encode(&payload_json)))

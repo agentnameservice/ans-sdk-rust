@@ -55,6 +55,14 @@ pub struct VerifyProofOptions {
     /// When `Some`, the proof must carry a matching `ath`. When `None`, a
     /// proof that carries `ath` is rejected.
     pub access_token: Option<String>,
+    /// SHA-256 of the request content the callee received; `None` when the
+    /// request carries no content (a zero-length body carries none). A proof
+    /// binding content via `ans_content_digest` must match it (ANS-6 §7.13).
+    pub content_sha256: Option<[u8; 32]>,
+    /// Reject content-bearing requests whose proof does not bind the content.
+    /// Default `false` — the revision-1 acceptance; §7.13 recommends `true`
+    /// on state-changing endpoints behind TLS-terminating hops.
+    pub require_content_binding: bool,
     /// Freshness window. `None` or zero uses [`DEFAULT_POP_SKEW`].
     pub skew: Option<Duration>,
     /// Unix timestamp used as `now`. `None` uses the system clock.
@@ -65,8 +73,9 @@ pub struct VerifyProofOptions {
 ///
 /// Order: size cap, compact structure, pinned `typ`/`alg` plus required
 /// `jwk`/`x5c`, P-256 leaf within its validity window, jwk↔x5c key equality,
-/// signature, `htm`, normalized `htu`, `ath` ↔ presented token, `iat` window,
-/// `jti` presence and size, then replay commit.
+/// signature, supported `ans_profile` revision, `htm`, normalized `htu`,
+/// `ath` ↔ presented token, `ans_content_digest` ↔ received content, `iat`
+/// window, `jti` presence and size, then replay commit.
 ///
 /// A proof verified here is well-formed but **not trusted**: nothing has
 /// established that its certificate belongs to a live ANS agent. Prefer
@@ -132,8 +141,10 @@ pub fn verify_proof_unrecorded(
     let signing_input = jws_signing_input(header_b64, payload_b64);
     verify_es256(&leaf.key, signing_input.as_bytes(), sig_b64)?;
     let payload = decode_proof_payload(payload_b64)?;
+    check_profile_revision(&payload)?;
     check_http_binding(&payload, method, raw_url)?;
     check_token_binding(&payload, opts.access_token.as_deref())?;
+    check_content_binding(&payload, opts.content_sha256, opts.require_content_binding)?;
     check_freshness(&payload, now, skew)?;
     if payload.jti.is_empty() {
         return Err(PopError::new(
@@ -204,6 +215,60 @@ fn check_token_binding(
                 return Err(PopError::new(
                     PopErrorKind::TokenBindingMismatch,
                     "ath does not match the presented access token",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// ANS-6 §7.12: `ans_profile` selects the rule set the proof was minted
+/// under; absence means revision 1 and MUST NOT reject. A revision is by
+/// definition a change a verifier cannot safely ignore, so a revision this
+/// implementation does not know cannot be verified under revision-1 rules —
+/// fail closed. (A legitimate caller never mints one: §7.12 selects the
+/// newest *mutually-supported* revision from the callee's advertisement.)
+fn check_profile_revision(payload: &super::proof::ProofPayload) -> Result<(), PopError> {
+    match payload.ans_profile {
+        None | Some(super::proof::ANS_PROFILE_REVISION) => Ok(()),
+        Some(revision) => Err(PopError::new(
+            PopErrorKind::UnsupportedProfile,
+            format!("proof minted under unsupported profile revision {revision}"),
+        )),
+    }
+}
+
+/// ANS-6 §7.13: strict in both directions, mirroring `ath`. A proof binding
+/// content when the request carries none rejects; unbound content is a
+/// mint-time choice accepted at revision 1 unless deployment policy requires
+/// the binding.
+fn check_content_binding(
+    payload: &super::proof::ProofPayload,
+    content_sha256: Option<[u8; 32]>,
+    require: bool,
+) -> Result<(), PopError> {
+    match (content_sha256, payload.ans_content_digest.as_deref()) {
+        (None, Some(_)) => Err(PopError::new(
+            PopErrorKind::ContentBindingMismatch,
+            "proof binds content but the request carries none",
+        )),
+        (Some(_), None) => {
+            if require {
+                Err(PopError::new(
+                    PopErrorKind::ContentBindingMismatch,
+                    "request content is not bound and policy requires binding",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        (None, None) => Ok(()),
+        (Some(digest), Some(claim)) => {
+            let want = b64url_encode(&digest);
+            if claim.as_bytes().ct_eq(want.as_bytes()).unwrap_u8() != 1 {
+                return Err(PopError::new(
+                    PopErrorKind::ContentBindingMismatch,
+                    "ans_content_digest does not match the received content",
                 ));
             }
             Ok(())

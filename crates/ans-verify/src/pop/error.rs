@@ -26,6 +26,11 @@ pub enum PopErrorKind {
     KeyMismatch,
     /// `ath` ↔ access-token binding failed.
     TokenBindingMismatch,
+    /// `ans_content_digest` ↔ request-content binding failed (ANS-6 §7.13).
+    ContentBindingMismatch,
+    /// Proof was minted under a profile revision this verifier does not
+    /// implement (ANS-6 §7.12).
+    UnsupportedProfile,
     /// Proof, status token, and receipt do not name the same agent.
     BindingFailed,
     /// Status token failed SCITT verification.
@@ -56,6 +61,8 @@ impl PopErrorKind {
             Self::CertInvalid => "CERT_INVALID",
             Self::KeyMismatch => "KEY_MISMATCH",
             Self::TokenBindingMismatch => "TOKEN_BINDING_MISMATCH",
+            Self::ContentBindingMismatch => "CONTENT_BINDING_MISMATCH",
+            Self::UnsupportedProfile => "UNSUPPORTED_PROFILE",
             Self::BindingFailed => "BINDING_FAILED",
             Self::StatusInvalid => "STATUS_INVALID",
             Self::ReceiptInvalid => "RECEIPT_INVALID",

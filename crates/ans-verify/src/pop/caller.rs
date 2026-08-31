@@ -61,6 +61,13 @@ pub struct VerifyCallerOptions {
     pub now: Option<i64>,
     /// Access token presented as `Authorization: DPoP <token>`.
     pub access_token: Option<String>,
+    /// SHA-256 of the request content the callee received; `None` when the
+    /// request carries no content. See
+    /// [`VerifyProofOptions::content_sha256`](super::VerifyProofOptions).
+    pub content_sha256: Option<[u8; 32]>,
+    /// Reject content-bearing requests whose proof does not bind the content
+    /// (ANS-6 §7.13 deployment policy; default `false`).
+    pub require_content_binding: bool,
     /// Cache of verified artifacts (ANS-6 §4.6). When set, a status token or
     /// receipt whose exact bytes verified before skips re-verification; the
     /// token's `exp` is still enforced and the possession proof is never
@@ -78,6 +85,8 @@ impl Default for VerifyCallerOptions {
             status_skew: None,
             now: None,
             access_token: None,
+            content_sha256: None,
+            require_content_binding: false,
             artifact_cache: None,
         }
     }
@@ -101,13 +110,31 @@ impl VerifyCallerOptions {
         self.artifact_cache = Some(cache);
         self
     }
+
+    /// Bind the received request content into verification (§7.13).
+    ///
+    /// Pass the SHA-256 of the content octets exactly as received. A proof
+    /// carrying `ans_content_digest` must match it; a proof binding content
+    /// when none was set rejects.
+    pub fn with_content_sha256(mut self, digest: [u8; 32]) -> Self {
+        self.content_sha256 = Some(digest);
+        self
+    }
+
+    /// Reject content-bearing requests whose proof does not bind the content
+    /// (§7.13 deployment policy for state-changing endpoints behind
+    /// TLS-terminating hops).
+    pub fn with_required_content_binding(mut self) -> Self {
+        self.require_content_binding = true;
+        self
+    }
 }
 
 /// Authenticate an A2A caller from its `DPoP` proof and SCITT headers.
 ///
 /// Composes possession ([`super::verify_proof`]), liveness (status token),
 /// and identity (receipt) and binds them to one identity certificate.
-/// Missing status token is a hard reject (Flavor B does not fall back to
+/// Missing status token is a hard reject (Method B does not fall back to
 /// the badge tier). The `jti` is recorded only after that binding succeeds.
 ///
 /// # The `raw_url` authority (ANS-6 §7.7)
@@ -182,6 +209,8 @@ pub async fn verify_caller(
     let now = opts.now.unwrap_or_else(|| chrono::Utc::now().timestamp());
     let proof_opts = VerifyProofOptions {
         access_token: opts.access_token.clone(),
+        content_sha256: opts.content_sha256,
+        require_content_binding: opts.require_content_binding,
         skew: opts.pop_skew,
         now: Some(now),
     };

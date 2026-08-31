@@ -5,7 +5,7 @@
     clippy::print_stdout,
     clippy::print_stderr
 )]
-//! Example: ANS-6 Flavor B — `DPoP` caller authentication without mTLS
+//! Example: ANS-6 Method B — `DPoP` caller authentication without mTLS
 //!
 //! Self-contained example that generates an identity certificate, a
 //! transparency-log key, and SCITT artifacts in-memory, then runs both sides
@@ -24,8 +24,8 @@
 
 use ans_verify::{
     AnsName, CertFingerprint, MemoryReplayCache, PopErrorKind, ScittHeaders, ScittKeyStore, Signer,
-    VerifiedArtifactCache, VerifyCallerOptions, attach_identity, compute_sig_structure_digest,
-    verify_caller,
+    VerifiedArtifactCache, VerifyCallerOptions, attach_identity, attach_identity_with_content,
+    compute_sig_structure_digest, verify_caller,
 };
 use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
@@ -104,6 +104,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proof2 = attach_identity(&signer, METHOD, URL, None)?;
     verify_caller(&proof2, &headers, METHOD, URL, &key_store, &replay, opts()).await?;
     println!("Request 2 authenticated (artifacts served from cache)");
+
+    // Content-bearing requests bind the body into the proof (§7.13): the
+    // callee hashes the content it received, so a TLS-terminating hop that
+    // rewrites the body breaks the binding — even on a first, in-flight
+    // request that no replay check would catch.
+    let body: &[u8] = br#"{"amount":100}"#;
+    let bound = attach_identity_with_content(&signer, METHOD, URL, None, body)?;
+    let digest: [u8; 32] = Sha256::digest(body).into();
+    verify_caller(
+        &bound,
+        &headers,
+        METHOD,
+        URL,
+        &key_store,
+        &replay,
+        opts().with_content_sha256(digest),
+    )
+    .await?;
+    println!("Content-bound request authenticated");
+
+    let bound2 = attach_identity_with_content(&signer, METHOD, URL, None, body)?;
+    let rewritten: [u8; 32] = Sha256::digest(br#"{"amount":9999}"#).into();
+    let err = verify_caller(
+        &bound2,
+        &headers,
+        METHOD,
+        URL,
+        &key_store,
+        &replay,
+        opts().with_content_sha256(rewritten),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::ContentBindingMismatch);
+    println!("Rewritten body rejected: {err}");
 
     // A request for an authority this callee does not answer as is rejected
     // before any proof verification — the §7.7 defense against spoofed-Host

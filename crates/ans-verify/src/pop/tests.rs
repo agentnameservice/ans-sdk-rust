@@ -384,7 +384,7 @@ async fn ath_both_directions() {
     let opts_tok = VerifyProofOptions {
         access_token: Some(token.to_string()),
         now: Some(NOW),
-        skew: None,
+        ..VerifyProofOptions::default()
     };
     let opts_none = VerifyProofOptions {
         now: Some(NOW),
@@ -422,7 +422,7 @@ async fn stale_proof_rejected() {
         VerifyProofOptions {
             now: Some(NOW + 121),
             skew: Some(Duration::from_secs(120)),
-            access_token: None,
+            ..VerifyProofOptions::default()
         },
     )
     .await
@@ -671,7 +671,7 @@ async fn attach_identity_binds_dpop_authorization() {
         VerifyProofOptions {
             access_token: Some("tok".to_string()),
             now: Some(NOW),
-            skew: None,
+            ..VerifyProofOptions::default()
         },
     )
     .await
@@ -904,6 +904,157 @@ fn request_authority_normalizes() {
         "api.example.com:8443"
     );
     assert!(request_authority("/relative/path").is_err());
+}
+
+#[tokio::test]
+async fn content_binding_both_directions() {
+    let (key, cert, _) = identity_material(28, ANS_NAME);
+    let signer = signer_at_now(key, cert);
+    let body = br#"{"amount": 100}"#;
+    let digest: [u8; 32] = Sha256::digest(body).into();
+    let opts = |content: Option<[u8; 32]>, require: bool| VerifyProofOptions {
+        content_sha256: content,
+        require_content_binding: require,
+        now: Some(NOW),
+        ..VerifyProofOptions::default()
+    };
+
+    // Bound content, matching digest → ok.
+    let bound = signer.sign_with_content(METHOD, URL, None, body).unwrap();
+    verify_proof(&bound, METHOD, URL, &replay(), opts(Some(digest), false))
+        .await
+        .unwrap();
+
+    // Bound content, tampered body → reject.
+    let tampered: [u8; 32] = Sha256::digest(br#"{"amount": 9999}"#).into();
+    let err = verify_proof(&bound, METHOD, URL, &replay(), opts(Some(tampered), false))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::ContentBindingMismatch);
+
+    // Claim present but request carries no content → reject.
+    let bound2 = signer.sign_with_content(METHOD, URL, None, body).unwrap();
+    let err = verify_proof(&bound2, METHOD, URL, &replay(), opts(None, false))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::ContentBindingMismatch);
+
+    // Unbound content: accepted at revision 1, rejected under policy.
+    let unbound = signer.sign(METHOD, URL, None).unwrap();
+    verify_proof(&unbound, METHOD, URL, &replay(), opts(Some(digest), false))
+        .await
+        .unwrap();
+    let unbound2 = signer.sign(METHOD, URL, None).unwrap();
+    let err = verify_proof(&unbound2, METHOD, URL, &replay(), opts(Some(digest), true))
+        .await
+        .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::ContentBindingMismatch);
+
+    // Empty content mints no claim (a zero-length body carries none).
+    let empty = signer.sign_with_content(METHOD, URL, None, b"").unwrap();
+    verify_proof(&empty, METHOD, URL, &replay(), opts(None, false))
+        .await
+        .unwrap();
+}
+
+#[test]
+fn minted_proofs_carry_profile_revision() {
+    let (key, cert, _) = identity_material(29, ANS_NAME);
+    let signer = signer_at_now(key, cert);
+    let proof = signer.sign(METHOD, URL, None).unwrap();
+    let payload_b64 = proof.split('.').nth(1).unwrap();
+    let payload: serde_json::Value = serde_json::from_slice(
+        &base64::prelude::BASE64_URL_SAFE_NO_PAD
+            .decode(payload_b64)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["ans_profile"],
+        serde_json::json!(ANS_PROFILE_REVISION)
+    );
+}
+
+/// ANS-6 §7.12 / §10 tolerance case: a proof carrying an unknown payload
+/// claim verifies — the payload is the open extension lane.
+#[tokio::test]
+async fn unknown_payload_claim_is_tolerated() {
+    let (key, cert, _) = identity_material(30, ANS_NAME);
+    let signing_key = key.clone();
+    let signer = signer_at_now(key, cert);
+    let proof = signer.sign(METHOD, URL, None).unwrap();
+
+    let (h, p, _) = {
+        let mut it = proof.split('.');
+        (
+            it.next().unwrap().to_string(),
+            it.next().unwrap().to_string(),
+            it.next().unwrap(),
+        )
+    };
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&base64::prelude::BASE64_URL_SAFE_NO_PAD.decode(&p).unwrap())
+            .unwrap();
+    payload["future_extension"] = serde_json::json!({"nested": true});
+    let p2 = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let signing_input = format!("{h}.{p2}");
+    let sig = super::jws::sign_es256(&signing_key, signing_input.as_bytes()).unwrap();
+    let extended = format!("{h}.{p2}.{sig}");
+
+    verify_proof(
+        &extended,
+        METHOD,
+        URL,
+        &replay(),
+        VerifyProofOptions {
+            now: Some(NOW),
+            ..VerifyProofOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// ANS-6 §7.12: a revision is a change a verifier cannot safely ignore, so a
+/// proof minted under a revision this implementation does not know rejects
+/// (contrast with the unknown-*claim* tolerance above).
+#[tokio::test]
+async fn unknown_profile_revision_rejected() {
+    let (key, cert, _) = identity_material(31, ANS_NAME);
+    let signing_key = key.clone();
+    let signer = signer_at_now(key, cert);
+    let proof = signer.sign(METHOD, URL, None).unwrap();
+
+    let (h, p, _) = {
+        let mut it = proof.split('.');
+        (
+            it.next().unwrap().to_string(),
+            it.next().unwrap().to_string(),
+            it.next().unwrap(),
+        )
+    };
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&base64::prelude::BASE64_URL_SAFE_NO_PAD.decode(&p).unwrap())
+            .unwrap();
+    payload["ans_profile"] = serde_json::json!(ANS_PROFILE_REVISION + 1);
+    let p2 = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+    let signing_input = format!("{h}.{p2}");
+    let sig = super::jws::sign_es256(&signing_key, signing_input.as_bytes()).unwrap();
+    let future_revision = format!("{h}.{p2}.{sig}");
+
+    let err = verify_proof(
+        &future_revision,
+        METHOD,
+        URL,
+        &replay(),
+        VerifyProofOptions {
+            now: Some(NOW),
+            ..VerifyProofOptions::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::UnsupportedProfile);
 }
 
 #[test]
