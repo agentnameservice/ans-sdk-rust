@@ -137,7 +137,26 @@ fn make_status_token(
             ciborium::Value::Text("X509-OV-CLIENT".to_string()),
         ),
     ]);
-    let payload = ciborium::Value::Map(vec![
+    make_status_token_with_identity_entry(tl_key, agent_id, ans_name, Some(cert_entry))
+}
+
+/// Status token for an agent registered without Identity Certificates:
+/// `validIdentityCerts` (key 6) is absent entirely, not present-but-empty.
+fn make_status_token_without_identity_certs(
+    tl_key: &SigningKey,
+    agent_id: Uuid,
+    ans_name: &str,
+) -> Vec<u8> {
+    make_status_token_with_identity_entry(tl_key, agent_id, ans_name, None)
+}
+
+fn make_status_token_with_identity_entry(
+    tl_key: &SigningKey,
+    agent_id: Uuid,
+    ans_name: &str,
+    identity_entry: Option<ciborium::Value>,
+) -> Vec<u8> {
+    let mut pairs = vec![
         (
             ciborium::Value::Integer(1.into()),
             ciborium::Value::Text(agent_id.to_string()),
@@ -158,19 +177,22 @@ fn make_status_token(
             ciborium::Value::Integer(5.into()),
             ciborium::Value::Text(ans_name.to_string()),
         ),
-        (
+    ];
+    if let Some(entry) = identity_entry {
+        pairs.push((
             ciborium::Value::Integer(6.into()),
-            ciborium::Value::Array(vec![cert_entry]),
-        ),
-        (
-            ciborium::Value::Integer(7.into()),
-            ciborium::Value::Array(vec![]),
-        ),
-        (
-            ciborium::Value::Integer(8.into()),
-            ciborium::Value::Map(vec![]),
-        ),
-    ]);
+            ciborium::Value::Array(vec![entry]),
+        ));
+    }
+    pairs.push((
+        ciborium::Value::Integer(7.into()),
+        ciborium::Value::Array(vec![]),
+    ));
+    pairs.push((
+        ciborium::Value::Integer(8.into()),
+        ciborium::Value::Map(vec![]),
+    ));
+    let payload = ciborium::Value::Map(pairs);
     let mut payload_bytes = Vec::new();
     ciborium::ser::into_writer(&payload, &mut payload_bytes).unwrap();
     sign_cose(
@@ -1055,6 +1077,37 @@ async fn unknown_profile_revision_rejected() {
     .await
     .unwrap_err();
     assert_eq!(err.kind, PopErrorKind::UnsupportedProfile);
+}
+
+/// Identity Certificates are optional at registration (ANS-1 §6.1), so a
+/// status token can carry no `validIdentityCerts` at all. Such an agent
+/// cannot authenticate as a Method B caller: possession verifies, but the
+/// §7.5 binding rejects cleanly — no panic, no fallback.
+#[tokio::test]
+async fn caller_rejected_when_token_has_no_identity_certs() {
+    let (key, cert, _) = identity_material(32, ANS_NAME);
+    let signer = signer_at_now(key, cert);
+    let (tl_key, store) = make_tl_key(13);
+    let agent_id = Uuid::nil();
+    let token = make_status_token_without_identity_certs(&tl_key, agent_id, ANS_NAME);
+    let receipt = make_receipt(&tl_key, agent_id, ANS_NAME);
+
+    let proof = signer.sign(METHOD, URL, None).unwrap();
+    let err = verify_caller(
+        &proof,
+        &headers(&receipt, &token),
+        METHOD,
+        URL,
+        &store,
+        &replay(),
+        VerifyCallerOptions {
+            now: Some(NOW),
+            ..VerifyCallerOptions::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::BindingFailed);
 }
 
 #[test]

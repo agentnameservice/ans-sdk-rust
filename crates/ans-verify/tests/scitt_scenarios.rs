@@ -480,6 +480,97 @@ async fn test_s1_2_valid_token_mtls_verify() {
     assert!(matches!(outcome, VerificationOutcome::ScittVerified { .. }));
 }
 
+/// Re-encode a CBOR map payload without the given integer key, for tokens
+/// that omit a field entirely rather than carrying it empty.
+fn without_cbor_key(payload: &[u8], key: i64) -> Vec<u8> {
+    let value: ciborium::Value = ciborium::de::from_reader(payload).unwrap();
+    let ciborium::Value::Map(pairs) = value else {
+        panic!("payload is not a CBOR map");
+    };
+    let filtered: Vec<_> = pairs
+        .into_iter()
+        .filter(|(k, _)| *k != ciborium::Value::Integer(key.into()))
+        .collect();
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&ciborium::Value::Map(filtered), &mut buf).unwrap();
+    buf
+}
+
+/// Token for an agent registered without Identity Certificates (optional per
+/// ANS-1 §6.1): `validIdentityCerts` (key 6) is absent entirely.
+fn make_token_without_identity_certs(signing_key: &SigningKey, server_fp: &str) -> Vec<u8> {
+    let payload = build_cbor_payload(
+        &nil_uuid(),
+        "ACTIVE",
+        future_exp(),
+        &format!("ans://v1.0.0.{HOST}"),
+        &[],
+        &[(server_fp.to_string(), "X509-DV-SERVER".to_string())],
+    );
+    sign_cose(signing_key, &without_cbor_key(&payload, 6))
+}
+
+/// S1.3: Identity Certificates are optional at registration, so a status
+/// token can omit `validIdentityCerts` entirely. Server verification matches
+/// only `validServerCerts` (ANS-6 §5.2) and must still pass.
+#[tokio::test]
+async fn test_s1_3_server_verify_token_without_identity_certs() {
+    let (signing_key, store) = make_key_and_store(1);
+    let store = Arc::new(store);
+    let token = make_token_without_identity_certs(&signing_key, SERVER_FP);
+
+    let verifier = make_scitt_verifier(
+        HOST,
+        SERVER_FP,
+        IDENTITY_FP,
+        store,
+        ScittTierPolicy::ScittWithBadgeFallback,
+    )
+    .await;
+    let cert = server_cert(HOST, SERVER_FP);
+    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+
+    let outcome = verifier
+        .verify_server_with_scitt(HOST, &cert, &headers)
+        .await;
+    assert!(
+        outcome.is_success(),
+        "identity-less token must pass server verification, got: {outcome:?}"
+    );
+    assert!(matches!(outcome, VerificationOutcome::ScittVerified { .. }));
+}
+
+/// S1.4: The same identity-less token cannot authenticate an mTLS client —
+/// the fingerprint has no array to match. Present headers are final: reject
+/// with a SCITT error, no badge fallback, no panic.
+#[tokio::test]
+async fn test_s1_4_client_verify_token_without_identity_certs_rejects() {
+    let (signing_key, store) = make_key_and_store(1);
+    let store = Arc::new(store);
+    let token = make_token_without_identity_certs(&signing_key, SERVER_FP);
+
+    let verifier = make_scitt_verifier(
+        HOST,
+        SERVER_FP,
+        IDENTITY_FP,
+        store,
+        ScittTierPolicy::ScittWithBadgeFallback,
+    )
+    .await;
+    let cert = mtls_cert(HOST, "v1.0.0", IDENTITY_FP);
+    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+
+    let outcome = verifier.verify_client_with_scitt(&cert, &headers).await;
+    assert!(
+        !outcome.is_success(),
+        "identity-less token must not authenticate an mTLS client"
+    );
+    assert!(
+        matches!(outcome, VerificationOutcome::ScittError(_)),
+        "Expected ScittError, got: {outcome:?}"
+    );
+}
+
 // =========================================================================
 // S2: Missing headers → badge fallback
 // =========================================================================
