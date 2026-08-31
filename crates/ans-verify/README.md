@@ -233,7 +233,7 @@ cargo run -p ans-verify --features scitt --example inspect_scitt -- \
   --agent-id b8a46f57-5599-4b4d-9a53-0313e5529694
 ```
 
-### DPoP / Flavor B (A2A without mTLS)
+### DPoP / Method B (A2A without mTLS)
 
 When TLS is terminated at a proxy, the callee authenticates the caller from three artifacts on the HTTP request: a DPoP proof (`DPoP`), a status token (`X-ANS-Status-Token`), and a SCITT receipt (`X-SCITT-Receipt`). Missing status token is a hard reject.
 
@@ -259,6 +259,8 @@ let identity = verify_caller(
 ```
 
 Outbound minting: `Signer` / `attach_identity`. Inbound: `verify_caller` (three-proof bind) or `verify_proof` (possession only). Replay protection: `ReplayCache` / `MemoryReplayCache`.
+
+Content-bearing requests should bind the body into the proof via `attach_identity_with_content` / `Signer::sign_with_content` (`ans_content_digest`, ANS-6 §7.13) — a TLS-terminating hop that rewrites the body then breaks the proof. The callee passes the received content's SHA-256 as `VerifyCallerOptions::content_sha256`; verification is strict in both directions, and `require_content_binding` additionally rejects content-bearing requests whose proof does not bind the content. Minted proofs carry the profile revision (`ans_profile`, §7.12); a proof minted under a revision this implementation does not know rejects with `UNSUPPORTED_PROFILE`.
 
 Callee hardening: `VerifyCallerOptions::with_trusted_authority` rejects requests for authorities this callee does not answer as (ANS-6 §7.7), and `with_artifact_cache` (`VerifiedArtifactCache`) skips re-verifying a status token or receipt whose exact bytes verified before, while still enforcing token expiry (§4.6). On an unknown signing key, `PopError::is_unknown_key_id()` signals the refresh-and-retry pattern (§9.5) — pair with `RefreshableKeyStore::refresh_if_cooldown_elapsed`.
 

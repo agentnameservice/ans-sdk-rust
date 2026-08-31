@@ -25,7 +25,7 @@ Verification relies on:
 - **Certificate fingerprint comparison** to ensure the presented certificate matches the registered identity
 - **DANE/TLSA records** (optional) for additional certificate binding via DNSSEC
 - **SCITT verification** (optional) for offline-capable trust via signed status tokens and Merkle inclusion receipts
-- **DPoP / Flavor B** (optional, `scitt`) for application-layer A2A authentication when TLS is terminated at a proxy
+- **DPoP / Method B** (optional, `scitt`) for application-layer A2A authentication when TLS is terminated at a proxy
 
 Endpoint discovery reads the DNS discovery records of whichever profile the
 agent publishes, probing SVCB first and falling back to `_ans` TXT:
@@ -304,9 +304,9 @@ cargo run -p ans-verify --features scitt --example inspect_scitt -- \
   --agent-id b8a46f57-5599-4b4d-9a53-0313e5529694
 ```
 
-### DPoP / Flavor B (A2A without mTLS)
+### DPoP / Method B (A2A without mTLS)
 
-Enable with `features = ["scitt"]`. The caller proves possession of the identity certificate with an RFC 9449 DPoP proof (`DPoP` header). The callee binds that proof to the status token's `validIdentityCerts` and (when required) to the SCITT receipt. Missing status token is a hard reject — Flavor B does not fall back to the badge tier.
+Enable with `features = ["scitt"]`. The caller proves possession of the identity certificate with an RFC 9449 DPoP proof (`DPoP` header). The callee binds that proof to the status token's `validIdentityCerts` and (when required) to the SCITT receipt. Missing status token is a hard reject — Method B does not fall back to the badge tier. Content-bearing requests can bind the body into the proof (`attach_identity_with_content`, ANS-6 §7.13), and proofs carry their profile revision (`ans_profile`, §7.12).
 
 ```rust
 use ans_verify::{Signer, VerifyCallerOptions, attach_identity, verify_caller};

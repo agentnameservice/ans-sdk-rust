@@ -37,7 +37,7 @@ RUST_LOG=ans_verify=debug cargo run -p ans-verify --example verify_mtls_client
 RUST_LOG=ans_verify=debug cargo run -p ans-verify --features scitt --example verify_server_scitt
 RUST_LOG=ans_verify=debug cargo run -p ans-verify --features scitt --example verify_mtls_scitt
 
-# Run the self-contained DPoP / Flavor B example (both sides, in-memory)
+# Run the self-contained DPoP / Method B example (both sides, in-memory)
 cargo run -p ans-verify --features scitt,test-support --example local_dpop
 
 # Run SCITT/DPoP verification benchmarks (criterion)
@@ -152,6 +152,8 @@ Server verification (`verify_server`):
 6. Anchor to the dialed host (ANS-6 §5.1): badge's `agent.host` and the certificate host must both equal the FQDN the caller dialed — badge fields alone verify a consistent story, not the right peer
 7. Optional: DANE/TLSA verification if policy enabled
 
+Failure handling (ANS-6 §9.1/§9.2): NXDOMAIN on the badge lookup is a determinate answer — possibly the post-revocation state — and rejects regardless of `FailurePolicy`; a cached pre-revocation badge is never a fallback for it. `FailOpenWithCache { max_staleness }` applies only to indeterminate failures (SERVFAIL/timeout, TL unreachable) and may serve cache entries past their freshness TTL via the `*_allow_stale` getters — `CacheConfig::hard_ttl` (eviction bound, default 4× the freshness TTL) must be ≥ `max_staleness` for the window to exist.
+
 Client verification (`verify_client`) for mTLS:
 
 1. Extract FQDN from certificate CN, version from URI SAN (`ans://...`)
@@ -179,7 +181,7 @@ Key rules:
 - Badge fallback only when SCITT headers are completely absent
 - Terminal status (`REVOKED`/`EXPIRED`) = always reject regardless of policy
 
-### DPoP / Flavor B (feature = "scitt")
+### DPoP / Method B (feature = "scitt")
 
 Application-layer proof of possession for A2A traffic that crosses TLS-terminating proxies (`Signer`, `verify_caller`, `verify_proof`):
 
@@ -187,8 +189,10 @@ Application-layer proof of possession for A2A traffic that crosses TLS-terminati
 2. Callee verifies possession, then binds the proof fingerprint to `validIdentityCerts` on the status token
 3. The `x5c[0]` validity period must contain `now` (± pop skew) — fingerprint arrays never prune rotated-away certs, so the certificate's dates are its only expiry (ANS-6 §7.5)
 4. Optional receipt leaf identity is taken from the V2 envelope (`.payload.producer.event.ansName` / `ansId`)
-5. Missing status token is a hard reject — Flavor B does not fall back to the badge tier
+5. Missing status token is a hard reject — Method B does not fall back to the badge tier
 6. `jti` is recorded in the replay cache only after binding succeeds
+7. Content-bearing requests bind the body via `ans_content_digest` (§7.13): mint with `sign_with_content` / `attach_identity_with_content` (empty content mints no claim), verify by passing the received content's SHA-256 as `content_sha256`; strict both directions, `require_content_binding` for deployments that mandate it
+8. Minted proofs state their profile revision (`ans_profile`, §7.12); absence means revision 1, and an unknown revision rejects with `UNSUPPORTED_PROFILE` (a revision is by definition a change the verifier cannot safely ignore)
 
 The comparison URL for `htu` is the callee's job (pass the reconstructed URL into `verify_caller`). Callee hardening lives on `VerifyCallerOptions`: `trusted_authorities` (§7.7 preflight allowlist, `UNTRUSTED_AUTHORITY` on miss) and `artifact_cache` (`VerifiedArtifactCache`, §4.6 — cached status tokens still enforce `exp`; the possession proof is never cached). `PopError::is_unknown_key_id()` is the §9.5 trigger to refresh root keys once (cooldown-gated) and retry.
 
@@ -301,4 +305,4 @@ Test fixtures use `rstest` for parameterized tests and `test-log` for tracing ou
 - **Status Token**: COSE_Sign1-signed current-status claim with certificate fingerprint arrays
 - **COSE_Sign1**: CBOR Object Signing (RFC 9052) — used for receipt and status token signatures
 - **C2SP key**: Key format `{issuer}+{key_id_hex}+{spki_base64}` for transparency log root keys
-- **DPoP / Flavor B**: RFC 9449 proof of possession in the `DPoP` header, bound to the identity certificate via `x5c` and to the transparency log via the status token (no mTLS required)
+- **DPoP / Method B**: RFC 9449 proof of possession in the `DPoP` header, bound to the identity certificate via `x5c` and to the transparency log via the status token (no mTLS required)
