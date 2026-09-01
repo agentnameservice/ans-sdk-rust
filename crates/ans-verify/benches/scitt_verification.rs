@@ -266,7 +266,7 @@ fn bench_dpop(c: &mut Criterion) {
     // A 2^20-entry log: the receipt carries a 20-node inclusion path.
     let token = mint_status_token(&tl, agent_id, &fp, now);
     let receipt = mint_receipt(&tl, agent_id, 20);
-    let headers = ScittHeaders::new(Some(receipt.clone()), Some(token));
+    let headers = ScittHeaders::new(Some(receipt.clone()), Some(token.clone()));
     let signer = Signer::new(id_key, cert_der).unwrap();
 
     let mut group = c.benchmark_group("dpop");
@@ -324,6 +324,27 @@ fn bench_dpop(c: &mut Criterion) {
                 let opts = opts(None);
                 async move {
                     verify_caller(&proof, headers, METHOD, URL, store, replay, opts)
+                        .await
+                        .unwrap()
+                }
+            },
+            criterion::BatchSize::SmallInput,
+        );
+    });
+
+    // No-receipt — the `require_receipt: false` deployment shape: liveness +
+    // possession only, two ECDSA verifies instead of three.
+    let replay_no_receipt = MemoryReplayCache::new(2_000_000);
+    let headers_no_receipt = ScittHeaders::new(None, Some(token.clone()));
+    group.bench_function("verify_caller_no_receipt", |b| {
+        b.to_async(&rt).iter_batched(
+            || signer.sign(METHOD, URL, None).unwrap(),
+            |proof| {
+                let (headers, store, replay) = (&headers_no_receipt, &store, &replay_no_receipt);
+                let mut o = opts(None);
+                o.require_receipt = false;
+                async move {
+                    verify_caller(&proof, headers, METHOD, URL, store, replay, o)
                         .await
                         .unwrap()
                 }
@@ -406,6 +427,59 @@ fn bench_dpop(c: &mut Criterion) {
             },
             criterion::BatchSize::SmallInput,
         );
+    });
+
+    // Parallel — the cold check across all cores at once: every worker shares
+    // one replay cache (a single mutex, as one callee process would), so the
+    // reported per-request wall time includes lock contention. Compare with
+    // `verify_caller_cold` to read off the contention overhead; proofs are
+    // pre-minted outside the timed window because each jti is single-use.
+    let workers = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
+    let signer = std::sync::Arc::new(signer);
+    let headers = std::sync::Arc::new(headers);
+    let store = std::sync::Arc::new(store);
+    group.bench_function("verify_caller_parallel", |b| {
+        b.to_async(&rt).iter_custom(|iters| {
+            let (signer, headers, store) = (signer.clone(), headers.clone(), store.clone());
+            async move {
+                let total = usize::try_from(iters).unwrap();
+                let proofs: Vec<String> = (0..total)
+                    .map(|_| signer.sign(METHOD, URL, None).unwrap())
+                    .collect();
+                let proofs = std::sync::Arc::new(proofs);
+                let replay = std::sync::Arc::new(MemoryReplayCache::new(total + 1));
+
+                let start = std::time::Instant::now();
+                let handles: Vec<_> = (0..workers)
+                    .map(|w| {
+                        let (proofs, headers, store, replay) = (
+                            proofs.clone(),
+                            headers.clone(),
+                            store.clone(),
+                            replay.clone(),
+                        );
+                        tokio::spawn(async move {
+                            for i in (w..proofs.len()).step_by(workers) {
+                                let opts = VerifyCallerOptions {
+                                    now: Some(now),
+                                    ..VerifyCallerOptions::default()
+                                }
+                                .with_trusted_authority("payments.example.com");
+                                verify_caller(
+                                    &proofs[i], &headers, METHOD, URL, &store, &*replay, opts,
+                                )
+                                .await
+                                .unwrap();
+                            }
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    h.await.unwrap();
+                }
+                start.elapsed()
+            }
+        });
     });
 
     group.finish();

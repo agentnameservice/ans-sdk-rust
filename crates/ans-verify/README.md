@@ -270,7 +270,7 @@ A self-contained example runs both sides of the flow in-memory, including replay
 cargo run -p ans-verify --features scitt,test-support --example local_dpop
 ```
 
-Criterion benchmarks cover offline verification (status token, receipt at log sizes up to 2^30 entries, proof minting, and the full caller flow cold vs. artifact-cache warm):
+Criterion benchmarks cover offline verification (status token, receipt at log sizes up to 2^30 entries, proof minting, and the full caller flow across deployment shapes: cold / artifact-cache warm and hot / no-receipt / parallel across all cores with a shared replay cache):
 
 ```bash
 cargo bench -p ans-verify --features scitt,test-support
