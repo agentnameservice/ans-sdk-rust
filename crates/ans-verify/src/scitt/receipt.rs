@@ -20,9 +20,8 @@
 //! - **signature** is a 64-byte P1363 ECDSA P-256 signature
 
 use p256::ecdsa::Signature;
-use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
 
-use super::cose::{compute_sig_structure_digest, parse_cose_sign1};
+use super::cose::{build_sig_structure, parse_cose_sign1};
 use super::error::ScittError;
 use super::merkle::{MAX_HASH_PATH_LEN, walk_inclusion_path};
 use super::root_keys::ScittKeyStore;
@@ -78,7 +77,7 @@ struct Vdp {
 ///
 /// # Errors
 ///
-/// - Structural/CBOR errors from [`parse_cose_sign1`]
+/// - Structural/CBOR errors from `COSE_Sign1` parsing
 /// - [`ScittError::InvalidProtectedHeader`] if `vds` is missing or not 1
 /// - [`ScittError::UnknownKeyId`] if `kid` is not in `key_store`
 /// - [`ScittError::SignatureInvalid`] if ECDSA verification fails
@@ -125,15 +124,15 @@ pub fn verify_receipt(
     }
 
     // Step 4: verify ECDSA P-256 signature
-    let digest = compute_sig_structure_digest(&parsed.protected_bytes, &parsed.payload)?;
+    let sig_structure = build_sig_structure(&parsed.protected_bytes, &parsed.payload)?;
     let sig = Signature::from_slice(&parsed.signature).map_err(|_| {
         tracing::warn!(kid = %kid_hex, "ECDSA signature encoding invalid");
         ScittError::SignatureInvalid
     })?;
-    trusted_key.key.verify_prehash(&digest, &sig).map_err(|_| {
+    if !crate::p256_verify::verify_p256_sha256(&trusted_key.key, &sig_structure, &sig) {
         tracing::warn!(kid = %kid_hex, "ECDSA signature verification failed");
-        ScittError::SignatureInvalid
-    })?;
+        return Err(ScittError::SignatureInvalid);
+    }
     tracing::debug!(kid = %kid_hex, "ECDSA signature verified");
 
     // Step 5: extract VDP from unprotected header (label 396)

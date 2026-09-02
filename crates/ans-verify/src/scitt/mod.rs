@@ -49,12 +49,12 @@ pub use receipt::{VerifiedReceipt, verify_receipt};
 pub use refreshable_key_store::{KeyRefreshHandle, RefreshableKeyStore};
 pub use root_keys::{ScittKeyStore, TrustedKey};
 pub use scitt_cache::{ReceiptCache, StatusTokenCache};
-pub use status_token::{VerifiedStatusToken, verify_status_token};
+pub use status_token::{VerifiedStatusToken, verify_status_token, verify_status_token_at};
 pub use supplier::{ScittHeaderSupplier, ScittOutgoingHeaders, ScittRefreshHandle};
 pub use verification_cache::ScittVerificationCache;
 
-// ── Internal API (used by verify.rs, not re-exported from lib.rs) ────────────
-pub use status_token::{matches_identity_cert, matches_server_cert};
+// ── Internal API (used by verify.rs and pop, not re-exported from lib.rs) ────
+pub use status_token::{MAX_CLOCK_SKEW_TOLERANCE_SECS, matches_identity_cert, matches_server_cert};
 pub use verification_cache::{CachedScittOutcome, hash_bytes};
 
 // ── Test-support API (internal primitives exposed for integration tests) ─────
@@ -62,5 +62,3 @@ pub use verification_cache::{CachedScittOutcome, hash_bytes};
 pub use client::MockScittClient;
 #[cfg(any(test, feature = "test-support"))]
 pub use cose::{ParsedCoseSign1, compute_sig_structure_digest, parse_cose_sign1};
-#[cfg(any(test, feature = "test-support"))]
-pub use status_token::verify_status_token_at;

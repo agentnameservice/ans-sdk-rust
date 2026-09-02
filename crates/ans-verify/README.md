@@ -233,6 +233,49 @@ cargo run -p ans-verify --features scitt --example inspect_scitt -- \
   --agent-id b8a46f57-5599-4b4d-9a53-0313e5529694
 ```
 
+### DPoP / Method B (A2A without mTLS)
+
+When TLS is terminated at a proxy, the callee authenticates the caller from three artifacts on the HTTP request: a DPoP proof (`DPoP`), a status token (`X-ANS-Status-Token`), and a SCITT receipt (`X-SCITT-Receipt`). Missing status token is a hard reject.
+
+```rust
+use ans_verify::{
+    MemoryReplayCache, Signer, VerifyCallerOptions, attach_identity, verify_caller,
+};
+
+// Caller
+let proof = attach_identity(&signer, "POST", "https://payments.example.com/api/task", None)?;
+
+// Callee — pass the reconstructed request URL, not the proxy's local address
+let identity = verify_caller(
+    &proof,
+    &headers,
+    "POST",
+    "https://payments.example.com/api/task",
+    &key_store,
+    &replay,
+    VerifyCallerOptions::default(),
+)
+.await?;
+```
+
+Outbound minting: `Signer` / `attach_identity`. Inbound: `verify_caller` (three-proof bind) or `verify_proof` (possession only). Replay protection: `ReplayCache` / `MemoryReplayCache`.
+
+Content-bearing requests should bind the body into the proof via `attach_identity_with_content` / `Signer::sign_with_content` (`ans_content_digest`, ANS-6 §7.13) — a TLS-terminating hop that rewrites the body then breaks the proof. The callee passes the received content's SHA-256 as `VerifyCallerOptions::content_sha256`; verification is strict in both directions, and `require_content_binding` additionally rejects content-bearing requests whose proof does not bind the content. Minted proofs carry the profile revision (`ans_profile`, §7.12); a proof minted under a revision this implementation does not know rejects with `UNSUPPORTED_PROFILE`.
+
+Callee hardening: `VerifyCallerOptions::with_trusted_authority` rejects requests for authorities this callee does not answer as (ANS-6 §7.7), and `with_artifact_cache` (`VerifiedArtifactCache`) skips re-verifying a status token or receipt whose exact bytes verified before, while still enforcing token expiry (§4.6). On an unknown signing key, `PopError::is_unknown_key_id()` signals the refresh-and-retry pattern (§9.5) — pair with `RefreshableKeyStore::refresh_if_cooldown_elapsed`.
+
+A self-contained example runs both sides of the flow in-memory, including replay rejection, the authority allowlist, and the artifact cache:
+
+```bash
+cargo run -p ans-verify --features scitt,test-support --example local_dpop
+```
+
+Criterion benchmarks cover offline verification (status token, receipt at log sizes up to 2^30 entries, proof minting, and the full caller flow across deployment shapes: cold / artifact-cache warm and hot / no-receipt / parallel across all cores with a shared replay cache):
+
+```bash
+cargo bench -p ans-verify --features scitt,test-support
+```
+
 ## Traits
 
 Implement these traits for custom backends:
@@ -305,7 +348,8 @@ let verifier = ServerVerifier::builder()
 | Feature | Description |
 |---|---|
 | `rustls` | Enables `AnsServerCertVerifier` and `AnsClientCertVerifier` for rustls TLS integration |
-| `scitt` | Enables SCITT verification: `ScittKeyStore`, `verify_status_token`, `verify_receipt`, `ScittHeaderSupplier`, `HttpScittClient` |
+| `scitt` | Enables SCITT verification and ANS-6 DPoP: `ScittKeyStore`, `verify_status_token`, `verify_receipt`, `ScittHeaderSupplier`, `HttpScittClient`, `Signer`, `verify_caller` |
+| `fast-verify` | Swaps ECDSA P-256 *verification* to `ring`'s assembly implementation (~3x faster; implies `scitt`). The default stays pure-Rust `p256`. `ring` is the same backend the `rustls` feature already links |
 | `test-support` | Exposes `MockDnsResolver`, `MockTransparencyLogClient`, and `MockScittClient` for use in downstream integration tests |
 
 ## License

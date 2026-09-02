@@ -16,9 +16,21 @@ pub struct CacheConfig {
     /// Maximum number of entries in the cache.
     pub max_entries: u64,
     /// Default time-to-live for cached badges.
+    ///
+    /// This is the *freshness* window: normal reads ([`BadgeCache::get`] and
+    /// friends) serve an entry only while it is younger than this.
     pub default_ttl: Duration,
     /// Time before TTL when refresh is recommended.
     pub refresh_threshold: Duration,
+    /// How long entries stay resident after insertion (hard eviction bound).
+    ///
+    /// Between `default_ttl` and `hard_ttl` an entry is *stale*: invisible to
+    /// normal reads but still available to the `*_allow_stale` getters, which
+    /// exist for fail-open fallback under a lookup outage (ANS-6 §9.2). A
+    /// deployment using `FailurePolicy::FailOpenWithCache` should keep this
+    /// at or above its `max_staleness`. Values below `default_ttl` are
+    /// clamped up to it.
+    pub hard_ttl: Duration,
 }
 
 impl Default for CacheConfig {
@@ -27,16 +39,21 @@ impl Default for CacheConfig {
             max_entries: 1000,
             default_ttl: Duration::from_secs(300), // 5 minutes
             refresh_threshold: Duration::from_secs(60), // 1 minute before expiry
+            hard_ttl: Duration::from_secs(1200),   // 20 minutes
         }
     }
 }
 
 impl CacheConfig {
     /// Create a new configuration with custom TTL.
+    ///
+    /// The stale-residency bound ([`Self::hard_ttl`]) scales to 4× the
+    /// freshness TTL.
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             default_ttl: ttl,
             refresh_threshold: Duration::from_secs(ttl.as_secs() / 5),
+            hard_ttl: ttl.saturating_mul(4),
             ..Default::default()
         }
     }
@@ -129,7 +146,7 @@ impl BadgeCache {
     pub fn new(config: CacheConfig) -> Self {
         let cache = Cache::builder()
             .max_capacity(config.max_entries)
-            .time_to_live(config.default_ttl)
+            .time_to_live(config.hard_ttl.max(config.default_ttl))
             .build();
 
         Self {
@@ -147,6 +164,16 @@ impl BadgeCache {
     /// Get a cached badge by key.
     pub async fn get(&self, key: &CacheKey) -> Option<CachedBadge> {
         self.cache.get(key).await.filter(CachedBadge::is_valid)
+    }
+
+    /// Get a cached badge by key, including entries past their freshness TTL.
+    ///
+    /// For fail-open fallback under a lookup outage (ANS-6 §9.2): the caller
+    /// is expected to bound acceptance with its own staleness threshold via
+    /// [`CachedBadge::fetched_at`]. Entries remain readable until the
+    /// [`CacheConfig::hard_ttl`] eviction bound.
+    pub async fn get_allow_stale(&self, key: &CacheKey) -> Option<CachedBadge> {
+        self.cache.get(key).await
     }
 
     /// Insert a badge into the cache.
@@ -193,12 +220,37 @@ impl BadgeCache {
         self.get(&CacheKey::fqdn_version(fqdn, version)).await
     }
 
+    /// [`Self::get_by_fqdn_version`], including entries past their freshness
+    /// TTL. See [`Self::get_allow_stale`].
+    pub async fn get_by_fqdn_version_allow_stale(
+        &self,
+        fqdn: &Fqdn,
+        version: &Version,
+    ) -> Option<CachedBadge> {
+        self.get_allow_stale(&CacheKey::fqdn_version(fqdn, version))
+            .await
+    }
+
     /// Insert a badge keyed by FQDN and version, updating the version index.
     ///
     /// The version index enables `get_all_for_fqdn()` to discover all cached
     /// badges for a given host.
     pub async fn insert_for_fqdn_version(&self, fqdn: &Fqdn, version: &Version, badge: Badge) {
-        self.insert(CacheKey::fqdn_version(fqdn, version), badge)
+        self.insert_for_fqdn_version_with_ttl(fqdn, version, badge, self.config.default_ttl)
+            .await;
+    }
+
+    /// [`Self::insert_for_fqdn_version`] with a custom soft (freshness) TTL.
+    ///
+    /// See [`Self::insert_with_ttl`] for the soft/hard TTL distinction.
+    pub async fn insert_for_fqdn_version_with_ttl(
+        &self,
+        fqdn: &Fqdn,
+        version: &Version,
+        badge: Badge,
+        ttl: Duration,
+    ) {
+        self.insert_with_ttl(CacheKey::fqdn_version(fqdn, version), badge, ttl)
             .await;
 
         let key = fqdn.as_str().to_lowercase();
@@ -214,6 +266,16 @@ impl BadgeCache {
     /// Reads the version index to find which versions are cached, then fetches
     /// each one. Filters out expired entries.
     pub async fn get_all_for_fqdn(&self, fqdn: &Fqdn) -> Vec<CachedBadge> {
+        self.collect_for_fqdn(fqdn, false).await
+    }
+
+    /// [`Self::get_all_for_fqdn`], including entries past their freshness
+    /// TTL. See [`Self::get_allow_stale`].
+    pub async fn get_all_for_fqdn_allow_stale(&self, fqdn: &Fqdn) -> Vec<CachedBadge> {
+        self.collect_for_fqdn(fqdn, true).await
+    }
+
+    async fn collect_for_fqdn(&self, fqdn: &Fqdn, allow_stale: bool) -> Vec<CachedBadge> {
         let key = fqdn.as_str().to_lowercase();
         let index = self.version_index.read().await;
         let versions = match index.get(&key) {
@@ -224,7 +286,13 @@ impl BadgeCache {
 
         let mut results = Vec::new();
         for version in &versions {
-            if let Some(cached) = self.get(&CacheKey::fqdn_version(fqdn, version)).await {
+            let key = CacheKey::fqdn_version(fqdn, version);
+            let cached = if allow_stale {
+                self.get_allow_stale(&key).await
+            } else {
+                self.get(&key).await
+            };
+            if let Some(cached) = cached {
                 results.push(cached);
             }
         }
@@ -535,5 +603,48 @@ mod tests {
 
         cache.clear().await;
         assert!(cache.get_all_for_fqdn(&fqdn).await.is_empty());
+    }
+
+    /// A stale entry (past its freshness TTL, within the hard eviction bound)
+    /// is invisible to normal reads but served by the `*_allow_stale` getters.
+    #[tokio::test]
+    async fn test_stale_entry_visible_only_to_allow_stale_reads() {
+        let cache = BadgeCache::with_defaults();
+        let fqdn = Fqdn::new("test.example.com").unwrap();
+        let version = Version::new(1, 0, 0);
+
+        cache
+            .insert_for_fqdn_version_with_ttl(&fqdn, &version, create_test_badge(), Duration::ZERO)
+            .await;
+
+        assert!(cache.get_by_fqdn_version(&fqdn, &version).await.is_none());
+        assert!(cache.get_all_for_fqdn(&fqdn).await.is_empty());
+
+        let stale = cache
+            .get_by_fqdn_version_allow_stale(&fqdn, &version)
+            .await
+            .unwrap();
+        assert!(!stale.is_valid());
+        assert_eq!(cache.get_all_for_fqdn_allow_stale(&fqdn).await.len(), 1);
+    }
+
+    /// Fresh entries are served by both read paths.
+    #[tokio::test]
+    async fn test_allow_stale_reads_also_serve_fresh_entries() {
+        let cache = BadgeCache::with_defaults();
+        let fqdn = Fqdn::new("test.example.com").unwrap();
+        let version = Version::new(1, 0, 0);
+
+        cache
+            .insert_for_fqdn_version(&fqdn, &version, create_test_badge())
+            .await;
+
+        assert!(cache.get_by_fqdn_version(&fqdn, &version).await.is_some());
+        assert!(
+            cache
+                .get_by_fqdn_version_allow_stale(&fqdn, &version)
+                .await
+                .is_some()
+        );
     }
 }

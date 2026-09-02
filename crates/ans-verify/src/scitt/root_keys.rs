@@ -130,7 +130,9 @@ impl ScittKeyStore {
                     use std::collections::hash_map::Entry;
                     match keys.entry(trusted_key.kid) {
                         Entry::Occupied(e) => {
-                            if e.get().name != trusted_key.name {
+                            // ANS-6 §4.5: collisions fail toward the cache — a line whose
+                            // kid matches but whose name or key material differs is a finding.
+                            if e.get().name != trusted_key.name || e.get().key != trusted_key.key {
                                 warn!(
                                     kid = %hex::encode(trusted_key.kid),
                                     existing = %e.get().name,

@@ -21,16 +21,15 @@ use std::collections::BTreeMap;
 
 use ans_types::{BadgeStatus, CertEntry, CertFingerprint, CertType, StatusTokenPayload};
 use p256::ecdsa::Signature;
-use p256::ecdsa::signature::hazmat::PrehashVerifier as _;
 use uuid::Uuid;
 
-use super::cose::{compute_sig_structure_digest, parse_cose_sign1};
+use super::cose::{build_sig_structure, parse_cose_sign1};
 use super::error::ScittError;
 use super::root_keys::ScittKeyStore;
 
 /// Maximum clock skew tolerance (24 hours). Larger values would make tokens
 /// effectively non-expirable.
-const MAX_CLOCK_SKEW_TOLERANCE_SECS: u64 = 24 * 60 * 60;
+pub const MAX_CLOCK_SKEW_TOLERANCE_SECS: u64 = 24 * 60 * 60;
 
 /// A status token whose COSE signature has been verified and expiry checked.
 #[derive(Debug, Clone)]
@@ -44,8 +43,9 @@ pub struct VerifiedStatusToken {
 
 /// Verify a SCITT status token: COSE signature + expiry + status check.
 ///
-/// Uses the system clock for expiry checks. See [`verify_status_token_at`]
-/// for a variant that accepts an explicit timestamp (useful in tests).
+/// Uses the system clock for expiry checks. See
+/// [`verify_status_token_at`](crate::verify_status_token_at) for a variant
+/// that accepts an explicit timestamp (useful in tests).
 ///
 /// # Steps
 /// 1. Parse `COSE_Sign1` structure
@@ -89,7 +89,7 @@ pub fn verify_status_token_at(
     let parsed = parse_cose_sign1(token_bytes)?;
 
     // Step 2: verify ECDSA P-256 signature
-    let digest = compute_sig_structure_digest(&parsed.protected_bytes, &parsed.payload)?;
+    let sig_structure = build_sig_structure(&parsed.protected_bytes, &parsed.payload)?;
     let kid_hex = hex::encode(parsed.protected.kid);
     let sig = Signature::from_slice(&parsed.signature).map_err(|_| {
         tracing::warn!(kid = %kid_hex, "ECDSA signature encoding invalid");
@@ -99,10 +99,10 @@ pub fn verify_status_token_at(
     })?;
     let trusted_key = key_store.get(parsed.protected.kid)?;
     tracing::debug!(kid = %kid_hex, key_domain = %trusted_key.name, "Key lookup succeeded");
-    trusted_key.key.verify_prehash(&digest, &sig).map_err(|_| {
+    if !crate::p256_verify::verify_p256_sha256(&trusted_key.key, &sig_structure, &sig) {
         tracing::warn!(kid = %kid_hex, "ECDSA signature verification failed");
-        ScittError::SignatureInvalid
-    })?;
+        return Err(ScittError::SignatureInvalid);
+    }
     tracing::debug!(kid = %kid_hex, "ECDSA signature verified");
 
     // Step 2b: bind iss claim to signing key domain (mirrors receipt.rs)
@@ -327,12 +327,19 @@ fn parse_cert_entries(arr: Vec<ciborium::Value>) -> Result<Vec<CertEntry>, Scitt
                 || matches!(&k, ciborium::Value::Text(s) if s == "cert_type");
 
             if is_fingerprint {
-                if let ciborium::Value::Text(fp_str) = v {
-                    fingerprint =
+                fingerprint = match v {
+                    ciborium::Value::Text(fp_str) => {
                         Some(CertFingerprint::parse(&fp_str).map_err(|e| {
                             ScittError::CborDecodeError(format!("fingerprint: {e}"))
-                        })?);
-                }
+                        })?)
+                    }
+                    ciborium::Value::Bytes(b) if b.len() == 32 => {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&b);
+                        Some(CertFingerprint::from_bytes(arr))
+                    }
+                    _ => None,
+                };
             } else if is_cert_type && let ciborium::Value::Text(t) = v {
                 cert_type = Some(t.parse::<CertType>().map_err(ScittError::CborDecodeError)?);
             }
@@ -366,6 +373,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::scitt::cose::compute_sig_structure_digest;
     use crate::scitt::root_keys::ScittKeyStore;
 
     use base64::Engine as _;

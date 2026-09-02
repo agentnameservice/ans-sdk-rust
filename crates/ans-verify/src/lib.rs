@@ -100,6 +100,7 @@
 //! - Response caching with configurable TTL
 //! - Async-first design with tokio
 //! - Optional rustls integration for TLS handshake verification
+//! - Optional SCITT `DPoP` (ANS-6 Method B) for application-layer A2A authentication
 
 mod cache;
 mod dane;
@@ -113,6 +114,12 @@ mod rustls_verifier;
 
 #[cfg(feature = "scitt")]
 mod scitt;
+
+#[cfg(feature = "scitt")]
+mod p256_verify;
+
+#[cfg(feature = "scitt")]
+mod pop;
 
 // Re-export types from ans-types for convenience
 pub use ans_types::{
@@ -154,11 +161,23 @@ pub use scitt::{
     ClockFn, HttpScittClient, KeyRefreshHandle, ReceiptCache, RefreshableKeyStore, ScittClient,
     ScittError, ScittHeaderSupplier, ScittHeaders, ScittKeyStore, ScittOutgoingHeaders,
     ScittRefreshHandle, ScittVerificationCache, StatusTokenCache, TrustedKey, VerifiedReceipt,
-    VerifiedStatusToken, system_clock, verify_receipt, verify_status_token,
+    VerifiedStatusToken, system_clock, verify_receipt, verify_status_token, verify_status_token_at,
+};
+
+#[cfg(feature = "scitt")]
+pub use pop::{
+    ANS_PROFILE_REVISION, CallerIdentity, DEFAULT_ARTIFACT_CACHE_ENTRIES, DEFAULT_POP_SKEW,
+    DEFAULT_REPLAY_MAX_ENTRIES, DPOP_HEADER, MAX_JTI_SIZE, MAX_PROOF_SIZE, MemoryReplayCache,
+    PopError, PopErrorKind, ProofResult, ReplayCache, Signer, VerifiedArtifactCache,
+    VerifyCallerOptions, VerifyProofOptions, access_token_from_authorization, attach_identity,
+    attach_identity_with_content, normalize_authority, normalize_htu, reject_duplicate_header,
+    request_authority, verify_caller, verify_proof,
 };
 
 #[cfg(all(feature = "scitt", any(test, feature = "test-support")))]
+pub use p256_verify::verify_p256_sha256;
+#[cfg(all(feature = "scitt", any(test, feature = "test-support")))]
 pub use scitt::{
     MockScittClient, ParsedCoseSign1, compute_sig_structure_digest, matches_identity_cert,
-    matches_server_cert, parse_cose_sign1, verify_status_token_at,
+    matches_server_cert, parse_cose_sign1,
 };

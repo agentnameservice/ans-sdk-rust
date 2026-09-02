@@ -465,6 +465,125 @@ async fn test_2_6_tlog_unreachable_fail_closed() {
     );
 }
 
+/// ANS-6 §9.1: NXDOMAIN is a determinate answer — possibly post-revocation —
+/// and a cached pre-revocation badge is never a fallback for it. Fail-open
+/// caching applies only to indeterminate failures (SERVFAIL/timeout, §9.2).
+///
+/// The cached badge is inserted past its freshness TTL so the normal cache
+/// path skips it and verification reaches DNS; the badge is then available
+/// only to the fail-open fallback, which must decline it for NXDOMAIN and
+/// use it for SERVFAIL.
+#[tokio::test]
+async fn test_9_1_nxdomain_rejects_despite_cached_badge() {
+    let host = "agent.example.com";
+    let b = badge(host, "v1.0.0", SERVER_FP, IDENTITY_FP);
+    let cache = Arc::new(BadgeCache::with_defaults());
+    let fqdn = Fqdn::new(host).unwrap();
+    cache
+        .insert_for_fqdn_version_with_ttl(&fqdn, &Version::new(1, 0, 0), b, Duration::ZERO)
+        .await;
+
+    let dns = Arc::new(MockDnsResolver::new().with_error(
+        host,
+        DnsError::NotFound {
+            fqdn: host.to_string(),
+        },
+    ));
+    let tlog = Arc::new(MockTransparencyLogClient::new());
+    let verifier = ServerVerifier::builder()
+        .dns_resolver(dns.clone() as Arc<dyn DnsResolver>)
+        .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
+        .cache(cache)
+        .failure_policy(FailurePolicy::FailOpenWithCache {
+            max_staleness: Duration::from_secs(600),
+        })
+        .build()
+        .await
+        .unwrap();
+
+    // NXDOMAIN: determinate absence → reject, cache not consulted.
+    let outcome = verifier.verify(&fqdn, &server_cert(host, SERVER_FP)).await;
+    assert!(
+        matches!(
+            outcome,
+            VerificationOutcome::DnsError(DnsError::NotFound { .. })
+        ),
+        "Expected NXDOMAIN rejection, got: {outcome:?}"
+    );
+
+    // Contrast: an indeterminate failure on the same verifier does use the
+    // stale cached badge under fail-open-with-cache.
+    dns.set_error(
+        host,
+        DnsError::LookupFailed {
+            fqdn: host.to_string(),
+            reason: "SERVFAIL".to_string(),
+        },
+    );
+    let outcome = verifier.verify(&fqdn, &server_cert(host, SERVER_FP)).await;
+    assert!(
+        outcome.is_success(),
+        "Expected cached-badge success on SERVFAIL, got: {outcome:?}"
+    );
+}
+
+/// ANS-6 §9.1/§6.6, client side: `find_badge_for_version` surfaces NXDOMAIN
+/// as a DNS error, which must reject even under fail-open-with-cache. The
+/// same stale cached badge does serve an indeterminate SERVFAIL.
+#[tokio::test]
+async fn test_9_1_client_nxdomain_rejects_despite_cached_badge() {
+    let host = "client.example.com";
+    let b = badge(host, "v1.0.0", SERVER_FP, IDENTITY_FP);
+    let cache = Arc::new(BadgeCache::with_defaults());
+    let fqdn = Fqdn::new(host).unwrap();
+    cache
+        .insert_for_fqdn_version_with_ttl(&fqdn, &Version::new(1, 0, 0), b, Duration::ZERO)
+        .await;
+
+    let dns = Arc::new(MockDnsResolver::new().with_error(
+        host,
+        DnsError::NotFound {
+            fqdn: host.to_string(),
+        },
+    ));
+    let tlog = Arc::new(MockTransparencyLogClient::new());
+    let verifier = ClientVerifier::builder()
+        .dns_resolver(dns.clone() as Arc<dyn DnsResolver>)
+        .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
+        .cache(cache)
+        .failure_policy(FailurePolicy::FailOpenWithCache {
+            max_staleness: Duration::from_secs(600),
+        })
+        .build()
+        .await
+        .unwrap();
+    let cert = mtls_cert(host, "v1.0.0", IDENTITY_FP);
+
+    // NXDOMAIN: determinate absence → reject, cache not consulted.
+    let outcome = verifier.verify(&cert).await;
+    assert!(
+        matches!(
+            outcome,
+            VerificationOutcome::DnsError(DnsError::NotFound { .. })
+        ),
+        "Expected NXDOMAIN rejection, got: {outcome:?}"
+    );
+
+    // Contrast: SERVFAIL on the same verifier uses the stale cached badge.
+    dns.set_error(
+        host,
+        DnsError::LookupFailed {
+            fqdn: host.to_string(),
+            reason: "SERVFAIL".to_string(),
+        },
+    );
+    let outcome = verifier.verify(&cert).await;
+    assert!(
+        outcome.is_success(),
+        "Expected cached-badge success on SERVFAIL, got: {outcome:?}"
+    );
+}
+
 /// §2.6 Transparency log unreachable + FailOpenWithCache → uses cached badge.
 #[tokio::test]
 async fn test_2_6_tlog_unreachable_fail_open_with_cache() {
@@ -607,6 +726,42 @@ async fn test_3_3_dns_san_mismatch() {
     assert!(
         matches!(outcome, VerificationOutcome::HostnameMismatch { .. }),
         "Expected HostnameMismatch, got: {:?}",
+        outcome
+    );
+}
+
+/// ANS-6 §5.1 dialed-host anchor: a badge and certificate that agree with
+/// each other but name a different host than the caller dialed → reject.
+/// Without the anchor a spoofed `_ans-badge` record pointing at a consistent
+/// (badge, cert) pair for another agent would verify.
+#[tokio::test]
+async fn test_3_3b_badge_host_not_dialed_host() {
+    let dialed_host = "victim.example.com";
+    let other_host = "attacker.example.com";
+    // Badge and cert consistently name attacker.example.com.
+    let b = badge(other_host, "v1.0.0", SERVER_FP, IDENTITY_FP);
+
+    let dns = Arc::new(MockDnsResolver::new().with_records(
+        dialed_host,
+        vec![dns_record(Some(Version::new(1, 0, 0)), BADGE_URL_V1)],
+    ));
+    let tlog = Arc::new(MockTransparencyLogClient::new().with_badge(BADGE_URL_V1, b));
+
+    let verifier = server_verifier(dns, tlog).await;
+    let outcome = verifier
+        .verify(
+            &Fqdn::new(dialed_host).unwrap(),
+            &server_cert(other_host, SERVER_FP),
+        )
+        .await;
+
+    assert!(
+        matches!(
+            outcome,
+            VerificationOutcome::HostnameMismatch { ref expected, ref actual, .. }
+                if expected == dialed_host && actual == other_host
+        ),
+        "Expected HostnameMismatch anchored to the dialed host, got: {:?}",
         outcome
     );
 }
