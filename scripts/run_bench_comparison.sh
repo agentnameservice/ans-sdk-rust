@@ -24,6 +24,7 @@
 #   (fast-verify).
 
 set -euo pipefail
+trap 'echo "ERROR: command failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 WORKDIR="${1:-$HOME/ans-bench}"
 SAMPLES="${SAMPLES:-6}"
@@ -44,6 +45,19 @@ GO_BENCHES=(
 CRITERION_FILTER="status_token/verify|receipt/verify/2pow20|dpop/|ecdsa_p256|replay_cache"
 
 banner() { printf '\n== %s ==\n' "$*"; }
+
+# Run one go test benchmark; on success append its output to the results
+# file, on failure print the output (which carries the reason) and stop.
+go_bench() {
+  local dir=$1 pkg=$2 pattern=$3 out
+  if ! out=$(cd "$dir" && go test -bench "$pattern" -run '^$' \
+      -benchtime "$BENCHTIME" -benchmem "$pkg" 2>&1); then
+    echo "FAILED: go test -bench '$pattern' in $dir" >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  printf '%s\n' "$out" >> "$WORKDIR/results/go-bench.txt"
+}
 
 mkdir -p "$WORKDIR/results"
 cd "$WORKDIR"
@@ -68,16 +82,13 @@ git -C ans-sdk-rust checkout "$RUST_BRANCH"
 
 banner "1/5 Go pop benchmarks (one process per benchmark, $SAMPLES samples)"
 : > results/go-bench.txt
-cd ans-sdk-go
-go build ./pop/
+(cd ans-sdk-go && go build ./pop/)
 for i in $(seq "$SAMPLES"); do
   for b in "${GO_BENCHES[@]}"; do
     echo "  sample $i/$SAMPLES: $b"
-    go test -bench "^Benchmark${b}\$" -run '^$' -benchtime "$BENCHTIME" -benchmem ./pop/ \
-      >> "$WORKDIR/results/go-bench.txt"
+    go_bench ans-sdk-go ./pop/ "^Benchmark${b}\$"
   done
 done
-cd "$WORKDIR"
 
 banner "2/5 Go raw ECDSA P-256 baseline"
 mkdir -p ecdsabench
@@ -122,8 +133,8 @@ func BenchmarkP256Verify(b *testing.B) {
 EOF
 # No shared fixtures between these two — one process for both is fine.
 for i in $(seq "$SAMPLES"); do
-  (cd ecdsabench && go test -bench . -run '^$' -benchtime "$BENCHTIME" .) \
-    >> "$WORKDIR/results/go-bench.txt"
+  echo "  sample $i/$SAMPLES: P256Sign+P256Verify"
+  go_bench ecdsabench . '^BenchmarkP256'
 done
 
 banner "3/5 Rust criterion, pure p256"
