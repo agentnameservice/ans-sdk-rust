@@ -62,6 +62,13 @@ go_bench() {
 mkdir -p "$WORKDIR/results"
 cd "$WORKDIR"
 
+# go test builds and *executes* the test binary from its temp dir; on
+# hosts where /tmp is mounted noexec that fails with
+# "fork/exec /tmp/go-build.../pop.test: permission denied".
+# Keep Go's build scratch on the (exec-able) workdir filesystem.
+mkdir -p "$WORKDIR/.gotmp"
+export GOTMPDIR="$WORKDIR/.gotmp"
+
 banner "0/5 setup"
 [ -d ans-sdk-go ] || git clone https://github.com/agentnameservice/ans-sdk-go
 git -C ans-sdk-go fetch origin "$GO_BRANCH"
