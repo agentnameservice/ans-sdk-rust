@@ -125,6 +125,7 @@ pub use ans_types::{
 pub use cache::{BadgeCache, CacheConfig, CacheKey, CachedBadge};
 pub use dane::{
     DanePolicy, DaneVerificationResult, TlsaMatchingType, TlsaRecord, TlsaSelector, TlsaUsage,
+    verify_dane, verify_dane_cert,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use dns::MockDnsResolver;
