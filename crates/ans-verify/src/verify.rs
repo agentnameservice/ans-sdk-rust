@@ -13,7 +13,7 @@ use std::time::Duration;
 use futures_util::future::join_all;
 
 use crate::cache::{BadgeCache, CacheConfig, CacheKey};
-use crate::dane::{DanePolicy, DaneVerificationResult, verify_dane};
+use crate::dane::{DanePolicy, DaneVerificationResult, verify_dane_cert};
 use crate::dns::{
     BadgeRecord, DnsLookupResult, DnsResolver, DnsResolverConfig, HickoryDnsResolver,
 };
@@ -21,8 +21,8 @@ use crate::error::{AnsError, AnsResult, DaneError, DnsError, TlogError, Verifica
 use crate::tlog::{HttpTransparencyLogClient, TransparencyLogClient};
 use ans_types::{AnsName, Badge, BadgeStatus, CertFingerprint, CryptoError, Fqdn, Version};
 
-/// Parsed certificate data: (Common Name, DNS SANs, URI SANs).
-type ParsedCertData = (Option<String>, Vec<String>, Vec<String>);
+/// Parsed certificate data: (Common Name, DNS SANs, URI SANs, `SubjectPublicKeyInfo` DER).
+type ParsedCertData = (Option<String>, Vec<String>, Vec<String>, Vec<u8>);
 
 /// Extracted identity information from a certificate.
 ///
@@ -42,6 +42,18 @@ pub struct CertIdentity {
     pub(crate) uri_sans: Vec<String>,
     /// Certificate fingerprint.
     pub(crate) fingerprint: CertFingerprint,
+    /// Full certificate DER, when the identity was built from one.
+    ///
+    /// Lets DANE evaluate TLSA records by their own selector and matching
+    /// type (RFC 6698) instead of assuming `3 0 1`. `None` for identities
+    /// built from a bare fingerprint, which then keep the fingerprint-only
+    /// comparison.
+    pub(crate) raw_der: Option<Vec<u8>>,
+    /// `SubjectPublicKeyInfo` DER (RFC 5280 §4.1.2.7), when known.
+    ///
+    /// The association data for TLSA selector 1, which survives certificate
+    /// renewal when the key pair is retained (RFC 7671 §5.1).
+    pub(crate) spki_der: Option<Vec<u8>>,
 }
 
 impl CertIdentity {
@@ -81,6 +93,8 @@ impl CertIdentity {
             dns_sans,
             uri_sans,
             fingerprint,
+            raw_der: None,
+            spki_der: None,
         }
     }
 
@@ -90,13 +104,15 @@ impl CertIdentity {
     /// Subject Alternative Names (DNS, URI) using x509-parser.
     pub fn from_der(der: &[u8]) -> Result<Self, CryptoError> {
         let fingerprint = CertFingerprint::from_der(der);
-        let (common_name, dns_sans, uri_sans) = Self::parse_cert_der(der)?;
+        let (common_name, dns_sans, uri_sans, spki_der) = Self::parse_cert_der(der)?;
 
         Ok(Self {
             common_name,
             dns_sans,
             uri_sans,
             fingerprint,
+            raw_der: Some(der.to_vec()),
+            spki_der: Some(spki_der),
         })
     }
 
@@ -110,7 +126,20 @@ impl CertIdentity {
             dns_sans: vec![cn],
             uri_sans: vec![],
             fingerprint,
+            raw_der: None,
+            spki_der: None,
         }
+    }
+
+    /// The full certificate DER, if this identity was built from one.
+    pub fn raw_der(&self) -> Option<&[u8]> {
+        self.raw_der.as_deref()
+    }
+
+    /// The certificate's `SubjectPublicKeyInfo` DER, if this identity was
+    /// built from a DER certificate.
+    pub fn spki_der(&self) -> Option<&[u8]> {
+        self.spki_der.as_deref()
     }
 
     /// Parse DER certificate to extract CN and SANs using x509-parser.
@@ -142,7 +171,12 @@ impl CertIdentity {
             }
         }
 
-        Ok((cn, dns_sans, uri_sans))
+        // Raw SubjectPublicKeyInfo DER — the TLSA selector-1 association
+        // data. x509-parser keeps the unparsed slice alongside the parsed
+        // structure precisely so callers can hash it.
+        let spki_der = cert.tbs_certificate.subject_pki.raw.to_vec();
+
+        Ok((cn, dns_sans, uri_sans, spki_der))
     }
 
     /// Get the FQDN from the certificate.
@@ -728,13 +762,7 @@ impl ServerVerifier {
             .get_tlsa_records(fqdn, self.dane_port)
             .await?;
 
-        verify_dane(
-            &tlsa_records,
-            &cert.fingerprint,
-            self.dane_policy,
-            fqdn,
-            self.dane_port,
-        )
+        verify_dane_cert(&tlsa_records, cert, self.dane_policy, fqdn, self.dane_port)
     }
 
     /// Pre-fetch badges for caching (before TLS connection).
@@ -2695,6 +2723,8 @@ mod tests {
             dns_sans: vec![cn.to_string()],
             uri_sans: vec![],
             fingerprint: CertFingerprint::parse(fingerprint).unwrap(),
+            raw_der: None,
+            spki_der: None,
         }
     }
 
@@ -2940,6 +2970,8 @@ mod tests {
             dns_sans: vec![host.to_string()],
             uri_sans: vec![format!("ans://{}.{}", version, host)],
             fingerprint: CertFingerprint::parse(fingerprint).unwrap(),
+            raw_der: None,
+            spki_der: None,
         }
     }
 
@@ -2998,6 +3030,8 @@ mod tests {
                 "SHA256:e7b64d16f42055d6faf382a43dc35b98be76aba0db145a904b590a034b33b904",
             )
             .unwrap(),
+            raw_der: None,
+            spki_der: None,
         };
 
         let outcome = verifier.verify(&cert).await;
@@ -3026,6 +3060,8 @@ mod tests {
                 "SHA256:e7b64d16f42055d6faf382a43dc35b98be76aba0db145a904b590a034b33b904",
             )
             .unwrap(),
+            raw_der: None,
+            spki_der: None,
         };
 
         let outcome = verifier.verify(&cert).await;
@@ -5006,6 +5042,8 @@ mod tests {
                 dns_sans: vec!["agent.example.com".to_string()],
                 uri_sans: vec!["ans://v1.0.0.agent.example.com".to_string()],
                 fingerprint: CertFingerprint::parse(&identity_fp).unwrap(),
+                raw_der: None,
+                spki_der: None,
             };
             let headers = ScittHeaders::new(None, None);
 
@@ -5036,6 +5074,8 @@ mod tests {
                 dns_sans: vec![],
                 uri_sans: vec!["ans://v1.0.0.agent.example.com".to_string()],
                 fingerprint: CertFingerprint::parse(&identity_fp).unwrap(),
+                raw_der: None,
+                spki_der: None,
             };
             let headers = ScittHeaders::new(None, None);
 
@@ -5063,6 +5103,8 @@ mod tests {
                 dns_sans: vec!["agent.example.com".to_string()],
                 uri_sans: vec!["ans://v1.0.0.agent.example.com".to_string()],
                 fingerprint: CertFingerprint::parse(&identity_fp).unwrap(),
+                raw_der: None,
+                spki_der: None,
             };
             let headers = ScittHeaders::from_base64(None, Some(&token_b64)).unwrap();
 
