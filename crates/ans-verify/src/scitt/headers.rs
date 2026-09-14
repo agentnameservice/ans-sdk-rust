@@ -22,9 +22,14 @@ const MAX_BASE64_HEADER_SIZE: usize = MAX_COSE_INPUT_SIZE.div_ceil(3) * 4;
 /// - `X-SCITT-Receipt` → receipt bytes (`COSE_Sign1` with Merkle proof)
 /// - `X-ANS-Status-Token` → status token bytes (`COSE_Sign1` with status claim)
 ///
+/// The HTTP adapter MUST reject duplicate occurrences of either header
+/// before selecting a value (ANS-6 §4.6). Method B also rejects duplicate
+/// `DPoP` and `Authorization` headers. Use [`crate::reject_duplicate_header`]
+/// with the count from the framework's original header collection.
+///
 /// # Fallback behavior
 ///
-/// - `None` for both fields → peer does not support SCITT, fall back to badge
+/// - `None` for both fields → badge fallback only if the configured policy allows
 /// - Present but decode fails → hard reject (not fallback)
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -95,8 +100,8 @@ impl ScittHeaders {
 
     /// Returns `true` if neither receipt nor status token is present.
     ///
-    /// When both are absent, the peer does not support SCITT and the verifier
-    /// should fall back to badge-based verification.
+    /// Badge fallback then depends on the configured policy. Method B always
+    /// requires a status token and cannot use badge fallback.
     pub fn is_empty(&self) -> bool {
         self.receipt.is_none() && self.status_token.is_none()
     }

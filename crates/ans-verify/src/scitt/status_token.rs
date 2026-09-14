@@ -27,9 +27,8 @@ use super::cose::{build_sig_structure, parse_cose_sign1};
 use super::error::ScittError;
 use super::root_keys::ScittKeyStore;
 
-/// Maximum clock skew tolerance (24 hours). Larger values would make tokens
-/// effectively non-expirable.
-pub const MAX_CLOCK_SKEW_TOLERANCE_SECS: u64 = 24 * 60 * 60;
+/// Maximum status-token clock skew (10 minutes), per ANS-6 §4.4.
+pub const MAX_CLOCK_SKEW_TOLERANCE_SECS: u64 = 10 * 60;
 
 /// A status token whose COSE signature has been verified and expiry checked.
 #[derive(Debug, Clone)]

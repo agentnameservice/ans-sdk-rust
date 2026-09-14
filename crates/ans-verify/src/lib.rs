@@ -132,6 +132,7 @@ pub use ans_types::{
 pub use cache::{BadgeCache, CacheConfig, CacheKey, CachedBadge};
 pub use dane::{
     DanePolicy, DaneVerificationResult, TlsaMatchingType, TlsaRecord, TlsaSelector, TlsaUsage,
+    verify_dane, verify_dane_cert,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use dns::MockDnsResolver;
@@ -171,7 +172,7 @@ pub use pop::{
     PopError, PopErrorKind, ProofResult, ReplayCache, Signer, VerifiedArtifactCache,
     VerifyCallerOptions, VerifyProofOptions, access_token_from_authorization, attach_identity,
     attach_identity_with_content, normalize_authority, normalize_htu, reject_duplicate_header,
-    request_authority, verify_caller, verify_proof,
+    request_authority, verify_caller, verify_caller_with_content, verify_proof,
 };
 
 #[cfg(all(feature = "scitt", any(test, feature = "test-support")))]

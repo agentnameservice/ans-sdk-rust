@@ -1,21 +1,24 @@
 //! Three-proof caller authentication: `DPoP` + status token + receipt.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use ans_types::{AnsName, CertFingerprint, StatusTokenPayload};
-use serde::Deserialize;
 use uuid::Uuid;
 
 use super::cache::VerifiedArtifactCache;
 use super::error::{PopError, PopErrorKind};
 use super::proof::{normalize_authority, request_authority};
 use super::replay::ReplayCache;
-use super::verify::{ProofResult, VerifyProofOptions, commit_replay, verify_proof_unrecorded};
+use super::verify::{
+    ProofResult, VerifyProofOptions, check_content_binding, commit_replay, empty_content_sha256,
+    verify_proof_unrecorded,
+};
 use crate::scitt::{
-    MAX_CLOCK_SKEW_TOLERANCE_SECS, ScittHeaders, ScittKeyStore, VerifiedReceipt,
-    matches_identity_cert, verify_receipt, verify_status_token_at,
+    MAX_CLOCK_SKEW_TOLERANCE_SECS, ScittError, ScittHeaders, ScittKeyStore, VerifiedReceipt,
+    bind_receipt_to_status, matches_identity_cert, verify_receipt, verify_status_token_at,
 };
 
 /// Default status-token clock-skew tolerance (matches [`crate::ScittConfig`]).
@@ -41,8 +44,8 @@ pub struct CallerIdentity {
 /// Options for [`verify_caller`].
 #[derive(Debug, Clone)]
 pub struct VerifyCallerOptions {
-    /// Require a SCITT receipt (default `true`). When `false`, identity rests
-    /// on the status token + possession proof only.
+    /// Require a SCITT receipt (default `true`). When `false`, its absence
+    /// is allowed; a supplied receipt is always verified and bound.
     pub require_receipt: bool,
     /// Restrict accepted callers to these `ans://` names (compared by FQDN
     /// host, case-insensitive). Empty means any proven agent authenticates.
@@ -61,12 +64,12 @@ pub struct VerifyCallerOptions {
     pub now: Option<i64>,
     /// Access token presented as `Authorization: DPoP <token>`.
     pub access_token: Option<String>,
-    /// SHA-256 of the request content the callee received; `None` when the
-    /// request carries no content. See
-    /// [`VerifyProofOptions::content_sha256`](super::VerifyProofOptions).
+    /// Precomputed SHA-256 of the received content; `None` means empty
+    /// content. Prefer [`verify_caller_with_content`] to defer body hashing
+    /// until the proof is bound to a live ANS identity (§7.4 steps 11–12).
     pub content_sha256: Option<[u8; 32]>,
-    /// Reject content-bearing requests whose proof does not bind the content
-    /// (ANS-6 §7.13 deployment policy; default `false`).
+    /// Retained for source compatibility. Content binding is always required,
+    /// including when this field is `false`.
     pub require_content_binding: bool,
     /// Cache of verified artifacts (ANS-6 §4.6). When set, a status token or
     /// receipt whose exact bytes verified before skips re-verification; the
@@ -86,7 +89,7 @@ impl Default for VerifyCallerOptions {
             now: None,
             access_token: None,
             content_sha256: None,
-            require_content_binding: false,
+            require_content_binding: true,
             artifact_cache: None,
         }
     }
@@ -114,16 +117,15 @@ impl VerifyCallerOptions {
     /// Bind the received request content into verification (§7.13).
     ///
     /// Pass the SHA-256 of the content octets exactly as received. A proof
-    /// carrying `ans_content_digest` must match it; a proof binding content
-    /// when none was set rejects.
+    /// must carry a matching `ans_content_digest`. Prefer
+    /// [`verify_caller_with_content`] when this has not already been hashed
+    /// behind an authentication boundary.
     pub fn with_content_sha256(mut self, digest: [u8; 32]) -> Self {
         self.content_sha256 = Some(digest);
         self
     }
 
-    /// Reject content-bearing requests whose proof does not bind the content
-    /// (§7.13 deployment policy for state-changing endpoints behind
-    /// TLS-terminating hops).
+    /// Retained for source compatibility; content binding is now unconditional.
     pub fn with_required_content_binding(mut self) -> Self {
         self.require_content_binding = true;
         self
@@ -135,7 +137,9 @@ impl VerifyCallerOptions {
 /// Composes possession ([`super::verify_proof`]), liveness (status token),
 /// and identity (receipt) and binds them to one identity certificate.
 /// Missing status token is a hard reject (Method B does not fall back to
-/// the badge tier). The `jti` is recorded only after that binding succeeds.
+/// the badge tier). The `jti` is recorded only after identity and content
+/// binding succeed. With default options this verifies empty content; use
+/// [`verify_caller_with_content`] to hash received content after identity binding.
 ///
 /// # The `raw_url` authority (ANS-6 §7.7)
 ///
@@ -171,6 +175,48 @@ pub async fn verify_caller(
     replay: &dyn ReplayCache,
     opts: VerifyCallerOptions,
 ) -> Result<CallerIdentity, PopError> {
+    let digest = opts.content_sha256.unwrap_or_else(empty_content_sha256);
+    verify_caller_with_content(
+        proof_jws,
+        headers,
+        method,
+        raw_url,
+        keys,
+        replay,
+        opts,
+        || async { Ok(digest) },
+    )
+    .await
+}
+
+/// Authenticate a caller, then hash and verify its received request content.
+///
+/// `content_sha256` is invoked only after the proof, status token, receipt,
+/// and identity bindings succeed (ANS-6 §7.4 step 11). It must enforce the
+/// deployment's body-size limit and read deadline, then hash the received
+/// content after transfer-coding removal and before content decoding. It
+/// may hash incrementally, but must not process application content before
+/// this function returns success. An error or digest mismatch rejects
+/// without consuming the `jti`.
+///
+/// The callback's result replaces [`VerifyCallerOptions::content_sha256`].
+/// All authority and duplicate-header requirements of [`verify_caller`]
+/// apply here too.
+#[allow(clippy::too_many_arguments)] // same authentication inputs plus deferred content
+pub async fn verify_caller_with_content<F, Fut>(
+    proof_jws: &str,
+    headers: &ScittHeaders,
+    method: &str,
+    raw_url: &str,
+    keys: &ScittKeyStore,
+    replay: &dyn ReplayCache,
+    opts: VerifyCallerOptions,
+    content_sha256: F,
+) -> Result<CallerIdentity, PopError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<[u8; 32], PopError>>,
+{
     // §7.4 preflight: reject a foreign authority before any proof work.
     if !opts.trusted_authorities.is_empty() {
         let authority = request_authority(raw_url)?;
@@ -232,16 +278,14 @@ pub async fn verify_caller(
     )
     .await?;
 
-    let receipt = if opts.require_receipt {
-        let bytes = headers.receipt.as_deref().ok_or_else(|| {
-            PopError::new(PopErrorKind::MissingHeaders, "no SCITT receipt on request")
-        })?;
+    let receipt = if let Some(bytes) = headers.receipt.as_deref() {
         Some(verified_receipt(bytes, keys, opts.artifact_cache.as_ref()).await?)
     } else {
         None
     };
 
     let identity = bind_caller(&proof, &status, receipt.as_deref(), &opts)?;
+    check_content_binding(&proof, content_sha256().await?)?;
     commit_replay(&proof, replay).await?;
     Ok(identity)
 }
@@ -349,7 +393,14 @@ fn bind_caller(
     }
 
     if let Some(rcpt) = receipt {
-        receipt_names_agent(rcpt, status)?;
+        bind_receipt_to_status(rcpt, status, None).map_err(|error| {
+            let kind = if matches!(error, ScittError::IdentityBinding(_)) {
+                PopErrorKind::BindingFailed
+            } else {
+                PopErrorKind::ReceiptInvalid
+            };
+            PopError::with_source(kind, "receipt does not bind to the status token", error)
+        })?;
     }
 
     if !opts.allowed_ans_names.is_empty() {
@@ -380,87 +431,4 @@ fn allowed_hosts(names: &[String]) -> HashSet<String> {
             )
         })
         .collect()
-}
-
-#[derive(Debug, Deserialize)]
-struct Envelope {
-    payload: Option<EnvelopePayload>,
-    #[serde(rename = "ansId")]
-    ans_id: Option<String>,
-    #[serde(rename = "ansName")]
-    ans_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EnvelopePayload {
-    producer: Option<EnvelopeProducer>,
-}
-
-#[derive(Debug, Deserialize)]
-struct EnvelopeProducer {
-    event: Option<LeafEvent>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LeafEvent {
-    #[serde(rename = "ansId")]
-    ans_id: Option<String>,
-    #[serde(rename = "ansName")]
-    ans_name: Option<String>,
-}
-
-fn receipt_names_agent(
-    receipt: &VerifiedReceipt,
-    status: &ans_types::StatusTokenPayload,
-) -> Result<(), PopError> {
-    let (ans_id, ans_name) = leaf_identity(&receipt.event_bytes)?;
-    if ans_id.is_none() && ans_name.is_none() {
-        return Err(PopError::new(
-            PopErrorKind::ReceiptInvalid,
-            "receipt leaf event names no agent (ansId/ansName)",
-        ));
-    }
-    if let Some(id) = ans_id.as_deref() {
-        let parsed = Uuid::parse_str(id).map_err(|e| {
-            PopError::with_source(
-                PopErrorKind::ReceiptInvalid,
-                "receipt leaf ansId is not a UUID",
-                e,
-            )
-        })?;
-        if parsed != status.agent_id {
-            return Err(PopError::new(
-                PopErrorKind::BindingFailed,
-                "receipt leaf ansId does not match status token agentId",
-            ));
-        }
-    }
-    if let Some(name) = ans_name.as_deref()
-        && !name.eq_ignore_ascii_case(&status.ans_name.to_string())
-    {
-        return Err(PopError::new(
-            PopErrorKind::BindingFailed,
-            "receipt leaf ansName does not match status token ansName",
-        ));
-    }
-    Ok(())
-}
-
-fn leaf_identity(event_bytes: &[u8]) -> Result<(Option<String>, Option<String>), PopError> {
-    let envelope: Envelope = serde_json::from_slice(event_bytes).map_err(|e| {
-        PopError::with_source(
-            PopErrorKind::ReceiptInvalid,
-            "receipt leaf event is not decodable JSON",
-            e,
-        )
-    })?;
-    if let Some(event) = envelope
-        .payload
-        .as_ref()
-        .and_then(|p| p.producer.as_ref())
-        .and_then(|p| p.event.as_ref())
-    {
-        return Ok((event.ans_id.clone(), event.ans_name.clone()));
-    }
-    Ok((envelope.ans_id, envelope.ans_name))
 }

@@ -388,6 +388,137 @@ fn encode_b64(bytes: &[u8]) -> String {
     BASE64_STANDARD.encode(bytes)
 }
 
+#[tokio::test]
+async fn ans6_scitt_enforces_dane_on_fresh_and_cached_results() {
+    for (fingerprint, policy, accepted) in [
+        (Some(WRONG_FP), DanePolicy::ValidateIfPresent, false),
+        (Some(SERVER_FP), DanePolicy::ValidateIfPresent, true),
+        (None, DanePolicy::Required, false),
+    ] {
+        let (key, store) = make_key_and_store(22);
+        let records = fingerprint
+            .into_iter()
+            .map(|fp| {
+                TlsaRecord::new(
+                    TlsaUsage::DomainIssuedCertificate,
+                    TlsaSelector::FullCertificate,
+                    TlsaMatchingType::Sha256,
+                    CertFingerprint::parse(fp).unwrap().as_bytes().to_vec(),
+                )
+            })
+            .collect();
+        let verifier = AnsVerifier::builder()
+            .dns_resolver(Arc::new(
+                MockDnsResolver::new().with_tlsa_records(HOST, 443, records),
+            ))
+            .tlog_client(Arc::new(MockTransparencyLogClient::new()))
+            .with_caching()
+            .dane_policy(policy)
+            .scitt_config(ScittConfig::new().with_tier_policy(ScittTierPolicy::RequireScitt))
+            .scitt_key_store(Arc::new(store))
+            .build()
+            .await
+            .unwrap();
+        let headers = ScittHeaders::new(None, Some(make_server_token(&key, SERVER_FP)));
+        for _ in 0..2 {
+            let outcome = verifier
+                .verify_server_with_scitt(HOST, &server_cert(HOST, SERVER_FP), &headers)
+                .await;
+            assert_eq!(outcome.is_success(), accepted, "{outcome:?}");
+            if !accepted {
+                assert!(
+                    matches!(outcome, VerificationOutcome::DaneError(_)),
+                    "SCITT bypassed DANE: {outcome:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn ans6_receipts_must_name_the_status_token_agent() {
+    let (key, store) = make_key_and_store(21);
+    let token = make_server_token(&key, SERVER_FP);
+    let verifier = make_cached_scitt_verifier(
+        HOST,
+        SERVER_FP,
+        IDENTITY_FP,
+        Arc::new(store),
+        ScittTierPolicy::RequireScitt,
+    )
+    .await;
+    for event in [
+        serde_json::json!({
+            "ansId": Uuid::new_v4(),
+            "ansName": "ans://v2.0.0.other.example.com",
+            "agent": {"host": "other.example.com"}
+        }),
+        serde_json::json!({"ansId": Uuid::nil(), "agent": {"host": HOST}}),
+        serde_json::json!({
+            "ansId": Uuid::nil(),
+            "ansName": format!("ans://v1.0.0.{HOST}"),
+            "agent": {"host": "other.example.com"}
+        }),
+    ] {
+        let receipt = build_receipt(&key, &serde_json::to_vec(&event).unwrap());
+        let headers = ScittHeaders::new(Some(receipt), Some(token.clone()));
+        let outcome = verifier
+            .verify_server_with_scitt(HOST, &server_cert(HOST, SERVER_FP), &headers)
+            .await;
+        assert!(
+            !outcome.is_success(),
+            "accepted unrelated receipt: {event}; {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ans6_client_name_binding_applies_on_outcome_cache_hits() {
+    let (key, store) = make_key_and_store(22);
+    let token = make_identity_token(&key, IDENTITY_FP);
+    let verifier = make_cached_scitt_verifier(
+        HOST,
+        SERVER_FP,
+        IDENTITY_FP,
+        Arc::new(store),
+        ScittTierPolicy::RequireScitt,
+    )
+    .await;
+    let headers = ScittHeaders::new(None, Some(token));
+    let valid = mtls_cert(HOST, "v1.0.0", IDENTITY_FP);
+    assert!(
+        verifier
+            .verify_client_with_scitt(&valid, &headers)
+            .await
+            .is_success()
+    );
+    let wrong_version = mtls_cert(HOST, "v2.0.0", IDENTITY_FP);
+    let outcome = verifier
+        .verify_client_with_scitt(&wrong_version, &headers)
+        .await;
+    assert!(
+        !outcome.is_success(),
+        "cached result bypassed URI SAN binding: {outcome:?}"
+    );
+}
+
+#[test]
+fn ans6_status_token_skew_cannot_exceed_ten_minutes() {
+    let (key, store) = make_key_and_store(23);
+    let now = 1_800_000_000;
+    let payload = build_cbor_payload(
+        &nil_uuid(),
+        "ACTIVE",
+        now - 601,
+        &format!("ans://v1.0.0.{HOST}"),
+        &[],
+        &[],
+    );
+    let token = sign_cose(&key, &payload);
+    let outcome = verify_status_token_at(&token, &store, Duration::from_secs(86_400), now);
+    assert!(matches!(outcome, Err(ScittError::TokenExpired { .. })));
+}
+
 // =========================================================================
 // S1: Valid SCITT verification
 // =========================================================================
@@ -701,15 +832,8 @@ async fn test_s3_2_receipt_invalid_cose() {
     let outcome = verifier
         .verify_server_with_scitt(HOST, &cert, &headers)
         .await;
-    // Token verifies, receipt fails → still ScittVerified but StatusTokenVerified tier
-    // (bad receipt degrades tier, doesn't reject)
-    assert!(outcome.is_success());
-    match outcome {
-        VerificationOutcome::ScittVerified { tier, .. } => {
-            assert_eq!(tier, VerificationTier::StatusTokenVerified);
-        }
-        other => panic!("Expected ScittVerified with degraded tier, got: {other:?}"),
-    }
+    // ANS-6 §9.7: a valid token cannot override a failed supplied receipt.
+    assert!(matches!(outcome, VerificationOutcome::ScittError(_)));
 }
 
 /// S3.5: Token signature invalid → Reject (not fallback)
@@ -1795,12 +1919,9 @@ async fn test_require_scitt_bad_receipt_rejects() {
     assert!(matches!(outcome, VerificationOutcome::ScittError(_)));
 }
 
-/// ScittWithBadgeFallback + invalid receipt → still degrades tier (existing behavior preserved).
-///
-/// Companion to the RequireScitt test above — ensures the fix only changes
-/// behavior for RequireScitt, not for lenient policies.
+/// Badge fallback applies to absent evidence, not a failed supplied receipt.
 #[tokio::test]
-async fn test_fallback_policy_bad_receipt_degrades_tier() {
+async fn test_fallback_policy_bad_receipt_rejects() {
     let (signing_key, store) = make_key_and_store(1);
     let store = Arc::new(store);
     let token = make_server_token(&signing_key, SERVER_FP);
@@ -1821,14 +1942,7 @@ async fn test_fallback_policy_bad_receipt_degrades_tier() {
     let outcome = verifier
         .verify_server_with_scitt(HOST, &cert, &headers)
         .await;
-    // Under lenient policy, bad receipt degrades tier but still succeeds
-    assert!(outcome.is_success());
-    match outcome {
-        VerificationOutcome::ScittVerified { tier, .. } => {
-            assert_eq!(tier, VerificationTier::StatusTokenVerified);
-        }
-        other => panic!("Expected ScittVerified with degraded tier, got: {other:?}"),
-    }
+    assert!(matches!(outcome, VerificationOutcome::ScittError(_)));
 }
 
 /// Builder rejects scitt_config without key store.
@@ -1863,10 +1977,16 @@ async fn test_full_scitt_tier_with_token_and_receipt() {
     let store = Arc::new(store);
     let token = make_server_token(&signing_key, SERVER_FP);
 
-    // Build a receipt: the payload can be any bytes — the receipt just proves
-    // inclusion in the TL's Merkle tree. Use a simple event payload.
-    let event_payload = b"test-event-payload";
-    let receipt = build_receipt(&signing_key, event_payload);
+    // FullScitt must establish inclusion for the same agent as the token.
+    let event_payload = serde_json::to_vec(&serde_json::json!({
+        "payload": {"producer": {"event": {
+            "ansId": Uuid::nil(),
+            "ansName": format!("ans://v1.0.0.{HOST}"),
+            "agent": {"host": HOST}
+        }}}
+    }))
+    .unwrap();
+    let receipt = build_receipt(&signing_key, &event_payload);
 
     let verifier = make_scitt_verifier(
         HOST,

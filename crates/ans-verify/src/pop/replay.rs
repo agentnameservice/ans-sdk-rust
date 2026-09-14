@@ -28,6 +28,9 @@ const BUCKET_WIDTH_SECS: i64 = 5;
 /// Implementations backed by a shared store MUST consult it with a deadline:
 /// a timeout is a rejection, never a skip (ANS-6 §9.6) — skipping the `jti`
 /// check reopens the replay exposure single-use proofs exist to close.
+/// An expiry at or before the store's current time MUST reject: processing
+/// that outlives the retention window must not store an immediately reusable
+/// proof identifier.
 ///
 /// `key` is a fixed-width digest of the proof's `jti`, never the raw claim.
 #[async_trait]
@@ -134,6 +137,13 @@ impl ReplayCache for MemoryReplayCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = (inner.now)();
         inner.evict(now);
+
+        if exp_unix <= now {
+            return Err(PopError::new(
+                PopErrorKind::ProofStale,
+                "proof retention window elapsed before replay commit",
+            ));
+        }
 
         if let Some(existing) = inner.index.get(key).copied() {
             if existing > now {

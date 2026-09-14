@@ -82,6 +82,13 @@ pub enum DnsError {
     ResolverError(String),
 }
 
+impl DnsError {
+    /// Only lookup outages can justify reuse of previously verified evidence.
+    pub(crate) fn is_unavailable(&self) -> bool {
+        matches!(self, Self::LookupFailed { .. } | Self::Timeout { .. })
+    }
+}
+
 /// HTTP transport error wrapper.
 ///
 /// Wraps the underlying HTTP client error to avoid exposing third-party
@@ -154,6 +161,13 @@ pub enum TlogError {
         /// The list of trusted domains.
         trusted: Vec<String>,
     },
+}
+
+impl TlogError {
+    /// Malformed, missing, or untrusted evidence is not a transport outage.
+    pub(crate) fn is_unavailable(&self) -> bool {
+        matches!(self, Self::HttpError(_) | Self::ServiceUnavailable)
+    }
 }
 
 /// Verification logic errors.

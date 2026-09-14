@@ -25,7 +25,7 @@
 use ans_verify::{
     AnsName, CertFingerprint, MemoryReplayCache, PopErrorKind, ScittHeaders, ScittKeyStore, Signer,
     VerifiedArtifactCache, VerifyCallerOptions, attach_identity, attach_identity_with_content,
-    compute_sig_structure_digest, verify_caller,
+    compute_sig_structure_digest, verify_caller, verify_caller_with_content,
 };
 use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
@@ -63,7 +63,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Caller side: mint the DPoP proof for an outbound request ---
     //
     // In a real agent the SCITT headers come from `ScittHeaderSupplier`;
-    // here we attach the artifacts minted above.
+    // here we attach the artifacts minted above. This first request has no
+    // content, so attach_identity signs the required empty-content digest.
 
     let signer = Signer::new(identity_key, identity_cert_der)?;
     let proof = attach_identity(&signer, METHOD, URL, None)?;
@@ -106,34 +107,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Request 2 authenticated (artifacts served from cache)");
 
     // Content-bearing requests bind the body into the proof (§7.13): the
-    // callee hashes the content it received, so a TLS-terminating hop that
-    // rewrites the body breaks the binding — even on a first, in-flight
-    // request that no replay check would catch.
+    // callee hashes only after live identity binding. Streamed input needs
+    // a size limit and read deadline; this fixed body is already bounded.
+    // Transfer framing is removed, while any content coding stays applied.
     let body: &[u8] = br#"{"amount":100}"#;
     let bound = attach_identity_with_content(&signer, METHOD, URL, None, body)?;
-    let digest: [u8; 32] = Sha256::digest(body).into();
-    verify_caller(
+    verify_caller_with_content(
         &bound,
         &headers,
         METHOD,
         URL,
         &key_store,
         &replay,
-        opts().with_content_sha256(digest),
+        opts(),
+        || async { Ok(Sha256::digest(body).into()) },
     )
     .await?;
     println!("Content-bound request authenticated");
 
     let bound2 = attach_identity_with_content(&signer, METHOD, URL, None, body)?;
-    let rewritten: [u8; 32] = Sha256::digest(br#"{"amount":9999}"#).into();
-    let err = verify_caller(
+    let err = verify_caller_with_content(
         &bound2,
         &headers,
         METHOD,
         URL,
         &key_store,
         &replay,
-        opts().with_content_sha256(rewritten),
+        opts(),
+        || async { Ok(Sha256::digest(br#"{"amount":9999}"#).into()) },
     )
     .await
     .unwrap_err();

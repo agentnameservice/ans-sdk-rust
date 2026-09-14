@@ -106,12 +106,12 @@ impl Signer {
         jwk_thumbprint(self.key.verifying_key())
     }
 
-    /// Produce a compact `DPoP` proof binding `method` and `raw_url`.
+    /// Produce a compact `DPoP` proof for a request with no content.
     ///
     /// Pass `access_token` to bind an OAuth 2.0 access token via `ath`
-    /// (`Authorization: DPoP <token>`). Requests that carry content should
-    /// use [`Self::sign_with_content`] so the body is bound too (ANS-6
-    /// §7.13).
+    /// (`Authorization: DPoP <token>`). The proof includes the digest of
+    /// empty content. Requests carrying content MUST use
+    /// [`Self::sign_with_content`] to bind the transmitted octets (ANS-6 §7.13).
     ///
     /// # Errors
     ///
@@ -123,12 +123,13 @@ impl Signer {
         raw_url: &str,
         access_token: Option<&str>,
     ) -> Result<String, PopError> {
-        self.sign_inner(method, raw_url, access_token, None)
+        self.sign_with_content(method, raw_url, access_token, b"")
     }
 
     /// Produce a proof that also binds the request content via
-    /// `ans_content_digest` (ANS-6 §7.13). Empty `content` mints no claim —
-    /// a zero-length body carries none.
+    /// `ans_content_digest` (ANS-6 §7.13), including the empty-content digest
+    /// for a zero-length body. Hash the content after transfer-coding removal
+    /// and before content decoding: gzip content is hashed while compressed.
     ///
     /// # Errors
     ///
@@ -141,7 +142,7 @@ impl Signer {
         access_token: Option<&str>,
         content: &[u8],
     ) -> Result<String, PopError> {
-        let digest = (!content.is_empty()).then(|| Sha256::digest(content).into());
+        let digest = Sha256::digest(content).into();
         self.sign_inner(method, raw_url, access_token, digest)
     }
 
@@ -150,7 +151,7 @@ impl Signer {
         method: &str,
         raw_url: &str,
         access_token: Option<&str>,
-        content_sha256: Option<[u8; 32]>,
+        content_sha256: [u8; 32],
     ) -> Result<String, PopError> {
         let htu = normalize_htu(raw_url)?;
         let jti = new_jti();
@@ -172,7 +173,7 @@ impl Signer {
             jti,
             ath: access_token.map(super::proof::access_token_hash),
             ans_profile: Some(ANS_PROFILE_REVISION),
-            ans_content_digest: content_sha256.map(|d| super::jws::b64url_encode(&d)),
+            ans_content_digest: super::jws::b64url_encode(&content_sha256),
         };
         let (header_b64, payload_b64) = encode_proof_parts(&header, &payload)?;
         let signing_input = super::jws::jws_signing_input(&header_b64, &payload_b64);

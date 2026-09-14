@@ -3,7 +3,11 @@
 //! DANE (DNS-Based Authentication of Named Entities) binds certificates to DNS names
 //! via TLSA records, providing additional verification independent of the transparency log.
 
+use sha2::{Digest, Sha256, Sha512};
+use subtle::ConstantTimeEq;
+
 use crate::error::DaneError;
+use crate::verify::CertIdentity;
 use ans_types::{CertFingerprint, Fqdn};
 
 /// DANE verification policy.
@@ -174,20 +178,91 @@ impl TlsaRecord {
         })
     }
 
-    /// Check if this TLSA record is in a format we can verify.
+    /// Check if this TLSA record is in a format the fingerprint-only path
+    /// can verify: DANE-EE (usage=3), full certificate (selector=0),
+    /// SHA-256 (`matching_type=1`), the form the ANS RA emits.
     ///
-    /// Currently only supports DANE-EE (usage=3), full certificate (selector=0),
-    /// SHA-256 (`matching_type=1`) which is the ANS standard format.
+    /// [`Self::matches_cert`] evaluates every selector and matching type
+    /// when the certificate DER is available; see [`Self::is_evaluable`].
     pub fn is_verifiable(&self) -> bool {
         self.usage == TlsaUsage::DomainIssuedCertificate
             && self.selector == TlsaSelector::FullCertificate
             && self.matching_type == TlsaMatchingType::Sha256
     }
 
+    /// Check if this TLSA record can be evaluated against a certificate
+    /// whose DER is known: DANE-EE (usage=3) with any selector (full
+    /// certificate or `SubjectPublicKeyInfo`) and any matching type
+    /// (exact, SHA-256, SHA-512), per RFC 6698 §2.1.
+    pub fn is_evaluable(&self) -> bool {
+        self.usage == TlsaUsage::DomainIssuedCertificate
+    }
+
+    /// Check if this TLSA record matches a certificate, honoring the
+    /// record's selector and matching type (RFC 6698 §2.1.2–2.1.3).
+    ///
+    /// When the identity carries its DER (built via
+    /// [`CertIdentity::from_der`]), the association data is recomputed for
+    /// the record's own selector — the full certificate for selector 0, the
+    /// `SubjectPublicKeyInfo` for selector 1 — and matching type, so a
+    /// `3 1 1` record (the renewal-stable form RFC 7671 §5.1 recommends) is
+    /// compared against the SPKI hash and never against the full-certificate
+    /// fingerprint, and vice versa.
+    ///
+    /// An identity built from a bare fingerprint has no DER to select from,
+    /// so it falls back to [`Self::matches_fingerprint`]: the pre-existing
+    /// `3 0 1`-only comparison, unchanged, so fingerprint-only callers do not
+    /// regress.
+    ///
+    /// Returns `None` when the record cannot be evaluated (usage other than
+    /// DANE-EE), as distinct from `Some(false)` for a record that was
+    /// evaluated and did not match.
+    pub fn matches_cert(&self, cert: &CertIdentity) -> Option<bool> {
+        let (Some(raw_der), Some(spki_der)) = (cert.raw_der(), cert.spki_der()) else {
+            return self.matches_fingerprint(cert.fingerprint());
+        };
+
+        if self.usage != TlsaUsage::DomainIssuedCertificate {
+            tracing::debug!(
+                usage = ?self.usage,
+                "TLSA usage is not DANE-EE, cannot verify"
+            );
+            return None;
+        }
+
+        let selected: &[u8] = match self.selector {
+            TlsaSelector::FullCertificate => raw_der,
+            TlsaSelector::SubjectPublicKeyInfo => spki_der,
+        };
+        let expected: Vec<u8> = match self.matching_type {
+            TlsaMatchingType::NoHash => selected.to_vec(),
+            TlsaMatchingType::Sha256 => Sha256::digest(selected).to_vec(),
+            TlsaMatchingType::Sha512 => Sha512::digest(selected).to_vec(),
+        };
+
+        // Constant-time equality; a length mismatch is a plain mismatch
+        // (lengths are not secret).
+        let matches = self.certificate_data.len() == expected.len()
+            && bool::from(self.certificate_data.ct_eq(&expected));
+
+        tracing::debug!(
+            selector = ?self.selector,
+            matching_type = ?self.matching_type,
+            tlsa_data = %hex::encode(&self.certificate_data),
+            cert_data = %hex::encode(&expected),
+            matches,
+            "TLSA association comparison"
+        );
+
+        Some(matches)
+    }
+
     /// Check if this TLSA record matches a certificate fingerprint.
     ///
-    /// Currently only supports DANE-EE (usage=3), full certificate (selector=0),
-    /// SHA-256 (`matching_type=1`) which is the ANS standard format.
+    /// Fingerprint-only path: supports DANE-EE (usage=3), full certificate
+    /// (selector=0), SHA-256 (`matching_type=1`), the form the ANS RA emits.
+    /// Prefer [`Self::matches_cert`] when the certificate DER is available;
+    /// it evaluates SPKI (selector=1) and the other matching types too.
     ///
     /// Returns `None` if the record format is not supported (different from not matching).
     pub fn matches_fingerprint(&self, cert_fingerprint: &CertFingerprint) -> Option<bool> {
@@ -220,12 +295,8 @@ impl TlsaRecord {
         // Both sides are SHA-256 hashes (32 bytes). If the TLSA data has wrong length,
         // the comparison fails (not a timing concern since length is not secret).
         let cert_bytes = cert_fingerprint.as_bytes();
-        let matches = if self.certificate_data.len() == cert_bytes.len() {
-            use subtle::ConstantTimeEq;
-            bool::from(self.certificate_data.ct_eq(cert_bytes.as_slice()))
-        } else {
-            false
-        };
+        let matches = self.certificate_data.len() == cert_bytes.len()
+            && bool::from(self.certificate_data.ct_eq(cert_bytes.as_slice()));
 
         tracing::debug!(
             tlsa_fingerprint = %hex::encode(&self.certificate_data),
@@ -279,6 +350,63 @@ pub fn verify_dane(
     fqdn: &Fqdn,
     port: u16,
 ) -> Result<DaneVerificationResult, DaneError> {
+    verify_dane_with(
+        records,
+        policy,
+        fqdn,
+        port,
+        |record| record.matches_fingerprint(cert_fingerprint),
+        "TLSA record format not supported (only usage=3, selector=0, matching_type=1)",
+    )
+}
+
+/// Verify a certificate against TLSA records, honoring each record's
+/// selector and matching type.
+///
+/// Same policy semantics as [`verify_dane`], but each record is evaluated
+/// with [`TlsaRecord::matches_cert`]: when `cert` carries its DER, a
+/// `3 1 1` (SPKI) record is checked against the certificate's
+/// `SubjectPublicKeyInfo` hash and a `3 0 1` record against the full
+/// certificate, so an operator may publish either form (or both) and be
+/// verified by whichever matches. Only records with a usage other than
+/// DANE-EE remain unsupported. A `cert` without DER behaves exactly like
+/// [`verify_dane`].
+///
+/// # Errors
+/// As [`verify_dane`].
+pub fn verify_dane_cert(
+    records: &[TlsaRecord],
+    cert: &CertIdentity,
+    policy: DanePolicy,
+    fqdn: &Fqdn,
+    port: u16,
+) -> Result<DaneVerificationResult, DaneError> {
+    let unsupported = if cert.raw_der().is_some() {
+        "TLSA record format not supported (only usage=3 DANE-EE records are evaluated)"
+    } else {
+        "TLSA record format not supported (only usage=3, selector=0, matching_type=1)"
+    };
+    verify_dane_with(
+        records,
+        policy,
+        fqdn,
+        port,
+        |record| record.matches_cert(cert),
+        unsupported,
+    )
+}
+
+/// Shared policy/iteration core for [`verify_dane`] and [`verify_dane_cert`].
+/// `matches` returns `Some(true)` on a match, `Some(false)` on an evaluated
+/// non-match, and `None` when the record cannot be evaluated at all.
+fn verify_dane_with(
+    records: &[TlsaRecord],
+    policy: DanePolicy,
+    fqdn: &Fqdn,
+    port: u16,
+    matches: impl Fn(&TlsaRecord) -> Option<bool>,
+    unsupported_reason: &str,
+) -> Result<DaneVerificationResult, DaneError> {
     if !policy.should_verify() {
         tracing::debug!("DANE verification disabled by policy");
         return Ok(DaneVerificationResult::Skipped);
@@ -306,7 +434,7 @@ pub fn verify_dane(
     let mut has_unsupported = false;
 
     for record in records {
-        match record.matches_fingerprint(cert_fingerprint) {
+        match matches(record) {
             Some(true) => {
                 tracing::info!(
                     fqdn = %fqdn,
@@ -340,11 +468,11 @@ pub fn verify_dane(
         tracing::error!(
             fqdn = %fqdn,
             port,
-            "DANE verification FAILED - TLSA records present but in unsupported format (only DANE-EE + FullCert + SHA256 supported)"
+            reason = unsupported_reason,
+            "DANE verification FAILED - TLSA records present but in unsupported format"
         );
         return Err(DaneError::InvalidRecord {
-            reason: "TLSA record format not supported (only usage=3, selector=0, matching_type=1)"
-                .to_string(),
+            reason: unsupported_reason.to_string(),
         });
     }
 
@@ -698,5 +826,214 @@ mod tests {
         assert!(!result.is_acceptable(DanePolicy::Disabled));
         assert!(!result.is_acceptable(DanePolicy::ValidateIfPresent));
         assert!(!result.is_acceptable(DanePolicy::Required));
+    }
+
+    // ── matches_cert / verify_dane_cert: selector + matching type ────
+
+    /// A self-signed test certificate as DER, plus its SubjectPublicKeyInfo
+    /// DER derived independently of the code under test (x509-parser).
+    fn test_cert() -> (Vec<u8>, Vec<u8>) {
+        use rcgen::{CertificateParams, DnType, KeyPair};
+        let key_pair = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "dane.agent.local");
+        let cert = params.self_signed(&key_pair).unwrap();
+        let der = cert.der().to_vec();
+        let (_, parsed) = x509_parser::parse_x509_certificate(&der).unwrap();
+        let spki = parsed.tbs_certificate.subject_pki.raw.to_vec();
+        (der, spki)
+    }
+
+    fn record(selector: TlsaSelector, mt: TlsaMatchingType, data: Vec<u8>) -> TlsaRecord {
+        TlsaRecord::new(TlsaUsage::DomainIssuedCertificate, selector, mt, data)
+    }
+
+    #[test]
+    fn test_matches_cert_spki_sha256() {
+        let (der, spki) = test_cert();
+        let cert = CertIdentity::from_der(&der).unwrap();
+        // 3 1 1 — the renewal-stable form (RFC 7671 §5.1).
+        let rec = record(
+            TlsaSelector::SubjectPublicKeyInfo,
+            TlsaMatchingType::Sha256,
+            Sha256::digest(&spki).to_vec(),
+        );
+        assert_eq!(rec.matches_cert(&cert), Some(true));
+        assert!(rec.is_evaluable());
+        assert!(
+            !rec.is_verifiable(),
+            "fingerprint-only path still declines 3 1 1"
+        );
+    }
+
+    #[test]
+    fn test_matches_cert_spki_hash_never_matches_full_cert_hash() {
+        let (der, _spki) = test_cert();
+        let cert = CertIdentity::from_der(&der).unwrap();
+        // A 3 1 1 record carrying the FULL-CERT hash must not match: the
+        // selector says SPKI, so that is what gets compared.
+        let rec = record(
+            TlsaSelector::SubjectPublicKeyInfo,
+            TlsaMatchingType::Sha256,
+            cert.fingerprint().as_bytes().to_vec(),
+        );
+        assert_eq!(rec.matches_cert(&cert), Some(false));
+    }
+
+    #[test]
+    fn test_matches_cert_full_cert_sha256_and_sha512() {
+        let (der, _spki) = test_cert();
+        let cert = CertIdentity::from_der(&der).unwrap();
+        let r301 = record(
+            TlsaSelector::FullCertificate,
+            TlsaMatchingType::Sha256,
+            Sha256::digest(&der).to_vec(),
+        );
+        let r302 = record(
+            TlsaSelector::FullCertificate,
+            TlsaMatchingType::Sha512,
+            Sha512::digest(&der).to_vec(),
+        );
+        assert_eq!(r301.matches_cert(&cert), Some(true));
+        assert_eq!(r302.matches_cert(&cert), Some(true));
+    }
+
+    #[test]
+    fn test_matches_cert_exact_spki() {
+        let (der, spki) = test_cert();
+        let cert = CertIdentity::from_der(&der).unwrap();
+        // 3 1 0 — matching type 0 compares the raw selected data.
+        let rec = record(
+            TlsaSelector::SubjectPublicKeyInfo,
+            TlsaMatchingType::NoHash,
+            spki.clone(),
+        );
+        assert_eq!(rec.matches_cert(&cert), Some(true));
+        let mut wrong = spki;
+        wrong[0] ^= 0xff;
+        let rec = record(
+            TlsaSelector::SubjectPublicKeyInfo,
+            TlsaMatchingType::NoHash,
+            wrong,
+        );
+        assert_eq!(rec.matches_cert(&cert), Some(false));
+    }
+
+    #[test]
+    fn test_matches_cert_non_dane_ee_usage_is_unsupported() {
+        let (der, spki) = test_cert();
+        let cert = CertIdentity::from_der(&der).unwrap();
+        let mut rec = record(
+            TlsaSelector::SubjectPublicKeyInfo,
+            TlsaMatchingType::Sha256,
+            Sha256::digest(&spki).to_vec(),
+        );
+        assert_eq!(rec.matches_cert(&cert), Some(true));
+        rec.usage = TlsaUsage::TrustAnchorAssertion;
+        assert_eq!(rec.matches_cert(&cert), None);
+    }
+
+    #[test]
+    fn test_matches_cert_without_der_falls_back_to_fingerprint_path() {
+        let (der, spki) = test_cert();
+        let fp = CertFingerprint::from_der(&der);
+        let cert = CertIdentity::from_fingerprint_and_cn(fp, "dane.agent.local".to_string());
+        assert!(cert.raw_der().is_none() && cert.spki_der().is_none());
+        // Same 3 1 1 record: without DER there is nothing to select from,
+        // so the pre-existing fingerprint-only answer (unsupported) stands.
+        let r311 = record(
+            TlsaSelector::SubjectPublicKeyInfo,
+            TlsaMatchingType::Sha256,
+            Sha256::digest(&spki).to_vec(),
+        );
+        assert_eq!(r311.matches_cert(&cert), None);
+        let r301 = record(
+            TlsaSelector::FullCertificate,
+            TlsaMatchingType::Sha256,
+            Sha256::digest(&der).to_vec(),
+        );
+        assert_eq!(r301.matches_cert(&cert), Some(true));
+    }
+
+    #[test]
+    fn test_verify_dane_cert_spki_record_verifies() {
+        let (der, spki) = test_cert();
+        let cert = CertIdentity::from_der(&der).unwrap();
+        let fqdn = Fqdn::new("dane.agent.local").unwrap();
+        let r311 = record(
+            TlsaSelector::SubjectPublicKeyInfo,
+            TlsaMatchingType::Sha256,
+            Sha256::digest(&spki).to_vec(),
+        );
+        let result =
+            verify_dane_cert(&[r311.clone()], &cert, DanePolicy::Required, &fqdn, 443).unwrap();
+        assert!(matches!(
+            result,
+            DaneVerificationResult::Verified { ref matched_record } if *matched_record == r311
+        ));
+    }
+
+    #[test]
+    fn test_verify_dane_cert_publishing_both_forms_verifies_by_either() {
+        // The ans#105 deployment shape: a 3 0 1 (RA-required) row that has
+        // gone stale after renewal, beside a 3 1 1 row that survived it.
+        let (der, spki) = test_cert();
+        let cert = CertIdentity::from_der(&der).unwrap();
+        let fqdn = Fqdn::new("dane.agent.local").unwrap();
+        let stale_301 = record(
+            TlsaSelector::FullCertificate,
+            TlsaMatchingType::Sha256,
+            vec![0; 32],
+        );
+        let live_311 = record(
+            TlsaSelector::SubjectPublicKeyInfo,
+            TlsaMatchingType::Sha256,
+            Sha256::digest(&spki).to_vec(),
+        );
+        let result = verify_dane_cert(
+            &[stale_301, live_311.clone()],
+            &cert,
+            DanePolicy::Required,
+            &fqdn,
+            443,
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            DaneVerificationResult::Verified { ref matched_record } if *matched_record == live_311
+        ));
+    }
+
+    #[test]
+    fn test_verify_dane_cert_spki_mismatch_is_mismatch_not_unsupported() {
+        let (der, _spki) = test_cert();
+        let cert = CertIdentity::from_der(&der).unwrap();
+        let fqdn = Fqdn::new("dane.agent.local").unwrap();
+        let wrong_311 = record(
+            TlsaSelector::SubjectPublicKeyInfo,
+            TlsaMatchingType::Sha256,
+            vec![0; 32],
+        );
+        // Evaluated and rejected: a fingerprint mismatch, not the
+        // "unsupported format" error the fingerprint-only path raises for 3 1 1.
+        let result = verify_dane_cert(&[wrong_311], &cert, DanePolicy::Required, &fqdn, 443);
+        assert!(matches!(result, Err(DaneError::FingerprintMismatch)));
+    }
+
+    #[test]
+    fn test_verify_dane_cert_without_der_keeps_legacy_unsupported_error() {
+        let (der, spki) = test_cert();
+        let fp = CertFingerprint::from_der(&der);
+        let cert = CertIdentity::from_fingerprint_and_cn(fp, "dane.agent.local".to_string());
+        let fqdn = Fqdn::new("dane.agent.local").unwrap();
+        let r311 = record(
+            TlsaSelector::SubjectPublicKeyInfo,
+            TlsaMatchingType::Sha256,
+            Sha256::digest(&spki).to_vec(),
+        );
+        let result = verify_dane_cert(&[r311], &cert, DanePolicy::Required, &fqdn, 443);
+        assert!(matches!(result, Err(DaneError::InvalidRecord { .. })));
     }
 }

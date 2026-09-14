@@ -9,7 +9,9 @@ use subtle::ConstantTimeEq as _;
 
 use super::cache::VerifiedArtifactCache;
 use super::error::{PopError, PopErrorKind};
-use super::jws::{b64url_encode, jws_signing_input, split_compact_jws, verify_es256};
+use super::jws::{
+    b64url_decode, b64url_encode, jws_signing_input, split_compact_jws, verify_es256,
+};
 use super::proof::{
     accept_es256_dpop, access_token_hash, check_cert_validity, decode_proof_header,
     decode_proof_payload, match_jwk_to_cert, normalize_htu, parse_leaf_cert,
@@ -45,6 +47,8 @@ pub struct ProofResult {
     /// The certificate's `ans://` URI SAN, extracted during cert parsing so
     /// the binding step does not re-parse the DER.
     pub(crate) ans_name: Option<AnsName>,
+    /// Required signed digest, decoded before certificate/signature work.
+    pub(crate) content_sha256: [u8; 32],
 }
 
 /// Options for [`verify_proof`].
@@ -55,13 +59,11 @@ pub struct VerifyProofOptions {
     /// When `Some`, the proof must carry a matching `ath`. When `None`, a
     /// proof that carries `ath` is rejected.
     pub access_token: Option<String>,
-    /// SHA-256 of the request content the callee received; `None` when the
-    /// request carries no content (a zero-length body carries none). A proof
-    /// binding content via `ans_content_digest` must match it (ANS-6 §7.13).
+    /// SHA-256 of the received content; `None` means the digest of empty
+    /// content. Every proof must carry a matching `ans_content_digest`.
     pub content_sha256: Option<[u8; 32]>,
-    /// Reject content-bearing requests whose proof does not bind the content.
-    /// Default `false` — the revision-1 acceptance; §7.13 recommends `true`
-    /// on state-changing endpoints behind TLS-terminating hops.
+    /// Retained for source compatibility. Content binding is always required
+    /// by ANS-6 §7.13, including when this field is `false`.
     pub require_content_binding: bool,
     /// Freshness window. `None` or zero uses [`DEFAULT_POP_SKEW`].
     pub skew: Option<Duration>,
@@ -72,10 +74,10 @@ pub struct VerifyProofOptions {
 /// Verify a compact `DPoP` proof against an HTTP method and URL.
 ///
 /// Order: size cap, compact structure, pinned `typ`/`alg` plus required
-/// `jwk`/`x5c`, P-256 leaf within its validity window, jwk↔x5c key equality,
-/// signature, supported `ans_profile` revision, `htm`, normalized `htu`,
-/// `ath` ↔ presented token, `ans_content_digest` ↔ received content, `iat`
-/// window, `jti` presence and size, then replay commit.
+/// `jwk`/`x5c`, payload shape and supported `ans_profile`, required content
+/// digest, P-256 leaf within its validity window, jwk↔x5c key equality,
+/// signature, `htm`, normalized `htu`, `ath` ↔ presented token, `iat`
+/// window, `jti` presence and size, content comparison, then replay commit.
 ///
 /// A proof verified here is well-formed but **not trusted**: nothing has
 /// established that its certificate belongs to a live ANS agent. Prefer
@@ -94,6 +96,10 @@ pub async fn verify_proof(
     opts: VerifyProofOptions,
 ) -> Result<ProofResult, PopError> {
     let result = verify_proof_unrecorded(proof_jws, method, raw_url, &opts, None)?;
+    check_content_binding(
+        &result,
+        opts.content_sha256.unwrap_or_else(empty_content_sha256),
+    )?;
     commit_replay(&result, replay).await?;
     Ok(result)
 }
@@ -123,6 +129,9 @@ pub fn verify_proof_unrecorded(
     let (header_b64, payload_b64, sig_b64) = split_compact_jws(proof_jws)?;
     let header = decode_proof_header(header_b64)?;
     accept_es256_dpop(&header)?;
+    let payload = decode_proof_payload(payload_b64)?;
+    check_profile_revision(&payload)?;
+    let content_sha256 = decode_content_digest(&payload.ans_content_digest)?;
     let leaf = match cert_cache {
         Some(cache) => {
             let key = VerifiedArtifactCache::key(header.x5c[0].as_bytes());
@@ -140,11 +149,8 @@ pub fn verify_proof_unrecorded(
     match_jwk_to_cert(&header.jwk, &leaf.key)?;
     let signing_input = jws_signing_input(header_b64, payload_b64);
     verify_es256(&leaf.key, signing_input.as_bytes(), sig_b64)?;
-    let payload = decode_proof_payload(payload_b64)?;
-    check_profile_revision(&payload)?;
     check_http_binding(&payload, method, raw_url)?;
     check_token_binding(&payload, opts.access_token.as_deref())?;
-    check_content_binding(&payload, opts.content_sha256, opts.require_content_binding)?;
     check_freshness(&payload, now, skew)?;
     if payload.jti.is_empty() {
         return Err(PopError::new(
@@ -171,6 +177,7 @@ pub fn verify_proof_unrecorded(
             .saturating_add(skew_secs)
             .saturating_add(REPLAY_GRACE_SECS),
         cert_der: leaf.der.clone(),
+        content_sha256,
     })
 }
 
@@ -226,8 +233,8 @@ fn check_token_binding(
 /// under; absence means revision 1 and MUST NOT reject. A revision is by
 /// definition a change a verifier cannot safely ignore, so a revision this
 /// implementation does not know cannot be verified under revision-1 rules —
-/// fail closed. (A legitimate caller never mints one: §7.12 selects the
-/// newest *mutually-supported* revision from the callee's advertisement.)
+/// fail closed. Revision selection and its authenticated advertisement are
+/// deferred until a future specification defines another revision.
 fn check_profile_revision(payload: &super::proof::ProofPayload) -> Result<(), PopError> {
     match payload.ans_profile {
         None | Some(super::proof::ANS_PROFILE_REVISION) => Ok(()),
@@ -238,42 +245,31 @@ fn check_profile_revision(payload: &super::proof::ProofPayload) -> Result<(), Po
     }
 }
 
-/// ANS-6 §7.13: strict in both directions, mirroring `ath`. A proof binding
-/// content when the request carries none rejects; unbound content is a
-/// mint-time choice accepted at revision 1 unless deployment policy requires
-/// the binding.
-fn check_content_binding(
-    payload: &super::proof::ProofPayload,
-    content_sha256: Option<[u8; 32]>,
-    require: bool,
+fn decode_content_digest(claim: &str) -> Result<[u8; 32], PopError> {
+    b64url_decode(claim)?.try_into().map_err(|_| {
+        PopError::new(
+            PopErrorKind::MalformedProof,
+            "ans_content_digest must be an unpadded base64url SHA-256 digest",
+        )
+    })
+}
+
+pub(super) fn empty_content_sha256() -> [u8; 32] {
+    Sha256::digest(b"").into()
+}
+
+/// ANS-6 §7.4 step 12: compare only after the live identity binding.
+pub(super) fn check_content_binding(
+    proof: &ProofResult,
+    received_sha256: [u8; 32],
 ) -> Result<(), PopError> {
-    match (content_sha256, payload.ans_content_digest.as_deref()) {
-        (None, Some(_)) => Err(PopError::new(
+    if proof.content_sha256.ct_eq(&received_sha256).unwrap_u8() != 1 {
+        return Err(PopError::new(
             PopErrorKind::ContentBindingMismatch,
-            "proof binds content but the request carries none",
-        )),
-        (Some(_), None) => {
-            if require {
-                Err(PopError::new(
-                    PopErrorKind::ContentBindingMismatch,
-                    "request content is not bound and policy requires binding",
-                ))
-            } else {
-                Ok(())
-            }
-        }
-        (None, None) => Ok(()),
-        (Some(digest), Some(claim)) => {
-            let want = b64url_encode(&digest);
-            if claim.as_bytes().ct_eq(want.as_bytes()).unwrap_u8() != 1 {
-                return Err(PopError::new(
-                    PopErrorKind::ContentBindingMismatch,
-                    "ans_content_digest does not match the received content",
-                ));
-            }
-            Ok(())
-        }
+            "ans_content_digest does not match the received content",
+        ));
     }
+    Ok(())
 }
 
 fn check_freshness(

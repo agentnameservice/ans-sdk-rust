@@ -262,6 +262,130 @@ fn headers(receipt: &[u8], token: &[u8]) -> ScittHeaders {
     ScittHeaders::new(Some(receipt.to_vec()), Some(token.to_vec()))
 }
 
+fn rewrite_payload(
+    proof: &str,
+    key: &SigningKey,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> String {
+    let (header, payload, _) = super::jws::split_compact_jws(proof).unwrap();
+    let mut payload: serde_json::Value =
+        serde_json::from_slice(&super::jws::b64url_decode(payload).unwrap()).unwrap();
+    edit(&mut payload);
+    let payload = super::jws::b64url_encode(&serde_json::to_vec(&payload).unwrap());
+    let input = format!("{header}.{payload}");
+    let signature = super::jws::sign_es256(key, input.as_bytes()).unwrap();
+    format!("{input}.{signature}")
+}
+
+#[test]
+fn normalize_htu_preserves_path_octets() {
+    for path in [
+        "/a/../task",
+        "/a/./task",
+        "/%2e%2e/task",
+        "/%2fTask",
+        "//task",
+    ] {
+        let url = format!("https://Payments.Example.com:443{path}?q=1#fragment");
+        assert_eq!(
+            normalize_htu(&url).unwrap(),
+            format!("https://payments.example.com{path}")
+        );
+    }
+}
+
+#[tokio::test]
+async fn content_digest_is_required_even_for_empty_requests() {
+    let (key, cert, _) = identity_material(33, ANS_NAME);
+    let signer = signer_at_now(key.clone(), cert);
+    let proof = signer.sign(METHOD, URL, None).unwrap();
+    let missing = rewrite_payload(&proof, &key, |payload| {
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("ans_content_digest");
+    });
+    let err = verify_proof(
+        &missing,
+        METHOD,
+        URL,
+        &replay(),
+        VerifyProofOptions {
+            now: Some(NOW),
+            ..VerifyProofOptions::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::MalformedProof);
+}
+
+#[tokio::test]
+async fn null_profile_revision_is_malformed() {
+    let (key, cert, _) = identity_material(34, ANS_NAME);
+    let signer = signer_at_now(key.clone(), cert);
+    let proof = signer.sign(METHOD, URL, None).unwrap();
+    let malformed = rewrite_payload(&proof, &key, |payload| {
+        payload["ans_profile"] = serde_json::Value::Null;
+    });
+    let err = verify_proof(
+        &malformed,
+        METHOD,
+        URL,
+        &replay(),
+        VerifyProofOptions {
+            now: Some(NOW),
+            ..VerifyProofOptions::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::MalformedProof);
+}
+
+#[tokio::test]
+async fn optional_receipt_is_still_verified_when_present() {
+    let (key, cert, fp) = identity_material(35, ANS_NAME);
+    let signer = signer_at_now(key, cert);
+    let (tl_key, store) = make_tl_key(14);
+    let token = make_status_token(&tl_key, Uuid::nil(), ANS_NAME, &fp);
+    let wrong_receipt = make_receipt(&tl_key, Uuid::nil(), "ans://v2.0.0.caller.example.com");
+    let proof = signer.sign(METHOD, URL, None).unwrap();
+    let replay = replay();
+    let opts = VerifyCallerOptions {
+        now: Some(NOW),
+        require_receipt: false,
+        ..VerifyCallerOptions::default()
+    };
+
+    let err = verify_caller(
+        &proof,
+        &headers(&wrong_receipt, &token),
+        METHOD,
+        URL,
+        &store,
+        &replay,
+        opts.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::BindingFailed);
+
+    // Rejection must not consume the proof's replay slot. The reduced mode
+    // permits an absent receipt, but cannot ignore adverse supplied evidence.
+    verify_caller(
+        &proof,
+        &ScittHeaders::new(None, Some(token)),
+        METHOD,
+        URL,
+        &store,
+        &replay,
+        opts,
+    )
+    .await
+    .unwrap();
+}
+
 #[test]
 fn normalize_htu_drops_default_port_and_query() {
     assert_eq!(
@@ -394,6 +518,45 @@ async fn extra_header_field_rejected() {
     .await
     .unwrap_err();
     assert_eq!(err.kind, PopErrorKind::MalformedProof);
+}
+
+#[tokio::test]
+async fn jose_conformance_rejects_certificate_chains_and_jwk_extensions() {
+    let (key, cert, _) = identity_material(39, ANS_NAME);
+    let signer = signer_at_now(key.clone(), cert);
+    let proof = signer.sign(METHOD, URL, None).unwrap();
+    let (header, payload, _) = super::jws::split_compact_jws(&proof).unwrap();
+    let header: serde_json::Value =
+        serde_json::from_slice(&super::jws::b64url_decode(header).unwrap()).unwrap();
+
+    for parameter in ["x5c", "alg", "use", "kid", "d"] {
+        let mut modified = header.clone();
+        let expected = if parameter == "x5c" {
+            let leaf = modified["x5c"][0].clone();
+            modified["x5c"].as_array_mut().unwrap().push(leaf);
+            PopErrorKind::CertInvalid
+        } else {
+            modified["jwk"][parameter] = serde_json::json!("unexpected");
+            PopErrorKind::MalformedProof
+        };
+        let encoded = super::jws::b64url_encode(&serde_json::to_vec(&modified).unwrap());
+        let input = format!("{encoded}.{payload}");
+        let signature = super::jws::sign_es256(&key, input.as_bytes()).unwrap();
+        let proof = format!("{input}.{signature}");
+        let err = verify_proof(
+            &proof,
+            METHOD,
+            URL,
+            &replay(),
+            VerifyProofOptions {
+                now: Some(NOW),
+                ..VerifyProofOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, expected, "accepted nonconformant {parameter}");
+    }
 }
 
 #[tokio::test]
@@ -681,6 +844,20 @@ async fn replay_cache_fails_closed_at_capacity() {
 }
 
 #[tokio::test]
+async fn replay_cache_rejects_expired_reservations() {
+    let cache = replay();
+    // A slow body read or shared-store round trip can outlive the proof's
+    // retention window. Storing an already-expired key would admit reuse.
+    for expiry in [NOW - 1, NOW] {
+        let err = cache.check_and_store("expired", expiry).await.unwrap_err();
+        assert_eq!(err.kind, PopErrorKind::ProofStale);
+    }
+    assert!(cache.is_empty());
+    assert!(!cache.check_and_store("fresh", NOW + 120).await.unwrap());
+    assert!(cache.check_and_store("fresh", NOW + 120).await.unwrap());
+}
+
+#[tokio::test]
 async fn attach_identity_binds_dpop_authorization() {
     let (key, cert, _) = identity_material(19, ANS_NAME);
     let signer = signer_at_now(key, cert);
@@ -961,22 +1138,36 @@ async fn content_binding_both_directions() {
         .unwrap_err();
     assert_eq!(err.kind, PopErrorKind::ContentBindingMismatch);
 
-    // Unbound content: accepted at revision 1, rejected under policy.
-    let unbound = signer.sign(METHOD, URL, None).unwrap();
-    verify_proof(&unbound, METHOD, URL, &replay(), opts(Some(digest), false))
-        .await
-        .unwrap();
-    let unbound2 = signer.sign(METHOD, URL, None).unwrap();
-    let err = verify_proof(&unbound2, METHOD, URL, &replay(), opts(Some(digest), true))
-        .await
-        .unwrap_err();
+    // Adding content to an empty request breaks its signed empty digest,
+    // even when the obsolete opt-in flag is false.
+    let empty_request = signer.sign(METHOD, URL, None).unwrap();
+    let err = verify_proof(
+        &empty_request,
+        METHOD,
+        URL,
+        &replay(),
+        opts(Some(digest), false),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.kind, PopErrorKind::ContentBindingMismatch);
 
-    // Empty content mints no claim (a zero-length body carries none).
+    // Empty content is explicitly bound, with either representation of the
+    // received digest accepted by the low-level options.
     let empty = signer.sign_with_content(METHOD, URL, None, b"").unwrap();
     verify_proof(&empty, METHOD, URL, &replay(), opts(None, false))
         .await
         .unwrap();
+    let empty_digest: [u8; 32] = Sha256::digest(b"").into();
+    verify_proof(
+        &empty,
+        METHOD,
+        URL,
+        &replay(),
+        opts(Some(empty_digest), true),
+    )
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -995,6 +1186,235 @@ fn minted_proofs_carry_profile_revision() {
         payload["ans_profile"],
         serde_json::json!(ANS_PROFILE_REVISION)
     );
+    assert_eq!(
+        payload["ans_content_digest"],
+        "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"
+    );
+}
+
+#[tokio::test]
+async fn malformed_content_digests_reject_before_certificate_work() {
+    let (key, cert, _) = identity_material(36, ANS_NAME);
+    let signer = signer_at_now(key.clone(), cert);
+    let proof = signer.sign(METHOD, URL, None).unwrap();
+    for value in [
+        serde_json::Value::Null,
+        serde_json::json!(1),
+        serde_json::json!(""),
+        serde_json::json!("not+a/base64url=digest"),
+        serde_json::json!("47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU="),
+        serde_json::json!(super::jws::b64url_encode(&[0u8; 31])),
+        serde_json::json!(super::jws::b64url_encode(&[0u8; 33])),
+    ] {
+        let malformed = rewrite_payload(&proof, &key, |payload| {
+            payload["ans_content_digest"] = value.clone();
+        });
+        let (header, payload, signature) = super::jws::split_compact_jws(&malformed).unwrap();
+        let mut header: serde_json::Value =
+            serde_json::from_slice(&super::jws::b64url_decode(header).unwrap()).unwrap();
+        header["x5c"] = serde_json::json!(["not-a-certificate"]);
+        let header = super::jws::b64url_encode(&serde_json::to_vec(&header).unwrap());
+        let malformed = format!("{header}.{payload}.{signature}");
+        let err = verify_proof(
+            &malformed,
+            METHOD,
+            URL,
+            &replay(),
+            VerifyProofOptions {
+                now: Some(NOW),
+                ..VerifyProofOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, PopErrorKind::MalformedProof, "digest: {value}");
+    }
+}
+
+#[tokio::test]
+async fn absent_profile_is_revision_one_but_malformed_profiles_reject() {
+    let (key, cert, _) = identity_material(37, ANS_NAME);
+    let signer = signer_at_now(key.clone(), cert);
+    let proof = signer.sign(METHOD, URL, None).unwrap();
+    let opts = VerifyProofOptions {
+        now: Some(NOW),
+        ..VerifyProofOptions::default()
+    };
+    let absent = rewrite_payload(&proof, &key, |payload| {
+        payload.as_object_mut().unwrap().remove("ans_profile");
+    });
+    verify_proof(&absent, METHOD, URL, &replay(), opts.clone())
+        .await
+        .unwrap();
+    for value in [
+        serde_json::Value::Null,
+        serde_json::json!(0),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!("1"),
+        serde_json::json!(true),
+    ] {
+        let malformed = rewrite_payload(&proof, &key, |payload| {
+            payload["ans_profile"] = value.clone();
+        });
+        assert!(
+            verify_proof(&malformed, METHOD, URL, &replay(), opts.clone())
+                .await
+                .is_err(),
+            "accepted profile: {value}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn content_hashing_follows_identity_binding_and_precedes_replay() {
+    let (key, cert, fp) = identity_material(38, ANS_NAME);
+    let signer = signer_at_now(key, cert);
+    let (tl_key, store) = make_tl_key(15);
+    let token = make_status_token(&tl_key, Uuid::nil(), ANS_NAME, &fp);
+    let receipt = make_receipt(&tl_key, Uuid::nil(), ANS_NAME);
+    let body = br#"{"task":"reconcile-ledger","amount":"1000.00"}"#;
+    let proof = signer.sign_with_content(METHOD, URL, None, body).unwrap();
+    let opts = VerifyCallerOptions {
+        now: Some(NOW),
+        ..VerifyCallerOptions::default()
+    };
+    let replay = replay();
+
+    let wrong_token = make_status_token(
+        &tl_key,
+        Uuid::nil(),
+        ANS_NAME,
+        &CertFingerprint::from_der(b"other"),
+    );
+    let hashed = std::cell::Cell::new(false);
+    let err = verify_caller_with_content(
+        &proof,
+        &headers(&receipt, &wrong_token),
+        METHOD,
+        URL,
+        &store,
+        &replay,
+        opts.clone(),
+        || async {
+            hashed.set(true);
+            Ok(Sha256::digest(body).into())
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::BindingFailed);
+    assert!(!hashed.get(), "untrusted caller bought content hashing");
+
+    // A body read/size-limit error and a mismatch both leave the jti unused.
+    for result in [
+        Err(PopError::new(
+            PopErrorKind::ContentBindingMismatch,
+            "body too large",
+        )),
+        Ok(Sha256::digest(b"modified").into()),
+    ] {
+        let err = verify_caller_with_content(
+            &proof,
+            &headers(&receipt, &token),
+            METHOD,
+            URL,
+            &store,
+            &replay,
+            opts.clone(),
+            || async { result },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, PopErrorKind::ContentBindingMismatch);
+    }
+
+    let identity = verify_caller_with_content(
+        &proof,
+        &headers(&receipt, &token),
+        METHOD,
+        URL,
+        &store,
+        &replay,
+        opts.clone(),
+        || async {
+            // Transfer framing has been removed; splitting the same content
+            // into different chunks does not change its digest.
+            let mut hash = Sha256::new();
+            for chunk in body.chunks(7) {
+                hash.update(chunk);
+            }
+            let digest: [u8; 32] = hash.finalize().into();
+            assert_eq!(
+                super::jws::b64url_encode(&digest),
+                "wT8MhptL9zBd-WXZkYTjY7AHo1vNNfPYZzVifJEzPJc"
+            );
+            Ok(digest)
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(identity.ans_name.to_string(), ANS_NAME);
+
+    let err = verify_caller_with_content(
+        &proof,
+        &headers(&receipt, &token),
+        METHOD,
+        URL,
+        &store,
+        &replay,
+        opts,
+        || async { Ok(Sha256::digest(body).into()) },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.kind, PopErrorKind::Replay);
+}
+
+#[tokio::test]
+async fn content_coding_remains_applied_when_hashing() {
+    let plain = br#"{"task":"reconcile-ledger","amount":"1000.00"}"#;
+    // gzip(plain), generated with mtime=0. These transmitted octets are the
+    // bound content, even when the application subsequently decodes JSON.
+    let gzip: &[u8] = &[
+        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 86, 42, 73, 44, 206, 86, 178, 82, 42, 74, 77, 206,
+        207, 75, 206, 204, 73, 213, 205, 73, 77, 73, 79, 45, 82, 210, 81, 74, 204, 205, 47, 205,
+        43, 1, 202, 25, 26, 24, 24, 232, 25, 24, 40, 213, 2, 0, 130, 136, 183, 214, 46, 0, 0, 0,
+    ];
+    let (key, cert, _) = identity_material(40, ANS_NAME);
+    let proof = signer_at_now(key, cert)
+        .sign_with_content(METHOD, URL, None, gzip)
+        .unwrap();
+    let replay = replay();
+    for digest in [Sha256::digest(plain).into(), Sha256::digest(b"").into()] {
+        let err = verify_proof(
+            &proof,
+            METHOD,
+            URL,
+            &replay,
+            VerifyProofOptions {
+                now: Some(NOW),
+                content_sha256: Some(digest),
+                ..VerifyProofOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.kind, PopErrorKind::ContentBindingMismatch);
+    }
+    verify_proof(
+        &proof,
+        METHOD,
+        URL,
+        &replay,
+        VerifyProofOptions {
+            now: Some(NOW),
+            content_sha256: Some(Sha256::digest(gzip).into()),
+            ..VerifyProofOptions::default()
+        },
+    )
+    .await
+    .unwrap();
 }
 
 /// ANS-6 §7.12 / §10 tolerance case: a proof carrying an unknown payload

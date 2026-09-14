@@ -159,9 +159,11 @@ let verifier = AnsVerifier::builder()
     .await?;
 ```
 
+Configured DANE checks apply to every successful server verification, including badge cache hits, permitted stale-cache fallback, and SCITT verification. Construct `CertIdentity` from the actual certificate DER to support SPKI-based TLSA records; a fingerprint alone can check only `3 0 1`.
+
 ### Trusted RA Domains
 
-Restrict badge URL fetches to known transparency log hosts. This prevents DNS-based redirections to attacker-controlled servers:
+ANS-6 badge verification requires a trusted-TL host allowlist configured out of band (§4.2). Configure it for every verifier that can use badge verification, including SCITT fallback:
 
 ```rust
 let verifier = ServerVerifier::builder()
@@ -170,7 +172,9 @@ let verifier = ServerVerifier::builder()
     .await?;
 ```
 
-When configured, badge URLs discovered via DNS TXT records are validated before any HTTP request is made. URLs pointing to hosts not in the set are rejected with `TlogError::UntrustedDomain`. By default (`None`), all domains are allowed.
+When configured, badge URLs discovered via DNS TXT records are validated before any HTTP request is made. URLs pointing to hosts outside the set are rejected with `TlogError::UntrustedDomain`. The compatibility default (`None`) allows all domains and does not satisfy ANS-6's badge trust requirement.
+
+V2 badges use `serverCerts` and `identityCerts` arrays; verification accepts any matching fingerprint in the relevant array. Identity certificates may be absent for server-only registrations. V1 singular attestations remain readable. In the Rust model, optional `identity_cert`, `server_cert`, `domain_validation`, and `expires_at` fields are `Option`; code accessing these fields directly must handle their absence. Prefer the fingerprint iterators when matching certificates.
 
 ## SCITT Verification
 
@@ -178,13 +182,13 @@ Enable with `features = ["scitt"]` for offline-capable verification using signed
 
 ### SCITT Flow
 
-1. Parse SCITT headers (`X-SCITT-Receipt`, `X-ANS-Status-Token`) from the HTTP response
+1. Reject duplicate SCITT headers, then parse `X-SCITT-Receipt` and `X-ANS-Status-Token`
 2. Verify the status token: COSE_Sign1 signature, expiry, agent status
 3. Match certificate fingerprint against the token's cert array
-4. Verify the receipt: COSE_Sign1 signature, Merkle inclusion proof
+4. Verify the receipt's COSE_Sign1 signature and Merkle inclusion proof, then bind its full ANS name and agent identifier to the token and its host to the peer
 5. Result: `ScittVerified` with tier (`FullScitt` or `StatusTokenVerified`)
 
-If SCITT headers are absent or the token is expired, the verifier falls back to badge-based verification (configurable via `ScittTierPolicy`).
+Badge fallback is available only when both SCITT headers are absent and the configured `ScittTierPolicy` allows it. Present but invalid evidence rejects, including an expired token or invalid receipt. A valid token without a receipt yields `StatusTokenVerified`, even under `RequireScitt`; require `FullScitt` if your application needs an inclusion receipt. Status-token clock skew is capped at ten minutes.
 
 ```rust
 use std::sync::Arc;
@@ -196,6 +200,7 @@ let key_store = Arc::new(ScittKeyStore::from_c2sp_keys(&root_keys)?);
 
 let verifier = AnsVerifier::builder()
     .with_caching()
+    .trusted_ra_domains(["tlog.example.com"])
     .scitt_config(ScittConfig::new()
         .with_tier_policy(ScittTierPolicy::ScittWithBadgeFallback))
     .scitt_key_store(key_store)
@@ -235,14 +240,14 @@ cargo run -p ans-verify --features scitt --example inspect_scitt -- \
 
 ### DPoP / Method B (A2A without mTLS)
 
-When TLS is terminated at a proxy, the callee authenticates the caller from three artifacts on the HTTP request: a DPoP proof (`DPoP`), a status token (`X-ANS-Status-Token`), and a SCITT receipt (`X-SCITT-Receipt`). Missing status token is a hard reject.
+When TLS is terminated at a proxy, the callee authenticates the caller from three artifacts on the HTTP request: a DPoP proof (`DPoP`), a status token (`X-ANS-Status-Token`), and a SCITT receipt (`X-SCITT-Receipt`). Missing status token is a hard reject. The receipt is required by default; `require_receipt: false` waives only its absence and must be an explicit deployment choice.
 
 ```rust
 use ans_verify::{
     MemoryReplayCache, Signer, VerifyCallerOptions, attach_identity, verify_caller,
 };
 
-// Caller
+// Caller: this request carries no content, so the proof signs the empty digest.
 let proof = attach_identity(&signer, "POST", "https://payments.example.com/api/task", None)?;
 
 // Callee — pass the reconstructed request URL, not the proxy's local address
@@ -253,16 +258,20 @@ let identity = verify_caller(
     "https://payments.example.com/api/task",
     &key_store,
     &replay,
-    VerifyCallerOptions::default(),
+    VerifyCallerOptions::default().with_trusted_authority("payments.example.com"),
 )
 .await?;
 ```
 
 Outbound minting: `Signer` / `attach_identity`. Inbound: `verify_caller` (three-proof bind) or `verify_proof` (possession only). Replay protection: `ReplayCache` / `MemoryReplayCache`.
 
-Content-bearing requests should bind the body into the proof via `attach_identity_with_content` / `Signer::sign_with_content` (`ans_content_digest`, ANS-6 §7.13) — a TLS-terminating hop that rewrites the body then breaks the proof. The callee passes the received content's SHA-256 as `VerifyCallerOptions::content_sha256`; verification is strict in both directions, and `require_content_binding` additionally rejects content-bearing requests whose proof does not bind the content. Minted proofs carry the profile revision (`ans_profile`, §7.12); a proof minted under a revision this implementation does not know rejects with `UNSUPPORTED_PROFILE`.
+Every proof must carry a valid `ans_content_digest`, including the empty-content digest when no content is sent (§7.13). Sign content with `attach_identity_with_content` / `Signer::sign_with_content`. On the callee, use `verify_caller_with_content`: its callback runs only after the proof is bound to a live identity. Enforce the body-size limit and read deadline there, hash after transfer-coding removal but before content decoding, and do not act on content until verification returns success. A digest mismatch or body-read error leaves the `jti` unconsumed. Recompression changes the digest; changing chunk framing does not.
+
+The precomputed `content_sha256` option remains available for content already hashed behind an authentication boundary; `None` means empty content. `require_content_binding` remains for source compatibility but cannot disable the required check. Revision `1` is the only supported profile: an absent `ans_profile` selects it, malformed values reject, and unknown revisions reject with `UNSUPPORTED_PROFILE`. Profile selection is deferred by the spec.
 
 Callee hardening: `VerifyCallerOptions::with_trusted_authority` rejects requests for authorities this callee does not answer as (ANS-6 §7.7), and `with_artifact_cache` (`VerifiedArtifactCache`) skips re-verifying a status token or receipt whose exact bytes verified before, while still enforcing token expiry (§4.6). On an unknown signing key, `PopError::is_unknown_key_id()` signals the refresh-and-retry pattern (§9.5) — pair with `RefreshableKeyStore::refresh_if_cooldown_elapsed`.
+
+At the HTTP boundary, reject duplicate `DPoP`, `Authorization`, `X-SCITT-Receipt`, and `X-ANS-Status-Token` headers before selecting a value. Fail startup without a trusted authority source, incorporate the request's actual path in the comparison URL, and keep authorization parameters out of its unsigned query string. Multi-replica deployments must share a replay cache with atomic check-and-store and a deadline. With OAuth, the token validator must also compare `cnf.jkt` to the returned identity's `jkt`; proof verification checks `ath` but does not validate the access token.
 
 A self-contained example runs both sides of the flow in-memory, including replay rejection, the authority allowlist, and the artifact cache:
 

@@ -6,7 +6,7 @@ use p256::ecdsa::VerifyingKey;
 use p256::pkcs8::DecodePublicKey as _;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use url::{Position, Url};
+use url::Url;
 
 use super::error::{PopError, PopErrorKind};
 use super::jws::{COORD_LEN, b64url_decode, b64url_encode};
@@ -46,10 +46,18 @@ pub struct ProofPayload {
     pub jti: String,
     #[serde(default)]
     pub ath: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_profile_revision")]
     pub ans_profile: Option<u64>,
-    #[serde(default)]
-    pub ans_content_digest: Option<String>,
+    pub ans_content_digest: String,
+}
+
+fn deserialize_profile_revision<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Only an absent claim defaults to revision 1. An explicit null is not
+    // the positive JSON integer required by ANS-6 §7.2.
+    u64::deserialize(deserializer).map(Some)
 }
 
 pub fn decode_proof_header(header_b64: &str) -> Result<ProofHeader, PopError> {
@@ -253,8 +261,18 @@ pub fn jwk_thumbprint(pub_key: &VerifyingKey) -> Result<String, PopError> {
 /// query and fragment stripped, empty path normalized to `/`. The path is
 /// otherwise preserved (case-sensitive, no dot-segment canonicalization).
 pub fn normalize_htu(raw_url: &str) -> Result<String, PopError> {
-    let (url, scheme, hostport) = parse_scheme_authority(raw_url)?;
-    let path = &url[Position::BeforePath..Position::AfterPath];
+    let (_, scheme, hostport) = parse_scheme_authority(raw_url)?;
+    // Url follows the WHATWG algorithm, which removes dot segments (even
+    // percent-encoded ones). ANS-6 §7.3 explicitly preserves the raw path.
+    let (_, after_scheme) = raw_url.split_once("://").ok_or_else(|| {
+        PopError::new(PopErrorKind::MalformedProof, "htu requires an absolute URL")
+    })?;
+    let path_start = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let path = &after_scheme[path_start..];
+    let path_end = path.find(['?', '#']).unwrap_or(path.len());
+    let path = &path[..path_end];
     let path = if path.is_empty() { "/" } else { path };
     Ok(format!("{scheme}://{hostport}{path}"))
 }
@@ -272,6 +290,16 @@ pub fn request_authority(raw_url: &str) -> Result<String, PopError> {
 }
 
 fn parse_scheme_authority(raw_url: &str) -> Result<(Url, String, String), PopError> {
+    if !raw_url.contains("://")
+        || raw_url
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace() || b == b'\\')
+    {
+        return Err(PopError::new(
+            PopErrorKind::MalformedProof,
+            "htu requires an absolute URL without whitespace or backslashes",
+        ));
+    }
     let url = Url::parse(raw_url)
         .map_err(|e| PopError::with_source(PopErrorKind::MalformedProof, "parse URL for htu", e))?;
     let scheme = url.scheme().to_ascii_lowercase();
@@ -281,10 +309,14 @@ fn parse_scheme_authority(raw_url: &str) -> Result<(Url, String, String), PopErr
             "htu requires an absolute URL with scheme and host",
         )
     })?;
-    if scheme.is_empty() || host.is_empty() {
+    if !matches!(scheme.as_str(), "http" | "https")
+        || host.is_empty()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
         return Err(PopError::new(
             PopErrorKind::MalformedProof,
-            "htu requires an absolute URL with scheme and host",
+            "htu requires an HTTP(S) URL with a host and no user information",
         ));
     }
     let host = host.to_ascii_lowercase();
@@ -339,8 +371,7 @@ pub fn encode_proof_parts(
         ath: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         ans_profile: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        ans_content_digest: Option<&'a str>,
+        ans_content_digest: &'a str,
     }
     let header_json = serde_json::to_vec(&HeaderOut {
         typ: &header.typ,
@@ -361,7 +392,7 @@ pub fn encode_proof_parts(
         jti: &payload.jti,
         ath: payload.ath.as_deref(),
         ans_profile: payload.ans_profile,
-        ans_content_digest: payload.ans_content_digest.as_deref(),
+        ans_content_digest: &payload.ans_content_digest,
     })
     .map_err(|e| PopError::with_source(PopErrorKind::MalformedProof, "marshal proof payload", e))?;
     Ok((b64url_encode(&header_json), b64url_encode(&payload_json)))

@@ -19,6 +19,7 @@ mod client;
 mod cose;
 mod error;
 mod headers;
+mod identity;
 mod merkle;
 mod receipt;
 mod refreshable_key_store;
@@ -54,6 +55,7 @@ pub use supplier::{ScittHeaderSupplier, ScittOutgoingHeaders, ScittRefreshHandle
 pub use verification_cache::ScittVerificationCache;
 
 // ── Internal API (used by verify.rs and pop, not re-exported from lib.rs) ────
+pub use identity::bind_receipt_to_status;
 pub use status_token::{MAX_CLOCK_SKEW_TOLERANCE_SECS, matches_identity_cert, matches_server_cert};
 pub use verification_cache::{CachedScittOutcome, hash_bytes};
 

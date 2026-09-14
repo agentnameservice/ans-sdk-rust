@@ -146,19 +146,21 @@ Server verification (`verify_server`):
 
 1. Check badge cache by FQDN
 2. DNS lookup: `_ans-badge.{fqdn}` TXT record (fallback: `_ra-badge.{fqdn}`) → transparency log URL
-3. Fetch badge from transparency log API
+3. Enforce the configured trusted-TL allowlist, then fetch the badge
 4. Validate badge status (`Active`/`Warning`/`Deprecated` allowed)
-5. Compare server certificate fingerprint to badge's `attestations.server_cert.fingerprint`
+5. Match any server certificate fingerprint in V2 `serverCerts` (V1 singular attestations remain supported)
 6. Anchor to the dialed host (ANS-6 §5.1): badge's `agent.host` and the certificate host must both equal the FQDN the caller dialed — badge fields alone verify a consistent story, not the right peer
-7. Optional: DANE/TLSA verification if policy enabled
+7. Optional: DANE/TLSA verification if policy enabled, on every successful path including fresh/stale badge cache hits and SCITT results
 
 Failure handling (ANS-6 §9.1/§9.2): NXDOMAIN on the badge lookup is a determinate answer — possibly the post-revocation state — and rejects regardless of `FailurePolicy`; a cached pre-revocation badge is never a fallback for it. `FailOpenWithCache { max_staleness }` applies only to indeterminate failures (SERVFAIL/timeout, TL unreachable) and may serve cache entries past their freshness TTL via the `*_allow_stale` getters — `CacheConfig::hard_ttl` (eviction bound, default 4× the freshness TTL) must be ≥ `max_staleness` for the window to exist.
+
+Determinate DNS/TL failures, including absent records, 404 responses, and malformed badges, invalidate cached positive state so a later outage cannot restore it. V2 revocation events and server-only registrations must deserialize without singular or identity-certificate fields.
 
 Client verification (`verify_client`) for mTLS:
 
 1. Extract FQDN from certificate CN, version from URI SAN (`ans://...`)
 2. DNS lookup by FQDN, match badge to certificate version
-3. Compare identity certificate fingerprint to badge's `attestations.identity_cert.fingerprint`
+3. Match any identity certificate fingerprint in V2 `identityCerts` (V1 singular attestations remain supported); absence rejects client authentication
 4. Compare ANS name from URI SAN to badge's `ans_name`
 
 ### SCITT Verification Flow (feature = "scitt")
@@ -167,8 +169,8 @@ SCITT-enhanced verification (`verify_server_with_scitt` / `verify_client_with_sc
 
 1. Parse SCITT headers (`X-SCITT-Receipt`, `X-ANS-Status-Token`)
 2. If status token present: verify COSE_Sign1 signature, check expiry, validate status
-3. Match certificate fingerprint against token's cert array
-4. If receipt present: verify Merkle inclusion proof
+3. Match certificate fingerprint against the token's cert array and bind peer names, including the full client URI SAN on cache hits
+4. If receipt present: verify its signature and Merkle proof, then bind the full ANS name, agent identifier, and peer host
 5. Result is `VerificationOutcome::ScittVerified` with verification tier
 
 Fallback behavior (governed by `ScittTierPolicy`):
@@ -188,11 +190,11 @@ Application-layer proof of possession for A2A traffic that crosses TLS-terminati
 1. Caller mints a compact DPoP proof (`DPoP` header) with `x5c` bound to the identity certificate
 2. Callee verifies possession, then binds the proof fingerprint to `validIdentityCerts` on the status token
 3. The `x5c[0]` validity period must contain `now` (± pop skew) — fingerprint arrays never prune rotated-away certs, so the certificate's dates are its only expiry (ANS-6 §7.5)
-4. Optional receipt leaf identity is taken from the V2 envelope (`.payload.producer.event.ansName` / `ansId`)
+4. Receipt leaf identity is taken from the V2 envelope (`.payload.producer.event.ansName` / `ansId`); receipts are required by default, and any supplied receipt must verify and agree even if absence is waived
 5. Missing status token is a hard reject — Method B does not fall back to the badge tier
-6. `jti` is recorded in the replay cache only after binding succeeds
-7. Content-bearing requests bind the body via `ans_content_digest` (§7.13): mint with `sign_with_content` / `attach_identity_with_content` (empty content mints no claim), verify by passing the received content's SHA-256 as `content_sha256`; strict both directions, `require_content_binding` for deployments that mandate it
-8. Minted proofs state their profile revision (`ans_profile`, §7.12); absence means revision 1, and an unknown revision rejects with `UNSUPPORTED_PROFILE` (a revision is by definition a change the verifier cannot safely ignore)
+6. `jti` is recorded only after identity and content binding succeed; expired replay reservations reject
+7. Every proof carries `ans_content_digest`, including the empty-content digest (§7.13). Use `verify_caller_with_content` to enforce size/read limits and hash only after identity binding; hash transfer-decoded bytes with content coding still applied. The legacy `require_content_binding` flag cannot disable this check
+8. Minted proofs state revision `1` (`ans_profile`, §7.12); absence means revision 1, malformed values reject, and unknown revisions reject with `UNSUPPORTED_PROFILE`. Profile selection is deferred
 
 The comparison URL for `htu` is the callee's job (pass the reconstructed URL into `verify_caller`). Callee hardening lives on `VerifyCallerOptions`: `trusted_authorities` (§7.7 preflight allowlist, `UNTRUSTED_AUTHORITY` on miss) and `artifact_cache` (`VerifiedArtifactCache`, §4.6 — cached status tokens still enforce `exp`; the possession proof is never cached). `PopError::is_unknown_key_id()` is the §9.5 trigger to refresh root keys once (cooldown-gated) and retry.
 

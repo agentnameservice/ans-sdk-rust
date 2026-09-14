@@ -290,9 +290,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Tier | Meaning |
 |------|---------|
-| `FullScitt` | Status token + receipt both verified |
-| `StatusTokenVerified` | Status token verified, receipt missing or invalid |
+| `FullScitt` | Status token + receipt verified and bound to the same peer |
+| `StatusTokenVerified` | Status token verified, receipt absent |
 | `BadgeOnly` | Traditional badge-based verification |
+
+Present but invalid receipts reject under every policy. `RequireScitt` disables badge fallback but still permits the `StatusTokenVerified` tier; applications requiring an inclusion receipt must require `FullScitt`.
 
 ### Inspect SCITT Artifacts
 
@@ -306,25 +308,38 @@ cargo run -p ans-verify --features scitt --example inspect_scitt -- \
 
 ### DPoP / Method B (A2A without mTLS)
 
-Enable with `features = ["scitt"]`. The caller proves possession of the identity certificate with an RFC 9449 DPoP proof (`DPoP` header). The callee binds that proof to the status token's `validIdentityCerts` and (when required) to the SCITT receipt. Missing status token is a hard reject — Method B does not fall back to the badge tier. Content-bearing requests can bind the body into the proof (`attach_identity_with_content`, ANS-6 §7.13), and proofs carry their profile revision (`ans_profile`, §7.12).
+Enable with `features = ["scitt"]`. The caller proves possession of its identity certificate with an RFC 9449 DPoP proof (`DPoP` header). The callee binds that proof to the status token's `validIdentityCerts` and the SCITT receipt. Missing status token is a hard reject. Receipts are required by default; waiving their absence never bypasses verification of a supplied receipt.
+
+Every proof carries `ans_content_digest`, including the digest of empty content for a request without a body (ANS-6 §7.13). Use `attach_identity_with_content` to sign a body and `verify_caller_with_content` to defer hashing until the live identity binding succeeds:
 
 ```rust
-use ans_verify::{Signer, VerifyCallerOptions, attach_identity, verify_caller};
+use ans_verify::{VerifyCallerOptions, attach_identity_with_content, verify_caller_with_content};
+use sha2::{Digest, Sha256};
 
-let proof = attach_identity(&signer, "POST", "https://payments.example.com/api/task", None)?;
-let identity = verify_caller(
+let body = br#"{"amount":100}"#;
+let proof = attach_identity_with_content(
+    &signer, "POST", "https://payments.example.com/api/task", None, body,
+)?;
+let identity = verify_caller_with_content(
     &proof,
     &headers,
     "POST",
     "https://payments.example.com/api/task",
     &key_store,
     &replay,
-    VerifyCallerOptions::default(),
+    VerifyCallerOptions::default().with_trusted_authority("payments.example.com"),
+    || async {
+        // For streamed input, enforce a size limit and read deadline here.
+        // Hash after removing transfer framing, before decoding content.
+        Ok(Sha256::digest(body).into())
+    },
 )
 .await?;
 ```
 
-Pass the reconstructed public request URL into `verify_caller` (`htu` comparison). Record `jti` only after binding — `verify_caller` does this; `verify_proof` records immediately and is possession-only. Harden the callee with `VerifyCallerOptions::with_trusted_authority` (authority allowlist) and `with_artifact_cache` (reuse verified status tokens and receipts across requests).
+For empty content, use `attach_identity` and `verify_caller` with default content options. Both caller-verification APIs record `jti` after identity and content binding; `verify_proof` establishes possession only and cannot authenticate an ANS agent by itself. Revision `1` is the only supported profile; an absent `ans_profile` selects it, and malformed or unsupported revisions reject.
+
+The HTTP adapter must reject duplicate security headers before extracting values, reconstruct the public URL from a trusted authority and the actual request path, and enforce body limits before hashing. Hash content with its content coding still applied: gzip bytes remain compressed. Complete verification before acting on the content, and share replay storage across replicas serving the same authority. Use `with_artifact_cache` to reuse verified status tokens and receipts.
 
 Run both sides of the flow locally with the self-contained example:
 
@@ -346,6 +361,7 @@ let verifier = AnsVerifier::builder()
         max_entries: 1000,
         default_ttl: Duration::from_secs(300),
         refresh_threshold: Duration::from_secs(60),
+        ..CacheConfig::default()
     })
 
     // Set failure policy
@@ -364,7 +380,7 @@ let verifier = AnsVerifier::builder()
     // Or: .with_dane_if_present()  // Shorthand for ValidateIfPresent
     .dane_port(443)  // Port for TLSA lookup (default: 443)
 
-    // Trusted RA domains (optional, defense-in-depth)
+    // Trusted TL hosts configured out of band (required for ANS-6 badge verification)
     .trusted_ra_domains(["tlog.example.com", "tlog2.example.com"])
 
     .build()

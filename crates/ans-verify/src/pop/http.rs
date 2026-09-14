@@ -45,11 +45,12 @@ pub fn reject_duplicate_header(name: &str, value_count: usize) -> Result<(), Pop
     }
 }
 
-/// Mint a `DPoP` proof for an outbound request.
+/// Mint a `DPoP` proof for an outbound request with no content.
 ///
 /// If `authorization` is `Authorization: DPoP <token>`, the proof is bound
 /// via `ath`. SCITT headers are owned by [`crate::ScittHeaderSupplier`]; this
-/// function only produces the `DPoP` header value.
+/// function only produces the `DPoP` header value, including the required
+/// digest of empty content. Use [`attach_identity_with_content`] for a body.
 ///
 /// # Errors
 ///
@@ -65,8 +66,9 @@ pub fn attach_identity(
 }
 
 /// [`attach_identity`] for content-bearing requests: also binds the request
-/// content via `ans_content_digest` (ANS-6 §7.13). Empty content mints no
-/// claim.
+/// content via `ans_content_digest` (ANS-6 §7.13). Empty content carries
+/// the empty-content digest. Pass bytes after transfer-coding removal and
+/// before content decoding.
 ///
 /// # Errors
 ///

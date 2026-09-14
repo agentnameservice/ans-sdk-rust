@@ -92,6 +92,14 @@ pub enum ScittError {
         actual: String,
     },
 
+    /// Signed receipt does not contain a usable ANS event identity.
+    #[error("Invalid receipt identity: {0}")]
+    InvalidReceiptIdentity(String),
+
+    /// Certificate, receipt, and status token do not name the same peer.
+    #[error("ANS identity binding failed: {0}")]
+    IdentityBinding(String),
+
     // ── Merkle ──
     /// Merkle inclusion proof is structurally invalid.
     #[error("Merkle proof invalid: {0}")]

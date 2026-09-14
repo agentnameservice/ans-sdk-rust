@@ -49,6 +49,8 @@ pub enum EventType {
     AgentRegistered,
     /// Agent certificates were renewed.
     AgentRenewed,
+    /// Agent registration was updated.
+    AgentUpdated,
     /// AHP has marked this version for retirement.
     AgentDeprecated,
     /// Agent registration was revoked.
@@ -64,7 +66,7 @@ pub struct Badge {
     pub status: BadgeStatus,
     /// Badge payload containing the signed event.
     pub payload: BadgePayload,
-    /// Schema version (e.g., "V1").
+    /// Schema version (`V1` or `V2`).
     pub schema_version: String,
     /// Signature over the badge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,26 +92,58 @@ impl Badge {
         &self.payload.producer.event.agent.version
     }
 
-    /// Get the server certificate fingerprint.
+    /// Get the first server certificate fingerprint, or `""` if absent.
+    ///
+    /// Use [`Self::server_cert_fingerprints`] for verification: rotations
+    /// can publish more than one certificate.
     pub fn server_cert_fingerprint(&self) -> &str {
-        &self
-            .payload
-            .producer
-            .event
-            .attestations
-            .server_cert
-            .fingerprint
+        self.server_cert_fingerprints().next().unwrap_or("")
     }
 
-    /// Get the identity certificate fingerprint.
+    /// Get the first identity certificate fingerprint, or `""` if absent.
+    ///
+    /// Use [`Self::identity_cert_fingerprints`] for verification.
     pub fn identity_cert_fingerprint(&self) -> &str {
-        &self
-            .payload
-            .producer
-            .event
-            .attestations
-            .identity_cert
-            .fingerprint
+        self.identity_cert_fingerprints().next().unwrap_or("")
+    }
+
+    /// All server certificate fingerprints for this badge's schema.
+    pub fn server_cert_fingerprints(&self) -> impl Iterator<Item = &str> {
+        let attestations = &self.payload.producer.event.attestations;
+        self.cert_fingerprints(
+            &attestations.server_certs,
+            attestations.server_cert.as_ref(),
+        )
+    }
+
+    /// All identity certificate fingerprints for this badge's schema.
+    ///
+    /// Registrations without an Identity Certificate yield no entries.
+    pub fn identity_cert_fingerprints(&self) -> impl Iterator<Item = &str> {
+        let attestations = &self.payload.producer.event.attestations;
+        self.cert_fingerprints(
+            &attestations.identity_certs,
+            attestations.identity_cert.as_ref(),
+        )
+    }
+
+    fn cert_fingerprints<'a>(
+        &'a self,
+        certificates: &'a [CertAttestation],
+        legacy: Option<&'a CertAttestation>,
+    ) -> impl Iterator<Item = &'a str> {
+        // V2 uses only arrays: a stale singular field must not restore a
+        // certificate missing from the current array. Unknown schemas fail
+        // closed instead of inheriting V1 semantics.
+        let (certificates, legacy) = match self.schema_version.as_str() {
+            "V1" if certificates.is_empty() => (certificates, legacy),
+            "V1" | "V2" => (certificates, None),
+            _ => (&[][..], None),
+        };
+        certificates
+            .iter()
+            .chain(legacy)
+            .map(|cert| cert.fingerprint.as_str())
     }
 
     /// Get the agent ID (UUID).
@@ -167,8 +201,9 @@ pub struct AgentEvent {
     pub agent: AgentInfo,
     /// Certificate attestations.
     pub attestations: Attestations,
-    /// When this registration expires.
-    pub expires_at: DateTime<Utc>,
+    /// When this registration expires, if present in the sealed event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
     /// When this registration was issued.
     pub issued_at: DateTime<Utc>,
     /// Registration Authority ID.
@@ -184,6 +219,7 @@ pub struct AgentInfo {
     /// Agent's host FQDN.
     pub host: String,
     /// Human-readable agent name.
+    #[serde(default)]
     pub name: String,
     /// Agent version string.
     pub version: String,
@@ -194,12 +230,21 @@ pub struct AgentInfo {
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 pub struct Attestations {
-    /// Domain validation method used.
-    pub domain_validation: String,
-    /// Identity certificate attestation.
-    pub identity_cert: CertAttestation,
-    /// Server certificate attestation.
-    pub server_cert: CertAttestation,
+    /// Domain validation method, when this event includes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_validation: Option<String>,
+    /// Legacy V1 identity certificate, absent for server-only registrations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_cert: Option<CertAttestation>,
+    /// Legacy V1 server certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_cert: Option<CertAttestation>,
+    /// V2 identity certificates, including the rotation overlap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_certs: Vec<CertAttestation>,
+    /// V2 server certificates, including the rotation overlap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_certs: Vec<CertAttestation>,
 }
 
 /// Certificate attestation with fingerprint and type.

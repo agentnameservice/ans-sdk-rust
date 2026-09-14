@@ -29,7 +29,7 @@ mod sign;
 mod verify;
 
 pub use cache::{DEFAULT_ARTIFACT_CACHE_ENTRIES, VerifiedArtifactCache};
-pub use caller::{CallerIdentity, VerifyCallerOptions, verify_caller};
+pub use caller::{CallerIdentity, VerifyCallerOptions, verify_caller, verify_caller_with_content};
 pub use error::{PopError, PopErrorKind};
 pub use http::{
     DPOP_HEADER, access_token_from_authorization, attach_identity, attach_identity_with_content,

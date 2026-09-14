@@ -13,7 +13,7 @@ use std::time::Duration;
 use futures_util::future::join_all;
 
 use crate::cache::{BadgeCache, CacheConfig, CacheKey};
-use crate::dane::{DanePolicy, DaneVerificationResult, verify_dane};
+use crate::dane::{DanePolicy, DaneVerificationResult, verify_dane_cert};
 use crate::dns::{
     BadgeRecord, DnsLookupResult, DnsResolver, DnsResolverConfig, HickoryDnsResolver,
 };
@@ -21,8 +21,8 @@ use crate::error::{AnsError, AnsResult, DaneError, DnsError, TlogError, Verifica
 use crate::tlog::{HttpTransparencyLogClient, TransparencyLogClient};
 use ans_types::{AnsName, Badge, BadgeStatus, CertFingerprint, CryptoError, Fqdn, Version};
 
-/// Parsed certificate data: (Common Name, DNS SANs, URI SANs).
-type ParsedCertData = (Option<String>, Vec<String>, Vec<String>);
+/// Parsed certificate data: (Common Name, DNS SANs, URI SANs, `SubjectPublicKeyInfo` DER).
+type ParsedCertData = (Option<String>, Vec<String>, Vec<String>, Vec<u8>);
 
 /// Extracted identity information from a certificate.
 ///
@@ -42,6 +42,18 @@ pub struct CertIdentity {
     pub(crate) uri_sans: Vec<String>,
     /// Certificate fingerprint.
     pub(crate) fingerprint: CertFingerprint,
+    /// Full certificate DER, when the identity was built from one.
+    ///
+    /// Lets DANE evaluate TLSA records by their own selector and matching
+    /// type (RFC 6698) instead of assuming `3 0 1`. `None` for identities
+    /// built from a bare fingerprint, which then keep the fingerprint-only
+    /// comparison.
+    pub(crate) raw_der: Option<Vec<u8>>,
+    /// `SubjectPublicKeyInfo` DER (RFC 5280 §4.1.2.7), when known.
+    ///
+    /// The association data for TLSA selector 1, which survives certificate
+    /// renewal when the key pair is retained (RFC 7671 §5.1).
+    pub(crate) spki_der: Option<Vec<u8>>,
 }
 
 impl CertIdentity {
@@ -81,6 +93,8 @@ impl CertIdentity {
             dns_sans,
             uri_sans,
             fingerprint,
+            raw_der: None,
+            spki_der: None,
         }
     }
 
@@ -90,13 +104,15 @@ impl CertIdentity {
     /// Subject Alternative Names (DNS, URI) using x509-parser.
     pub fn from_der(der: &[u8]) -> Result<Self, CryptoError> {
         let fingerprint = CertFingerprint::from_der(der);
-        let (common_name, dns_sans, uri_sans) = Self::parse_cert_der(der)?;
+        let (common_name, dns_sans, uri_sans, spki_der) = Self::parse_cert_der(der)?;
 
         Ok(Self {
             common_name,
             dns_sans,
             uri_sans,
             fingerprint,
+            raw_der: Some(der.to_vec()),
+            spki_der: Some(spki_der),
         })
     }
 
@@ -110,7 +126,20 @@ impl CertIdentity {
             dns_sans: vec![cn],
             uri_sans: vec![],
             fingerprint,
+            raw_der: None,
+            spki_der: None,
         }
+    }
+
+    /// The full certificate DER, if this identity was built from one.
+    pub fn raw_der(&self) -> Option<&[u8]> {
+        self.raw_der.as_deref()
+    }
+
+    /// The certificate's `SubjectPublicKeyInfo` DER, if this identity was
+    /// built from a DER certificate.
+    pub fn spki_der(&self) -> Option<&[u8]> {
+        self.spki_der.as_deref()
     }
 
     /// Parse DER certificate to extract CN and SANs using x509-parser.
@@ -142,7 +171,12 @@ impl CertIdentity {
             }
         }
 
-        Ok((cn, dns_sans, uri_sans))
+        // Raw SubjectPublicKeyInfo DER — the TLSA selector-1 association
+        // data. x509-parser keeps the unparsed slice alongside the parsed
+        // structure precisely so callers can hash it.
+        let spki_der = cert.tbs_certificate.subject_pki.raw.to_vec();
+
+        Ok((cn, dns_sans, uri_sans, spki_der))
     }
 
     /// Get the FQDN from the certificate.
@@ -407,6 +441,9 @@ pub enum ScittTierPolicy {
     ///
     /// Only safe when 100% of peers support SCITT. `TokenExpired` is a
     /// hard failure under this policy (no badge fallback available).
+    /// A valid status token without a receipt still succeeds at
+    /// [`ans_types::VerificationTier::StatusTokenVerified`]. Applications
+    /// requiring an inclusion receipt must require the `FullScitt` tier.
     RequireScitt,
 
     /// Badge first, enhance with SCITT if headers present.
@@ -423,7 +460,7 @@ pub enum ScittTierPolicy {
 pub struct ScittConfig {
     /// How SCITT and badge verification interact.
     pub tier_policy: ScittTierPolicy,
-    /// Clock skew tolerance for status token expiry checks.
+    /// Clock skew tolerance for status token expiry checks, capped at ten minutes.
     pub clock_skew_tolerance: Duration,
 }
 
@@ -548,7 +585,13 @@ impl ServerVerifier {
     ///    (handles multi-version transitions where both versions are ACTIVE)
     /// 6. If still no match, refresh-on-mismatch (handles cert renewal)
     /// 7. Compare certificate CN to badge agent.host
+    /// 8. Enforce the configured DANE policy, including cache hits
     pub async fn verify(&self, fqdn: &Fqdn, server_cert: &CertIdentity) -> VerificationOutcome {
+        let outcome = self.verify_badge(fqdn, server_cert).await;
+        self.enforce_dane(fqdn, server_cert, outcome).await
+    }
+
+    async fn verify_badge(&self, fqdn: &Fqdn, server_cert: &CertIdentity) -> VerificationOutcome {
         tracing::info!(fqdn = %fqdn, "Starting server verification");
         tracing::debug!(
             cert_cn = ?server_cert.common_name,
@@ -584,6 +627,9 @@ impl ServerVerifier {
                 records
             }
             Ok(DnsLookupResult::NotFound) => {
+                if let Some(cache) = &self.cache {
+                    cache.invalidate_fqdn(fqdn).await;
+                }
                 tracing::warn!(fqdn = %fqdn, "No badge record found - not an ANS agent");
                 return VerificationOutcome::NotAnsAgent {
                     fqdn: fqdn.to_string(),
@@ -598,10 +644,18 @@ impl ServerVerifier {
         // Server certs don't contain version info. Try all badge records by
         // fingerprint to handle multi-version transitions where both versions
         // are ACTIVE (see AGENT_TO_AGENT_FLOW §5.3).
-        let outcome = self
-            .verify_against_records(&records, fqdn, server_cert)
-            .await;
+        self.verify_against_records(&records, fqdn, server_cert)
+            .await
+    }
 
+    /// DANE is an independent policy on every successful server check,
+    /// including cached/stale badges and SCITT outcomes (ANS-6 §5.3).
+    async fn enforce_dane(
+        &self,
+        fqdn: &Fqdn,
+        server_cert: &CertIdentity,
+        outcome: VerificationOutcome,
+    ) -> VerificationOutcome {
         if !outcome.is_success() {
             return outcome;
         }
@@ -668,7 +722,17 @@ impl ServerVerifier {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::debug!(url = %record.url, error = %e, "Failed to fetch badge, trying next");
-                    last_error = Some(AnsError::TransparencyLog(e));
+                    if !e.is_unavailable() {
+                        if let Some(cache) = &self.cache {
+                            cache.invalidate_fqdn(fqdn).await;
+                        }
+                        last_error = Some(AnsError::TransparencyLog(e));
+                    } else if !matches!(
+                        &last_error,
+                        Some(AnsError::TransparencyLog(previous)) if !previous.is_unavailable()
+                    ) {
+                        last_error = Some(AnsError::TransparencyLog(e));
+                    }
                     continue;
                 }
             };
@@ -740,13 +804,7 @@ impl ServerVerifier {
             .get_tlsa_records(fqdn, self.dane_port)
             .await?;
 
-        verify_dane(
-            &tlsa_records,
-            &cert.fingerprint,
-            self.dane_policy,
-            fqdn,
-            self.dane_port,
-        )
+        verify_dane_cert(&tlsa_records, cert, self.dane_policy, fqdn, self.dane_port)
     }
 
     /// Pre-fetch badges for caching (before TLS connection).
@@ -757,11 +815,21 @@ impl ServerVerifier {
         let records = match self.dns_resolver.lookup_badge(fqdn).await {
             Ok(DnsLookupResult::Found(records)) => records,
             Ok(DnsLookupResult::NotFound) => {
+                if let Some(cache) = &self.cache {
+                    cache.invalidate_fqdn(fqdn).await;
+                }
                 return Err(AnsError::Dns(DnsError::NotFound {
                     fqdn: fqdn.to_string(),
                 }));
             }
-            Err(e) => return Err(AnsError::Dns(e)),
+            Err(e) => {
+                if !e.is_unavailable()
+                    && let Some(cache) = &self.cache
+                {
+                    cache.invalidate_fqdn(fqdn).await;
+                }
+                return Err(AnsError::Dns(e));
+            }
         };
 
         // Sort by version descending (newest first)
@@ -806,6 +874,11 @@ impl ServerVerifier {
                     }
                 }
                 Err(e) => {
+                    if !e.is_unavailable()
+                        && let Some(cache) = &self.cache
+                    {
+                        cache.invalidate_fqdn(fqdn).await;
+                    }
                     last_error = Some(e);
                 }
             }
@@ -990,7 +1063,16 @@ impl ServerVerifier {
             "Comparing certificate fingerprints"
         );
 
-        if !cert.fingerprint.matches(expected_fp) {
+        let fingerprint_matches = if is_server {
+            badge
+                .server_cert_fingerprints()
+                .any(|fp| cert.fingerprint.matches(fp))
+        } else {
+            badge
+                .identity_cert_fingerprints()
+                .any(|fp| cert.fingerprint.matches(fp))
+        };
+        if !fingerprint_matches {
             tracing::error!(
                 expected = %expected_fp,
                 actual = %cert.fingerprint,
@@ -1066,7 +1148,10 @@ impl ServerVerifier {
         // post-revocation state — not a lookup failure. Reject without
         // consulting the cache: fail-open-with-cache applies to an
         // unreachable TL, never to a record that is affirmatively gone.
-        if matches!(error, DnsError::NotFound { .. }) {
+        if !error.is_unavailable() {
+            if let Some(cache) = &self.cache {
+                cache.invalidate_fqdn(fqdn).await;
+            }
             return VerificationOutcome::DnsError(error);
         }
         match self.failure_policy {
@@ -1094,9 +1179,15 @@ impl ServerVerifier {
         fqdn: &Fqdn,
         cert: &CertIdentity,
     ) -> VerificationOutcome {
-        // ANS-6 §9.1: a wrapped NXDOMAIN is equally determinate — no cache.
-        if let AnsError::Dns(e @ DnsError::NotFound { .. }) = error {
-            return VerificationOutcome::DnsError(e);
+        // ANS-6 §9: only an indeterminate outage permits stale evidence.
+        // Keep rejection sticky across a later outage by removing old state.
+        let may_use_stale = match &error {
+            AnsError::Dns(e) => e.is_unavailable(),
+            AnsError::TransparencyLog(e) => e.is_unavailable(),
+            _ => false,
+        };
+        if !may_use_stale && let Some(cache) = &self.cache {
+            cache.invalidate_fqdn(fqdn).await;
         }
         match self.failure_policy {
             FailurePolicy::FailClosed => match error {
@@ -1122,7 +1213,7 @@ impl ServerVerifier {
                 }
             },
             FailurePolicy::FailOpenWithCache { max_staleness } => {
-                if let Some(cache) = &self.cache {
+                if may_use_stale && let Some(cache) = &self.cache {
                     for cached in cache.get_all_for_fqdn_allow_stale(fqdn).await {
                         if cached.fetched_at.elapsed() < max_staleness {
                             let outcome =
@@ -1398,6 +1489,13 @@ impl ClientVerifier {
                 record
             }
             Ok(None) => {
+                // The requested version is no longer published. Do not keep
+                // its old positive state if a subsequent lookup times out.
+                if let Some(cache) = &self.cache {
+                    cache
+                        .invalidate(&CacheKey::fqdn_version(&fqdn, &version))
+                        .await;
+                }
                 tracing::debug!("No badge for specific version, trying preferred badge");
                 // Try to find any badge
                 match self.dns_resolver.find_preferred_badge(&fqdn).await {
@@ -1406,6 +1504,9 @@ impl ClientVerifier {
                         record
                     }
                     Ok(None) => {
+                        if let Some(cache) = &self.cache {
+                            cache.invalidate_fqdn(&fqdn).await;
+                        }
                         tracing::warn!(fqdn = %fqdn, "No badge record found - not an ANS agent");
                         return VerificationOutcome::NotAnsAgent {
                             fqdn: fqdn.to_string(),
@@ -1500,7 +1601,10 @@ impl ClientVerifier {
             "Comparing identity certificate fingerprints"
         );
 
-        if !cert.fingerprint.matches(expected_fp) {
+        if !badge
+            .identity_cert_fingerprints()
+            .any(|fp| cert.fingerprint.matches(fp))
+        {
             tracing::error!(
                 expected = %expected_fp,
                 actual = %cert.fingerprint,
@@ -1639,7 +1743,10 @@ impl ClientVerifier {
     ) -> VerificationOutcome {
         // ANS-6 §9.1/§6.6: NXDOMAIN is determinate — possibly post-revocation.
         // Reject without consulting the cache.
-        if matches!(error, DnsError::NotFound { .. }) {
+        if !error.is_unavailable() {
+            if let Some(cache) = &self.cache {
+                cache.invalidate_fqdn(fqdn).await;
+            }
             return VerificationOutcome::DnsError(error);
         }
         match self.failure_policy {
@@ -1664,6 +1771,12 @@ impl ClientVerifier {
         cert: &CertIdentity,
         ans_name: &AnsName,
     ) -> VerificationOutcome {
+        if !error.is_unavailable() {
+            if let Some(cache) = &self.cache {
+                cache.invalidate_fqdn(fqdn).await;
+            }
+            return VerificationOutcome::TlogError(error);
+        }
         match self.failure_policy {
             FailurePolicy::FailClosed => VerificationOutcome::TlogError(error),
             FailurePolicy::FailOpenWithCache { max_staleness } => {
@@ -1901,8 +2014,9 @@ impl AnsVerifier {
     ///
     /// This implements the SCITT verification flow:
     /// 1. If SCITT headers are present, verify status token signature + expiry + cert fingerprint
-    /// 2. If receipt is also present, verify Merkle inclusion proof → `FullScitt` tier
+    /// 2. If receipt is also present, verify its signature, Merkle proof, and peer binding
     /// 3. If headers are absent, fall back to badge-based verification (per `ScittTierPolicy`)
+    /// 4. Enforce the configured DANE policy, including SCITT and badge cache hits
     ///
     /// **Present headers are final**: if SCITT headers are present but
     /// invalid/expired/corrupt, the result is a hard reject — badge
@@ -1990,10 +2104,11 @@ impl AnsVerifier {
                     // Any SCITT failure when headers are present = hard reject.
                     // Present-but-corrupt headers must never fall back to badge.
                     Some(outcome) => outcome,
-                    // None = no status token in headers (shouldn't happen since
-                    // we checked !headers.is_empty() above, but defensively
-                    // return the badge outcome).
-                    None => badge_outcome,
+                    None => VerificationOutcome::ScittError(
+                        crate::scitt::ScittError::MissingTokenField(
+                            "SCITT headers present without a status token".into(),
+                        ),
+                    ),
                 }
             }
         }
@@ -2062,7 +2177,11 @@ impl AnsVerifier {
                         }
                     }
                     Some(outcome) => outcome, // present-but-corrupt = reject
-                    None => badge_outcome,
+                    None => VerificationOutcome::ScittError(
+                        crate::scitt::ScittError::MissingTokenField(
+                            "SCITT headers present without a status token".into(),
+                        ),
+                    ),
                 }
             }
         }
@@ -2097,7 +2216,7 @@ impl AnsVerifier {
 
         // Headers are present — SCITT result is final, no badge fallback.
         let scitt_cache = self.scitt_verification_cache.as_deref();
-        match Self::try_scitt_verification(
+        let outcome = match Self::try_scitt_verification(
             server_cert,
             headers,
             key_store,
@@ -2115,7 +2234,10 @@ impl AnsVerifier {
                     "SCITT headers present but no valid status token found".to_string(),
                 ))
             }
-        }
+        };
+        self.server_verifier
+            .enforce_dane(fqdn, server_cert, outcome)
+            .await
     }
 
     /// SCITT-first client verification with optional badge fallback
@@ -2210,7 +2332,12 @@ impl AnsVerifier {
                 .await
         {
             tracing::debug!("SCITT verification cache hit (Layer 2 — full outcome)");
-            if let Some(e) = Self::check_dialed_host(&outcome.verified_token.payload, dialed_host) {
+            if let Some(e) = Self::check_scitt_certificate(
+                cert,
+                &outcome.verified_token.payload,
+                is_server,
+                dialed_host,
+            ) {
                 return Some(e);
             }
             return Some(VerificationOutcome::ScittVerified {
@@ -2276,30 +2403,10 @@ impl AnsVerifier {
             vt
         };
 
-        // ── Fingerprint comparison (always, cheap) ──────────────────────
-        let fingerprint_matches = if is_server {
-            crate::scitt::matches_server_cert(&verified_token.payload, cert.fingerprint())
-        } else {
-            crate::scitt::matches_identity_cert(&verified_token.payload, cert.fingerprint())
-        };
-
-        if !fingerprint_matches {
-            return Some(VerificationOutcome::ScittError(
-                crate::scitt::ScittError::MissingTokenField(format!(
-                    "Certificate fingerprint {} not found in status token's {} cert list ({} entries)",
-                    cert.fingerprint(),
-                    if is_server { "server" } else { "identity" },
-                    if is_server {
-                        verified_token.payload.valid_server_certs.len()
-                    } else {
-                        verified_token.payload.valid_identity_certs.len()
-                    }
-                )),
-            ));
-        }
-
-        // ── Dialed-host anchor (server verification, ANS-6 §5.2) ────────
-        if let Some(e) = Self::check_dialed_host(&verified_token.payload, dialed_host) {
+        // Certificate role and peer names are checked on cache hits too.
+        if let Some(e) =
+            Self::check_scitt_certificate(cert, &verified_token.payload, is_server, dialed_host)
+        {
             return Some(e);
         }
 
@@ -2317,33 +2424,52 @@ impl AnsVerifier {
                 ));
             };
 
-            if let Some(_cached_receipt) = match cache {
+            let receipt = if let Some(cached_receipt) = match cache {
                 Some(c) => c.get_verified_receipt(rh).await,
                 None => None,
             } {
                 tracing::debug!("SCITT receipt cache hit (Layer 1 — skipping Merkle)");
-                ans_types::VerificationTier::FullScitt
+                cached_receipt
             } else {
                 // Full receipt verification — needs a key store snapshot
                 let snapshot = key_store.current_snapshot().await;
-                match crate::scitt::verify_receipt(receipt_bytes, &snapshot) {
-                    Ok(receipt) => {
-                        tracing::debug!("SCITT receipt verified — FullScitt tier");
-                        if let Some(cache) = cache {
-                            cache.insert_verified_receipt(*rh, Arc::new(receipt)).await;
+                let mut result = crate::scitt::verify_receipt(receipt_bytes, &snapshot);
+                if matches!(result, Err(crate::scitt::ScittError::UnknownKeyId(_))) {
+                    match key_store.refresh_if_cooldown_elapsed().await {
+                        Ok(true) => {
+                            let refreshed_snapshot = key_store.current_snapshot().await;
+                            result =
+                                crate::scitt::verify_receipt(receipt_bytes, &refreshed_snapshot);
                         }
-                        ans_types::VerificationTier::FullScitt
-                    }
-                    Err(e) => {
-                        if matches!(config.tier_policy, ScittTierPolicy::RequireScitt) {
-                            tracing::error!(error = %e, "Receipt verification failed under RequireScitt — rejecting");
-                            return Some(VerificationOutcome::ScittError(e));
-                        }
-                        tracing::warn!(error = %e, "Receipt verification failed — StatusTokenVerified tier");
-                        ans_types::VerificationTier::StatusTokenVerified
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(%error, "Receipt key refresh failed"),
                     }
                 }
+                match result {
+                    Ok(receipt) => {
+                        tracing::debug!("SCITT receipt verified — FullScitt tier");
+                        let receipt = Arc::new(receipt);
+                        if let Some(cache) = cache {
+                            cache.insert_verified_receipt(*rh, receipt.clone()).await;
+                        }
+                        receipt
+                    }
+                    Err(e) => {
+                        // ANS-6 §9.7: present, failed evidence never causes
+                        // a downgrade to status-token-only verification.
+                        return Some(VerificationOutcome::ScittError(e));
+                    }
+                }
+            };
+            let expected_host = if is_server { dialed_host } else { cert.fqdn() };
+            if let Err(e) = crate::scitt::bind_receipt_to_status(
+                &receipt,
+                &verified_token.payload,
+                expected_host,
+            ) {
+                return Some(VerificationOutcome::ScittError(e));
             }
+            ans_types::VerificationTier::FullScitt
         } else {
             ans_types::VerificationTier::StatusTokenVerified
         };
@@ -2371,6 +2497,55 @@ impl AnsVerifier {
             matched_fingerprint: cert.fingerprint().clone(),
             badge: None,
         })
+    }
+
+    #[cfg(feature = "scitt")]
+    fn check_scitt_certificate(
+        cert: &CertIdentity,
+        payload: &ans_types::StatusTokenPayload,
+        is_server: bool,
+        dialed_host: Option<&str>,
+    ) -> Option<VerificationOutcome> {
+        let matches = if is_server {
+            crate::scitt::matches_server_cert(payload, cert.fingerprint())
+        } else {
+            crate::scitt::matches_identity_cert(payload, cert.fingerprint())
+        };
+        if !matches {
+            return Some(VerificationOutcome::ScittError(
+                crate::scitt::ScittError::MissingTokenField(format!(
+                    "Certificate fingerprint {} not found in status token's {} cert list",
+                    cert.fingerprint(),
+                    if is_server { "server" } else { "identity" },
+                )),
+            ));
+        }
+        if !is_server {
+            let Some(name) = cert.ans_name() else {
+                return Some(VerificationOutcome::CertError(CryptoError::NoUriSan));
+            };
+            if !name
+                .to_string()
+                .eq_ignore_ascii_case(&payload.ans_name.to_string())
+            {
+                return Some(VerificationOutcome::ScittError(
+                    crate::scitt::ScittError::IdentityBinding(
+                        "client URI SAN does not match status token ansName".into(),
+                    ),
+                ));
+            }
+            if !cert
+                .fqdn()
+                .is_some_and(|host| host.eq_ignore_ascii_case(payload.ans_name.fqdn().as_str()))
+            {
+                return Some(VerificationOutcome::ScittError(
+                    crate::scitt::ScittError::IdentityBinding(
+                        "client DNS name does not match status token ansName host".into(),
+                    ),
+                ));
+            }
+        }
+        Self::check_dialed_host(payload, dialed_host)
     }
 
     /// ANS-6 §5.2: for server verification, the status token's `ansName`
@@ -2792,6 +2967,8 @@ mod tests {
             dns_sans: vec![cn.to_string()],
             uri_sans: vec![],
             fingerprint: CertFingerprint::parse(fingerprint).unwrap(),
+            raw_der: None,
+            spki_der: None,
         }
     }
 
@@ -3037,6 +3214,8 @@ mod tests {
             dns_sans: vec![host.to_string()],
             uri_sans: vec![format!("ans://{}.{}", version, host)],
             fingerprint: CertFingerprint::parse(fingerprint).unwrap(),
+            raw_der: None,
+            spki_der: None,
         }
     }
 
@@ -3095,6 +3274,8 @@ mod tests {
                 "SHA256:e7b64d16f42055d6faf382a43dc35b98be76aba0db145a904b590a034b33b904",
             )
             .unwrap(),
+            raw_der: None,
+            spki_der: None,
         };
 
         let outcome = verifier.verify(&cert).await;
@@ -3123,6 +3304,8 @@ mod tests {
                 "SHA256:e7b64d16f42055d6faf382a43dc35b98be76aba0db145a904b590a034b33b904",
             )
             .unwrap(),
+            raw_der: None,
+            spki_der: None,
         };
 
         let outcome = verifier.verify(&cert).await;
@@ -5103,6 +5286,8 @@ mod tests {
                 dns_sans: vec!["agent.example.com".to_string()],
                 uri_sans: vec!["ans://v1.0.0.agent.example.com".to_string()],
                 fingerprint: CertFingerprint::parse(&identity_fp).unwrap(),
+                raw_der: None,
+                spki_der: None,
             };
             let headers = ScittHeaders::new(None, None);
 
@@ -5133,6 +5318,8 @@ mod tests {
                 dns_sans: vec![],
                 uri_sans: vec!["ans://v1.0.0.agent.example.com".to_string()],
                 fingerprint: CertFingerprint::parse(&identity_fp).unwrap(),
+                raw_der: None,
+                spki_der: None,
             };
             let headers = ScittHeaders::new(None, None);
 
@@ -5160,6 +5347,8 @@ mod tests {
                 dns_sans: vec!["agent.example.com".to_string()],
                 uri_sans: vec!["ans://v1.0.0.agent.example.com".to_string()],
                 fingerprint: CertFingerprint::parse(&identity_fp).unwrap(),
+                raw_der: None,
+                spki_der: None,
             };
             let headers = ScittHeaders::from_base64(None, Some(&token_b64)).unwrap();
 

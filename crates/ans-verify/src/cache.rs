@@ -178,19 +178,30 @@ impl BadgeCache {
 
     /// Insert a badge into the cache.
     pub async fn insert(&self, key: CacheKey, badge: Badge) {
-        let cached = CachedBadge::new(badge, self.config.default_ttl);
-        self.cache.insert(key, cached).await;
+        self.insert_with_ttl(key, badge, self.config.default_ttl)
+            .await;
     }
 
     /// Insert a badge with a custom soft TTL.
     ///
     /// The soft TTL controls when [`CachedBadge::is_valid`] returns false (i.e., when
     /// reads treat the entry as stale). The underlying moka cache still uses the
-    /// global `default_ttl` for hard eviction. This means entries may be filtered out
+    /// global `hard_ttl` for hard eviction. This means entries may be filtered out
     /// by `is_valid()` before moka evicts them.
     pub async fn insert_with_ttl(&self, key: CacheKey, badge: Badge, ttl: Duration) {
         let cached = CachedBadge::new(badge, ttl);
-        self.cache.insert(key, cached).await;
+        if let CacheKey::FqdnVersion(fqdn, version) = &key {
+            // Serialize indexed insertion with host invalidation. Every
+            // version-keyed insertion participates, including the generic API.
+            let mut index = self.version_index.write().await;
+            let versions = index.entry(fqdn.to_ascii_lowercase()).or_default();
+            if !versions.contains(version) {
+                versions.push(version.clone());
+            }
+            self.cache.insert(key, cached).await;
+        } else {
+            self.cache.insert(key, cached).await;
+        }
     }
 
     /// Invalidate a cache entry.
@@ -252,13 +263,6 @@ impl BadgeCache {
     ) {
         self.insert_with_ttl(CacheKey::fqdn_version(fqdn, version), badge, ttl)
             .await;
-
-        let key = fqdn.as_str().to_lowercase();
-        let mut index = self.version_index.write().await;
-        let versions = index.entry(key).or_default();
-        if !versions.contains(version) {
-            versions.push(version.clone());
-        }
     }
 
     /// Get all cached badges for an FQDN across all known versions.
@@ -315,11 +319,18 @@ impl BadgeCache {
     /// Set the known versions for an FQDN from DNS records.
     ///
     /// Called after DNS lookup to pre-populate the version index with all
-    /// discovered versions, even before badges are fetched.
+    /// discovered versions, even before badges are fetched. Removed versions
+    /// are invalidated so a client cannot reuse them through a direct lookup.
     pub async fn set_version_index(&self, fqdn: &Fqdn, versions: Vec<Version>) {
         let key = fqdn.as_str().to_lowercase();
         let mut index = self.version_index.write().await;
-        index.insert(key, versions);
+        if let Some(previous) = index.insert(key, versions.clone()) {
+            for removed in previous.iter().filter(|v| !versions.contains(v)) {
+                self.cache
+                    .invalidate(&CacheKey::fqdn_version(fqdn, removed))
+                    .await;
+            }
+        }
     }
 }
 
@@ -415,6 +426,55 @@ mod tests {
             .invalidate(&CacheKey::fqdn_version(&fqdn, &version))
             .await;
         assert!(cache.get_by_fqdn_version(&fqdn, &version).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn host_invalidation_clears_generic_version_insertions() {
+        let cache = BadgeCache::with_defaults();
+        let fqdn = Fqdn::new("test.example.com").unwrap();
+        let v1 = Version::new(1, 0, 0);
+        let v2 = Version::new(2, 0, 0);
+        cache
+            .insert(CacheKey::fqdn_version(&fqdn, &v1), create_test_badge())
+            .await;
+        cache
+            .insert_with_ttl(
+                CacheKey::fqdn_version(&fqdn, &v2),
+                create_test_badge_versioned("v2.0.0"),
+                Duration::ZERO,
+            )
+            .await;
+
+        cache.invalidate_fqdn(&fqdn).await;
+        for version in [&v1, &v2] {
+            assert!(
+                cache
+                    .get_by_fqdn_version_allow_stale(&fqdn, version)
+                    .await
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn removed_dns_versions_cannot_be_reused_by_direct_lookup() {
+        let cache = BadgeCache::with_defaults();
+        let fqdn = Fqdn::new("test.example.com").unwrap();
+        let v1 = Version::new(1, 0, 0);
+        let v2 = Version::new(2, 0, 0);
+        for version in [&v1, &v2] {
+            cache
+                .insert_for_fqdn_version(&fqdn, version, create_test_badge())
+                .await;
+        }
+        cache.set_version_index(&fqdn, vec![v2.clone()]).await;
+        assert!(
+            cache
+                .get_by_fqdn_version_allow_stale(&fqdn, &v1)
+                .await
+                .is_none()
+        );
+        assert!(cache.get_by_fqdn_version(&fqdn, &v2).await.is_some());
     }
 
     #[tokio::test]

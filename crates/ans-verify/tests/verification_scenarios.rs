@@ -149,6 +149,89 @@ async fn client_verifier_with_cache(
         .unwrap()
 }
 
+#[tokio::test]
+async fn ans6_v2_badges_accept_every_rotating_certificate() {
+    let host = "agent.example.com";
+    let mut value = serde_json::to_value(badge(host, "v1.0.0", SERVER_FP, IDENTITY_FP)).unwrap();
+    value["schemaVersion"] = serde_json::json!("V2");
+    let event = &mut value["payload"]["producer"]["event"];
+    event["eventType"] = serde_json::json!("AGENT_UPDATED");
+    event.as_object_mut().unwrap().remove("expiresAt");
+    event["agent"].as_object_mut().unwrap().remove("name");
+    event["attestations"] = serde_json::json!({
+        "serverCerts": [
+            {"fingerprint": WRONG_FP, "type": "X509-DV-SERVER"},
+            {"fingerprint": SERVER_FP, "type": "X509-DV-SERVER"}
+        ],
+        "identityCerts": [
+            {"fingerprint": WRONG_FP, "type": "X509-OV-CLIENT"},
+            {"fingerprint": IDENTITY_FP, "type": "X509-OV-CLIENT"}
+        ]
+    });
+    let b: Badge = serde_json::from_value(value).expect("valid V2 rotation badge");
+    let dns = Arc::new(MockDnsResolver::new().with_records(
+        host,
+        vec![dns_record(Some(Version::new(1, 0, 0)), BADGE_URL_V1)],
+    ));
+    let tlog = Arc::new(MockTransparencyLogClient::new().with_badge(BADGE_URL_V1, b));
+    let server = server_verifier_with_cache(dns.clone(), tlog.clone()).await;
+    let client = client_verifier_with_cache(dns, tlog).await;
+    for fp in [WRONG_FP, SERVER_FP] {
+        assert!(
+            server
+                .verify(&Fqdn::new(host).unwrap(), &server_cert(host, fp))
+                .await
+                .is_success()
+        );
+    }
+    for fp in [WRONG_FP, IDENTITY_FP] {
+        assert!(
+            client
+                .verify(&mtls_cert(host, "v1.0.0", fp))
+                .await
+                .is_success()
+        );
+    }
+}
+
+#[tokio::test]
+async fn ans6_badges_without_identity_certs_are_server_only() {
+    let host = "agent.example.com";
+    for schema in ["V1", "V2"] {
+        let mut value =
+            serde_json::to_value(badge(host, "v1.0.0", SERVER_FP, IDENTITY_FP)).unwrap();
+        value["schemaVersion"] = serde_json::json!(schema);
+        let attestations = &mut value["payload"]["producer"]["event"]["attestations"];
+        attestations.as_object_mut().unwrap().remove("identityCert");
+        if schema == "V2" {
+            attestations.as_object_mut().unwrap().remove("serverCert");
+            attestations["serverCerts"] = serde_json::json!([
+                {"fingerprint": SERVER_FP, "type": "X509-DV-SERVER"}
+            ]);
+        }
+        let b: Badge = serde_json::from_value(value).expect("valid server-only registration");
+        let dns = Arc::new(MockDnsResolver::new().with_records(
+            host,
+            vec![dns_record(Some(Version::new(1, 0, 0)), BADGE_URL_V1)],
+        ));
+        let tlog = Arc::new(MockTransparencyLogClient::new().with_badge(BADGE_URL_V1, b));
+        let server = server_verifier(dns.clone(), tlog.clone()).await;
+        let client = client_verifier(dns, tlog).await;
+        assert!(
+            server
+                .verify(&Fqdn::new(host).unwrap(), &server_cert(host, SERVER_FP))
+                .await
+                .is_success()
+        );
+        assert!(
+            !client
+                .verify(&mtls_cert(host, "v1.0.0", IDENTITY_FP))
+                .await
+                .is_success()
+        );
+    }
+}
+
 // =========================================================================
 // §1 DNS Badge Record Resolution
 // =========================================================================
@@ -471,8 +554,8 @@ async fn test_2_6_tlog_unreachable_fail_closed() {
 ///
 /// The cached badge is inserted past its freshness TTL so the normal cache
 /// path skips it and verification reaches DNS; the badge is then available
-/// only to the fail-open fallback, which must decline it for NXDOMAIN and
-/// use it for SERVFAIL.
+/// only to the fail-open fallback. Once DNS reports removal, a later outage
+/// must not restore the rejected positive state.
 #[tokio::test]
 async fn test_9_1_nxdomain_rejects_despite_cached_badge() {
     let host = "agent.example.com";
@@ -511,8 +594,7 @@ async fn test_9_1_nxdomain_rejects_despite_cached_badge() {
         "Expected NXDOMAIN rejection, got: {outcome:?}"
     );
 
-    // Contrast: an indeterminate failure on the same verifier does use the
-    // stale cached badge under fail-open-with-cache.
+    // Later indeterminate failures cannot resurrect the removed badge.
     dns.set_error(
         host,
         DnsError::LookupFailed {
@@ -522,14 +604,14 @@ async fn test_9_1_nxdomain_rejects_despite_cached_badge() {
     );
     let outcome = verifier.verify(&fqdn, &server_cert(host, SERVER_FP)).await;
     assert!(
-        outcome.is_success(),
-        "Expected cached-badge success on SERVFAIL, got: {outcome:?}"
+        !outcome.is_success(),
+        "SERVFAIL resurrected a badge removed by NXDOMAIN: {outcome:?}"
     );
 }
 
 /// ANS-6 §9.1/§6.6, client side: `find_badge_for_version` surfaces NXDOMAIN
 /// as a DNS error, which must reject even under fail-open-with-cache. The
-/// same stale cached badge does serve an indeterminate SERVFAIL.
+/// stale cached badge must remain rejected during a later SERVFAIL.
 #[tokio::test]
 async fn test_9_1_client_nxdomain_rejects_despite_cached_badge() {
     let host = "client.example.com";
@@ -569,7 +651,7 @@ async fn test_9_1_client_nxdomain_rejects_despite_cached_badge() {
         "Expected NXDOMAIN rejection, got: {outcome:?}"
     );
 
-    // Contrast: SERVFAIL on the same verifier uses the stale cached badge.
+    // The negative observation invalidated the earlier positive state.
     dns.set_error(
         host,
         DnsError::LookupFailed {
@@ -579,9 +661,214 @@ async fn test_9_1_client_nxdomain_rejects_despite_cached_badge() {
     );
     let outcome = verifier.verify(&cert).await;
     assert!(
-        outcome.is_success(),
-        "Expected cached-badge success on SERVFAIL, got: {outcome:?}"
+        !outcome.is_success(),
+        "SERVFAIL resurrected a badge removed by NXDOMAIN: {outcome:?}"
     );
+}
+
+async fn cached_failure_verifiers(
+    dns: Arc<MockDnsResolver>,
+    tlog: Arc<dyn TransparencyLogClient>,
+) -> (ServerVerifier, ClientVerifier) {
+    let fqdn = Fqdn::new("agent.example.com").unwrap();
+    let cache = Arc::new(BadgeCache::with_defaults());
+    cache
+        .insert_for_fqdn_version_with_ttl(
+            &fqdn,
+            &Version::new(1, 0, 0),
+            badge(fqdn.as_str(), "v1.0.0", SERVER_FP, IDENTITY_FP),
+            Duration::ZERO,
+        )
+        .await;
+    let policy = FailurePolicy::FailOpenWithCache {
+        max_staleness: Duration::from_secs(600),
+    };
+    let server = ServerVerifier::builder()
+        .dns_resolver(dns.clone())
+        .tlog_client(tlog.clone())
+        .cache(cache.clone())
+        .trusted_ra_domains(["127.0.0.1", "tlog.example.com"])
+        .failure_policy(policy)
+        .build()
+        .await
+        .unwrap();
+    let client = ClientVerifier::builder()
+        .dns_resolver(dns)
+        .tlog_client(tlog)
+        .cache(cache)
+        .trusted_ra_domains(["127.0.0.1", "tlog.example.com"])
+        .failure_policy(policy)
+        .build()
+        .await
+        .unwrap();
+    (server, client)
+}
+
+async fn verify_cached_peer(
+    server: &ServerVerifier,
+    client: &ClientVerifier,
+    is_server: bool,
+) -> VerificationOutcome {
+    if is_server {
+        server
+            .verify(
+                &Fqdn::new("agent.example.com").unwrap(),
+                &server_cert("agent.example.com", SERVER_FP),
+            )
+            .await
+    } else {
+        client
+            .verify(&mtls_cert("agent.example.com", "v1.0.0", IDENTITY_FP))
+            .await
+    }
+}
+
+#[tokio::test]
+async fn fail_open_only_uses_stale_badges_for_indeterminate_dns_failures() {
+    for is_server in [true, false] {
+        for error in [
+            DnsError::Timeout {
+                fqdn: "agent.example.com".into(),
+            },
+            DnsError::LookupFailed {
+                fqdn: "agent.example.com".into(),
+                reason: "SERVFAIL".into(),
+            },
+        ] {
+            let dns = Arc::new(MockDnsResolver::new().with_error("agent.example.com", error));
+            let (server, client) =
+                cached_failure_verifiers(dns, Arc::new(MockTransparencyLogClient::new())).await;
+            assert!(
+                verify_cached_peer(&server, &client, is_server)
+                    .await
+                    .is_success()
+            );
+        }
+
+        for error in [
+            DnsError::DnssecFailed {
+                fqdn: "agent.example.com".into(),
+            },
+            DnsError::InvalidFormat {
+                record: "malformed badge record".into(),
+            },
+            DnsError::ResolverError("invalid configuration".into()),
+        ] {
+            let dns = Arc::new(MockDnsResolver::new().with_error("agent.example.com", error));
+            let (server, client) =
+                cached_failure_verifiers(dns.clone(), Arc::new(MockTransparencyLogClient::new()))
+                    .await;
+            let outcome = verify_cached_peer(&server, &client, is_server).await;
+            assert!(!outcome.is_success(), "server={is_server}: {outcome:?}");
+
+            dns.set_error(
+                "agent.example.com",
+                DnsError::Timeout {
+                    fqdn: "agent.example.com".into(),
+                },
+            );
+            assert!(
+                !verify_cached_peer(&server, &client, is_server)
+                    .await
+                    .is_success(),
+                "later timeout restored rejected DNS state; server={is_server}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn dns_absence_then_outage_does_not_resurrect_stale_badges() {
+    for is_server in [true, false] {
+        // No configured records returns Ok(NotFound), distinct from the
+        // DnsError::NotFound path exercised above.
+        let dns = Arc::new(MockDnsResolver::new());
+        let (server, client) =
+            cached_failure_verifiers(dns.clone(), Arc::new(MockTransparencyLogClient::new())).await;
+        assert!(
+            !verify_cached_peer(&server, &client, is_server)
+                .await
+                .is_success()
+        );
+        dns.set_error(
+            "agent.example.com",
+            DnsError::Timeout {
+                fqdn: "agent.example.com".into(),
+            },
+        );
+        assert!(
+            !verify_cached_peer(&server, &client, is_server)
+                .await
+                .is_success(),
+            "timeout restored a DNS-absent badge; server={is_server}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fail_open_rejects_adverse_tlog_responses_and_later_outages() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mut revoked =
+        serde_json::to_value(badge("agent.example.com", "v1.0.0", SERVER_FP, IDENTITY_FP)).unwrap();
+    revoked["status"] = serde_json::json!("REVOKED");
+    revoked["payload"]["producer"]["event"]["eventType"] = serde_json::json!("AGENT_REVOKED");
+    // The producer's revocation event has certificate arrays and no
+    // domain-validation or legacy singular certificate fields.
+    revoked["payload"]["producer"]["event"]["attestations"] = serde_json::json!({
+        "dnsRecordsProvisioned": [],
+        "serverCerts": [{"fingerprint": SERVER_FP, "type": "X509-DV-SERVER"}],
+        "identityCerts": [{"fingerprint": IDENTITY_FP, "type": "X509-OV-CLIENT"}]
+    });
+    let mut v2_revoked = revoked.clone();
+    v2_revoked["schemaVersion"] = serde_json::json!("V2");
+    let cases = [
+        ("not found", ResponseTemplate::new(404)),
+        (
+            "malformed JSON",
+            ResponseTemplate::new(200).set_body_string("{"),
+        ),
+        (
+            "V1 revoked",
+            ResponseTemplate::new(200).set_body_json(&revoked),
+        ),
+        (
+            "V2 revoked",
+            ResponseTemplate::new(200).set_body_json(&v2_revoked),
+        ),
+    ];
+    for is_server in [true, false] {
+        for (label, response) in &cases {
+            let http = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(response.clone())
+                .mount(&http)
+                .await;
+            let dns = Arc::new(MockDnsResolver::new().with_records(
+                "agent.example.com",
+                vec![dns_record(Some(Version::new(1, 0, 0)), &http.uri())],
+            ));
+            let (server, client) =
+                cached_failure_verifiers(dns, Arc::new(HttpTransparencyLogClient::new())).await;
+            let outcome = verify_cached_peer(&server, &client, is_server).await;
+            assert!(
+                !outcome.is_success(),
+                "{label}, server={is_server}: {outcome:?}"
+            );
+
+            http.reset().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&http)
+                .await;
+            let later = verify_cached_peer(&server, &client, is_server).await;
+            assert!(
+                !later.is_success(),
+                "outage after {label}, server={is_server}: {later:?}"
+            );
+        }
+    }
 }
 
 /// §2.6 Transparency log unreachable + FailOpenWithCache → uses cached badge.
@@ -1515,6 +1802,7 @@ async fn test_7_2_dane_tlsa_mismatch() {
         .dns_resolver(dns as Arc<dyn DnsResolver>)
         .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
         .with_dane_if_present()
+        .with_cache()
         .build()
         .await
         .unwrap();
@@ -1527,6 +1815,16 @@ async fn test_7_2_dane_tlsa_mismatch() {
         matches!(outcome, VerificationOutcome::DaneError(_)),
         "DANE mismatch should reject, got: {:?}",
         outcome
+    );
+
+    // The badge was valid and cached even though DANE rejected the first
+    // connection. It must not bypass the configured policy on the next one.
+    let cached = verifier
+        .verify(&Fqdn::new(host).unwrap(), &server_cert(host, SERVER_FP))
+        .await;
+    assert!(
+        matches!(cached, VerificationOutcome::DaneError(_)),
+        "cached badge bypassed DANE: {cached:?}"
     );
 }
 
