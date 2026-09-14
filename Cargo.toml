@@ -24,7 +24,7 @@ ans-client = { path = "crates/ans-client", version = "0.1.5" }
 tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 
 # TLS
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = "0.26"
 rustls-pki-types = { version = "1.15", features = ["std"] }
 
