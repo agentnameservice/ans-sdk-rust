@@ -61,10 +61,16 @@ cargo clippy --fix --workspace --features ans-verify/test-support,ans-verify/rus
 All changes must pass before merging:
 
 ```bash
-cargo fmt --all -- --check                                                              # Formatting
-cargo clippy --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt  # No warnings
-cargo test --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt    # All tests pass
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt
+cargo test --locked --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt
+cargo clippy --locked --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt,ans-verify/fast-verify
+cargo test --locked --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt,ans-verify/fast-verify
 ```
+
+CI also runs benchmark smoke tests and Rust 1.88 checks for both signature
+backends. The feature selects the verification backend; both dependency graphs
+already contain native code.
 
 ## Releasing
 
@@ -185,7 +191,7 @@ Key rules:
 
 ### DPoP / Method B (feature = "scitt")
 
-Application-layer proof of possession for A2A traffic that crosses TLS-terminating proxies (`Signer`, `verify_caller`, `verify_proof`):
+Application-layer proof of possession for A2A traffic that crosses TLS-terminating proxies (`Signer`, `verify_caller`):
 
 1. Caller mints a compact DPoP proof (`DPoP` header) with `x5c` bound to the identity certificate
 2. Callee verifies possession, then binds the proof fingerprint to `validIdentityCerts` on the status token
@@ -193,7 +199,7 @@ Application-layer proof of possession for A2A traffic that crosses TLS-terminati
 4. Receipt leaf identity is taken from the V2 envelope (`.payload.producer.event.ansName` / `ansId`); receipts are required by default, and any supplied receipt must verify and agree even if absence is waived
 5. Missing status token is a hard reject — Method B does not fall back to the badge tier
 6. `jti` is recorded only after identity and content binding succeed; expired replay reservations reject
-7. Every proof carries `ans_content_digest`, including the empty-content digest (§7.13). Use `verify_caller_with_content` to enforce size/read limits and hash only after identity binding; hash transfer-decoded bytes with content coding still applied. The legacy `require_content_binding` flag cannot disable this check
+7. Every proof carries `ans_content_digest`, including the empty-content digest (§7.13). Use `verify_caller_with_content` to enforce size/read limits and hash only after identity binding; hash transfer-decoded bytes with content coding still applied. Content binding is unconditional
 8. Minted proofs state revision `1` (`ans_profile`, §7.12); absence means revision 1, malformed values reject, and unknown revisions reject with `UNSUPPORTED_PROFILE`. Profile selection is deferred
 
 The comparison URL for `htu` is the callee's job (pass the reconstructed URL into `verify_caller`). Callee hardening lives on `VerifyCallerOptions`: `trusted_authorities` (§7.7 preflight allowlist, `UNTRUSTED_AUTHORITY` on miss) and `artifact_cache` (`VerifiedArtifactCache`, §4.6 — cached status tokens still enforce `exp`; the possession proof is never cached). `PopError::is_unknown_key_id()` is the §9.5 trigger to refresh root keys once (cooldown-gated) and retry.
@@ -272,6 +278,7 @@ let tlog = Arc::new(MockTransparencyLogClient::new()
     .with_badge("https://tlog.example.com/badge", badge));
 
 let verifier = ServerVerifier::builder()
+    .trusted_ra_domains(["tlog.example.com"])
     .dns_resolver(dns)
     .tlog_client(tlog)
     .build()

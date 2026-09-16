@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use ans_types::StatusTokenPayload;
 use moka::future::Cache;
-use sha2::{Digest, Sha256};
 
 use super::proof::LeafCert;
 use crate::scitt::VerifiedReceipt;
@@ -12,7 +11,8 @@ use crate::scitt::VerifiedReceipt;
 /// Default maximum cached entries per artifact type.
 pub const DEFAULT_ARTIFACT_CACHE_ENTRIES: u64 = 1024;
 
-/// Cache of verified status tokens and receipts, keyed by artifact bytes.
+/// Cache of verified status tokens and receipts, keyed by artifact bytes and
+/// the complete trusted-key-store configuration.
 ///
 /// Peers re-present their SCITT artifacts on every request, and
 /// re-presentation does not imply re-verification (ANS-6 §4.6). Passing this
@@ -23,8 +23,9 @@ pub const DEFAULT_ARTIFACT_CACHE_ENTRIES: u64 = 1024;
 /// is reused for identical entry bytes; its validity window and signature
 /// still check on every request.
 ///
-/// Scope one cache per trusted-key-store configuration: a hit vouches for
-/// the exact bytes under the key store they first verified against.
+/// Trust scope includes every key's ID, public key, and TL name. Sharing a
+/// cache between different key stores cannot reuse their trust decisions.
+/// Refreshing a store with new keys causes a miss under the new configuration.
 ///
 /// Cloning is cheap and shares the underlying storage.
 #[derive(Clone)]
@@ -75,7 +76,7 @@ impl VerifiedArtifactCache {
 
     /// Cache key: SHA-256 of the artifact bytes.
     pub(crate) fn key(bytes: &[u8]) -> [u8; 32] {
-        Sha256::digest(bytes).into()
+        crate::scitt::hash_bytes(bytes)
     }
 
     pub(crate) async fn status(&self, key: &[u8; 32]) -> Option<Arc<StatusTokenPayload>> {

@@ -181,8 +181,9 @@ impl Signer {
         Ok(format!("{header_b64}.{payload_b64}.{sig_b64}"))
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_clock(mut self, now: fn() -> i64) -> Self {
+    /// Override the clock for deterministic tests and benchmarks.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_clock(mut self, now: fn() -> i64) -> Self {
         self.now = now;
         self
     }

@@ -68,13 +68,10 @@ pub struct VerifyCallerOptions {
     /// content. Prefer [`verify_caller_with_content`] to defer body hashing
     /// until the proof is bound to a live ANS identity (§7.4 steps 11–12).
     pub content_sha256: Option<[u8; 32]>,
-    /// Retained for source compatibility. Content binding is always required,
-    /// including when this field is `false`.
-    pub require_content_binding: bool,
     /// Cache of verified artifacts (ANS-6 §4.6). When set, a status token or
     /// receipt whose exact bytes verified before skips re-verification; the
     /// token's `exp` is still enforced and the possession proof is never
-    /// cached. Cloning the cache is cheap — share one per key store.
+    /// cached. Entries are scoped to the complete trusted key configuration.
     pub artifact_cache: Option<VerifiedArtifactCache>,
 }
 
@@ -89,7 +86,6 @@ impl Default for VerifyCallerOptions {
             now: None,
             access_token: None,
             content_sha256: None,
-            require_content_binding: true,
             artifact_cache: None,
         }
     }
@@ -124,17 +120,11 @@ impl VerifyCallerOptions {
         self.content_sha256 = Some(digest);
         self
     }
-
-    /// Retained for source compatibility; content binding is now unconditional.
-    pub fn with_required_content_binding(mut self) -> Self {
-        self.require_content_binding = true;
-        self
-    }
 }
 
 /// Authenticate an A2A caller from its `DPoP` proof and SCITT headers.
 ///
-/// Composes possession ([`super::verify_proof`]), liveness (status token),
+/// Composes proof of possession, liveness (status token),
 /// and identity (receipt) and binds them to one identity certificate.
 /// Missing status token is a hard reject (Method B does not fall back to
 /// the badge tier). The `jti` is recorded only after identity and content
@@ -255,8 +245,8 @@ where
     let now = opts.now.unwrap_or_else(|| chrono::Utc::now().timestamp());
     let proof_opts = VerifyProofOptions {
         access_token: opts.access_token.clone(),
+        #[cfg(any(test, feature = "test-support"))]
         content_sha256: opts.content_sha256,
-        require_content_binding: opts.require_content_binding,
         skew: opts.pop_skew,
         now: Some(now),
     };
@@ -317,7 +307,7 @@ async fn verified_status_payload(
     let Some(cache) = cache else {
         return verify_fresh();
     };
-    let key = VerifiedArtifactCache::key(token_bytes);
+    let key = keys.artifact_cache_key(token_bytes);
     let tolerance =
         i64::try_from(skew.as_secs().min(MAX_CLOCK_SKEW_TOLERANCE_SECS)).unwrap_or(i64::MAX);
     if let Some(payload) = cache.status(&key).await
@@ -353,7 +343,7 @@ async fn verified_receipt(
     let Some(cache) = cache else {
         return verify_fresh();
     };
-    let key = VerifiedArtifactCache::key(receipt_bytes);
+    let key = keys.artifact_cache_key(receipt_bytes);
     if let Some(receipt) = cache.receipt(&key).await {
         return Ok(receipt);
     }

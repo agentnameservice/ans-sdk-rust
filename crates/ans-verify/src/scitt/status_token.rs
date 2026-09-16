@@ -340,7 +340,7 @@ fn parse_cert_entries(arr: Vec<ciborium::Value>) -> Result<Vec<CertEntry>, Scitt
                     _ => None,
                 };
             } else if is_cert_type && let ciborium::Value::Text(t) = v {
-                cert_type = Some(t.parse::<CertType>().map_err(ScittError::CborDecodeError)?);
+                cert_type = Some(CertType::from(t));
             }
         }
 
@@ -367,6 +367,8 @@ fn cbor_to_i64(v: &ciborium::Value) -> Option<i64> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use p256::ecdsa::{SigningKey, signature::hazmat::PrehashSigner as _};
     use p256::pkcs8::EncodePublicKey as _;
     use sha2::{Digest, Sha256};
@@ -559,6 +561,67 @@ mod tests {
     }
 
     // ── Valid token tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn signed_tokens_match_fingerprints_independently_of_certificate_type() {
+        let (key, store) = make_key_and_store(1);
+        let fingerprint = CertFingerprint::parse(&test_fp()).unwrap();
+        for label in [
+            "X509-DV-SERVER",
+            "X509-OV-CLIENT",
+            "X509-OV-SERVER",
+            "X509-EV-CLIENT",
+            "x509-ev-server",
+            "Future-Certificate",
+        ] {
+            let certs = [(test_fp(), label.to_owned())];
+            let payload = build_cbor_payload(
+                &nil_uuid(),
+                "ACTIVE",
+                1,
+                future_exp(),
+                "ans://v1.0.0.agent.example.com",
+                &certs,
+                &certs,
+                &[],
+            );
+            let verified =
+                verify_status_token_at(&make_token(&key, &payload), &store, Duration::ZERO, 100)
+                    .unwrap();
+            assert!(
+                matches_identity_cert(&verified.payload, &fingerprint),
+                "{label}"
+            );
+            assert!(
+                matches_server_cert(&verified.payload, &fingerprint),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_tokens_reject_badge_only_and_unrecognized_statuses() {
+        let (key, store) = make_key_and_store(1);
+        for status in ["UNKNOWN", "FUTURE_TERMINAL_STATUS"] {
+            let payload = build_cbor_payload(
+                &nil_uuid(),
+                status,
+                1,
+                future_exp(),
+                "ans://v1.0.0.agent.example.com",
+                &[],
+                &[],
+                &[],
+            );
+            let error =
+                verify_status_token_at(&make_token(&key, &payload), &store, Duration::ZERO, 100)
+                    .unwrap_err();
+            assert!(
+                matches!(error, ScittError::CborDecodeError(_)),
+                "{status}: {error:?}"
+            );
+        }
+    }
 
     #[test]
     fn valid_active_token() {

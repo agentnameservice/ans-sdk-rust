@@ -62,25 +62,48 @@ pub struct HttpTransparencyLogClient {
 
 impl HttpTransparencyLogClient {
     /// Create a new client with default settings.
+    ///
+    /// HTTPS is required and redirects are rejected, so a trusted badge host
+    /// cannot send the request to a different trust root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the HTTP client's TLS configuration cannot be initialized.
+    #[allow(clippy::expect_used)] // Same initialization contract as reqwest::Client::new().
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: Self::client_builder()
+                .build()
+                .expect("failed to initialize the transparency log HTTPS client"),
             base_url: None,
             timeout: Duration::from_secs(30),
             extra_headers: Vec::new(),
         }
     }
 
+    fn client_builder() -> reqwest::ClientBuilder {
+        Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+    }
+
     /// Create a new client with a base URL for agent ID lookups.
     ///
     /// # Errors
     ///
-    /// Returns `TlogError::InvalidUrl` if the URL cannot be parsed.
+    /// Returns `TlogError::InvalidUrl` unless the URL is an absolute HTTPS URL.
     pub fn with_base_url(base_url: impl AsRef<str>) -> Result<Self, TlogError> {
         let parsed =
             Url::parse(base_url.as_ref()).map_err(|e| TlogError::InvalidUrl(e.to_string()))?;
+        if parsed.scheme() != "https" || parsed.host_str().is_none() {
+            return Err(TlogError::InvalidUrl(
+                "transparency log base URL must use HTTPS and include a host".into(),
+            ));
+        }
         Ok(Self {
-            client: Client::new(),
+            client: Self::client_builder()
+                .build()
+                .map_err(crate::error::HttpError::from)?,
             base_url: Some(parsed),
             timeout: Duration::from_secs(30),
             extra_headers: Vec::new(),
@@ -163,7 +186,7 @@ impl TransparencyLogClient for HttpTransparencyLogClient {
             });
         }
 
-        if status.is_server_error() {
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(TlogError::ServiceUnavailable);
         }
 
@@ -173,9 +196,13 @@ impl TransparencyLogClient for HttpTransparencyLogClient {
             )));
         }
 
-        let badge: Badge = response
-            .json()
+        // A failed body read is a transport outage. A complete body containing
+        // malformed JSON is determinate adverse evidence and must fail closed.
+        let body = response
+            .bytes()
             .await
+            .map_err(crate::error::HttpError::from)?;
+        let badge: Badge = serde_json::from_slice(&body)
             .map_err(|e| TlogError::InvalidResponse(format!("Failed to parse badge JSON: {e}")))?;
 
         tracing::debug!(
@@ -248,7 +275,7 @@ impl TransparencyLogClient for HttpTransparencyLogClient {
             });
         }
 
-        if status.is_server_error() {
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(TlogError::ServiceUnavailable);
         }
 
@@ -258,7 +285,11 @@ impl TransparencyLogClient for HttpTransparencyLogClient {
             )));
         }
 
-        let audit: AuditResponse = response.json().await.map_err(|e| {
+        let body = response
+            .bytes()
+            .await
+            .map_err(crate::error::HttpError::from)?;
+        let audit: AuditResponse = serde_json::from_slice(&body).map_err(|e| {
             TlogError::InvalidResponse(format!("Failed to parse audit response JSON: {e}"))
         })?;
 
@@ -311,6 +342,7 @@ impl TransparencyLogClient for MockTransparencyLogClient {
             return Err(match error {
                 TlogError::NotFound { url } => TlogError::NotFound { url: url.clone() },
                 TlogError::ServiceUnavailable => TlogError::ServiceUnavailable,
+                TlogError::StatusUnknown => TlogError::StatusUnknown,
                 TlogError::InvalidResponse(msg) => TlogError::InvalidResponse(msg.clone()),
                 TlogError::InvalidUrl(msg) => TlogError::InvalidUrl(msg.clone()),
                 TlogError::HttpError(e) => {
@@ -385,6 +417,128 @@ mod tests {
                 }
             }
         })).expect("test badge JSON should be valid")
+    }
+
+    fn local_http_client(base_url: &str) -> HttpTransparencyLogClient {
+        // Only the unit-test fixture permits plaintext loopback. Keep the
+        // production redirect policy so requests cannot escape the first host.
+        HttpTransparencyLogClient {
+            client: HttpTransparencyLogClient::client_builder()
+                .https_only(false)
+                .no_proxy()
+                .build()
+                .unwrap(),
+            base_url: Some(Url::parse(base_url).unwrap()),
+            timeout: Duration::from_secs(5),
+            extra_headers: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn production_http_client_rejects_plaintext() {
+        let server = wiremock::MockServer::start().await;
+        assert!(HttpTransparencyLogClient::with_base_url(server.uri()).is_err());
+        assert!(
+            HttpTransparencyLogClient::new()
+                .fetch_badge(&server.uri())
+                .await
+                .is_err()
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_client_does_not_follow_redirects() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let origin = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(create_test_badge()))
+            .mount(&destination)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "Location",
+                destination.uri().replace("127.0.0.1", "localhost"),
+            ))
+            .mount(&origin)
+            .await;
+        let error = local_http_client(&origin.uri())
+            .fetch_badge(&origin.uri())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, TlogError::InvalidResponse(_)));
+        assert!(destination.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn http_failures_distinguish_outages_from_denials_and_malformed_json() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (status, unavailable) in [
+            (429, true),
+            (500, true),
+            (503, true),
+            (401, false),
+            (403, false),
+            (404, false),
+            (200, false),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("{"))
+                .mount(&server)
+                .await;
+            let client = local_http_client(&server.uri());
+            let badge_error = client.fetch_badge(&server.uri()).await.unwrap_err();
+            assert_eq!(
+                badge_error.is_unavailable(),
+                unavailable,
+                "badge {status}: {badge_error}"
+            );
+            let audit_error = client
+                .fetch_audit(Uuid::nil(), None, None)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                audit_error.is_unavailable(),
+                unavailable,
+                "audit {status}: {audit_error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_http_bodies_are_outages() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const TRUNCATED_RESPONSE: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{";
+        for audit in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                stream.read(&mut request).await.unwrap();
+                stream.write_all(TRUNCATED_RESPONSE).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let client = local_http_client(&url);
+            let error = if audit {
+                client
+                    .fetch_audit(Uuid::nil(), None, None)
+                    .await
+                    .unwrap_err()
+            } else {
+                client.fetch_badge(&url).await.unwrap_err()
+            };
+            assert!(matches!(error, TlogError::HttpError(_)), "{error}");
+            assert!(error.is_unavailable());
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

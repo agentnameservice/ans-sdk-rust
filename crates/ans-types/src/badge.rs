@@ -19,6 +19,9 @@ pub enum BadgeStatus {
     Expired,
     /// Registration has been explicitly revoked.
     Revoked,
+    /// The TL cannot determine current status. Badge-only; apply the verifier's
+    /// failure policy instead of treating this as a successful status.
+    Unknown,
 }
 
 impl BadgeStatus {
@@ -32,7 +35,9 @@ impl BadgeStatus {
         matches!(self, Self::Active | Self::Warning)
     }
 
-    /// Check if this status indicates the badge should be rejected.
+    /// Check if this is a determinate terminal status.
+    ///
+    /// `Unknown` is not terminal, but is also never valid for a connection.
     pub fn should_reject(&self) -> bool {
         matches!(self, Self::Expired | Self::Revoked)
     }
@@ -40,9 +45,10 @@ impl BadgeStatus {
 
 /// Event types for badge events.
 ///
-/// These match the TL API swagger spec eventType enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+/// Known values match the TL API schema. Unfamiliar informational event labels
+/// are preserved; live authentication depends on the badge status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
 #[non_exhaustive]
 pub enum EventType {
     /// Agent was initially registered.
@@ -55,6 +61,34 @@ pub enum EventType {
     AgentDeprecated,
     /// Agent registration was revoked.
     AgentRevoked,
+    /// An event label introduced after this SDK version.
+    Other(String),
+}
+
+impl From<String> for EventType {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "AGENT_REGISTERED" => Self::AgentRegistered,
+            "AGENT_RENEWED" => Self::AgentRenewed,
+            "AGENT_UPDATED" => Self::AgentUpdated,
+            "AGENT_DEPRECATED" => Self::AgentDeprecated,
+            "AGENT_REVOKED" => Self::AgentRevoked,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<EventType> for String {
+    fn from(value: EventType) -> Self {
+        match value {
+            EventType::AgentRegistered => "AGENT_REGISTERED".into(),
+            EventType::AgentRenewed => "AGENT_RENEWED".into(),
+            EventType::AgentUpdated => "AGENT_UPDATED".into(),
+            EventType::AgentDeprecated => "AGENT_DEPRECATED".into(),
+            EventType::AgentRevoked => "AGENT_REVOKED".into(),
+            EventType::Other(value) => value,
+        }
+    }
 }
 
 /// Full badge response from the Transparency Log API.
@@ -153,7 +187,7 @@ impl Badge {
 
     /// Get the event type.
     pub fn event_type(&self) -> EventType {
-        self.payload.producer.event.event_type
+        self.payload.producer.event.event_type.clone()
     }
 
     /// Check if this badge is valid for connections.
@@ -291,6 +325,7 @@ mod tests {
         assert!(BadgeStatus::Deprecated.is_valid_for_connection());
         assert!(!BadgeStatus::Expired.is_valid_for_connection());
         assert!(!BadgeStatus::Revoked.is_valid_for_connection());
+        assert!(!BadgeStatus::Unknown.is_valid_for_connection());
     }
 
     #[test]
@@ -300,6 +335,24 @@ mod tests {
         assert!(!BadgeStatus::Deprecated.should_reject());
         assert!(BadgeStatus::Expired.should_reject());
         assert!(BadgeStatus::Revoked.should_reject());
+        assert!(!BadgeStatus::Unknown.should_reject());
+    }
+
+    #[test]
+    fn unknown_status_is_distinct_from_unrecognized_status() {
+        assert_eq!(
+            serde_json::from_str::<BadgeStatus>("\"UNKNOWN\"").unwrap(),
+            BadgeStatus::Unknown
+        );
+        assert!(serde_json::from_str::<BadgeStatus>("\"FUTURE_TERMINAL_STATUS\"").is_err());
+    }
+
+    #[test]
+    fn unfamiliar_event_type_round_trips() {
+        let json = "\"AGENT_FUTURE_EVENT\"";
+        let event: EventType = serde_json::from_str(json).unwrap();
+        assert_eq!(event, EventType::Other("AGENT_FUTURE_EVENT".into()));
+        assert_eq!(serde_json::to_string(&event).unwrap(), json);
     }
 
     #[test]

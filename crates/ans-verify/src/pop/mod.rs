@@ -38,9 +38,9 @@ pub use http::{
 pub use proof::{ANS_PROFILE_REVISION, normalize_authority, normalize_htu, request_authority};
 pub use replay::{DEFAULT_REPLAY_MAX_ENTRIES, MemoryReplayCache, ReplayCache};
 pub use sign::Signer;
-pub use verify::{
-    DEFAULT_POP_SKEW, MAX_JTI_SIZE, MAX_PROOF_SIZE, ProofResult, VerifyProofOptions, verify_proof,
-};
+pub use verify::{DEFAULT_POP_SKEW, MAX_JTI_SIZE, MAX_PROOF_SIZE};
+#[cfg(any(test, feature = "test-support"))]
+pub use verify::{ProofResult, VerifyProofOptions, verify_proof};
 
 #[cfg(test)]
 mod tests;

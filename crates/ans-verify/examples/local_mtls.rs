@@ -72,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let verifier = Arc::new(
         AnsVerifier::builder()
+            .trusted_ra_domains(["tlog.test.local"])
             .dns_resolver(dns)
             .tlog_client(tlog)
             .dane_policy(DanePolicy::Disabled)

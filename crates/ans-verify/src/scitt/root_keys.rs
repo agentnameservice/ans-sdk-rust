@@ -46,6 +46,7 @@ pub struct TrustedKey {
 #[derive(Debug, Clone)]
 pub struct ScittKeyStore {
     keys: HashMap<[u8; 4], TrustedKey>,
+    trust_scope: [u8; 32],
 }
 
 impl ScittKeyStore {
@@ -88,7 +89,37 @@ impl ScittKeyStore {
             ));
         }
 
-        Ok(Self { keys })
+        Ok(Self::from_keys(keys))
+    }
+
+    fn from_keys(keys: HashMap<[u8; 4], TrustedKey>) -> Self {
+        let mut ordered: Vec<_> = keys.values().collect();
+        ordered.sort_unstable_by_key(|key| key.kid);
+        let mut digest = Sha256::new();
+        digest.update(b"ANS-6 trusted key store\0");
+        for key in ordered {
+            digest.update(key.kid);
+            digest.update(
+                u64::try_from(key.name.len())
+                    .unwrap_or(u64::MAX)
+                    .to_be_bytes(),
+            );
+            digest.update(key.name.as_bytes());
+            digest.update(key.key.to_sec1_point(false).as_bytes());
+        }
+        Self {
+            keys,
+            trust_scope: digest.finalize().into(),
+        }
+    }
+
+    /// Bind cached verification to the complete immutable trust configuration.
+    /// The TL name matters: protected issuer claims are checked against it.
+    pub(crate) fn artifact_cache_key(&self, bytes: &[u8]) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(self.trust_scope);
+        digest.update(bytes);
+        digest.finalize().into()
     }
 
     /// Look up a key by its 4-byte key ID.
@@ -157,7 +188,7 @@ impl ScittKeyStore {
             tracing::debug!(added, total = keys.len(), "Merged new root keys into store");
         }
 
-        Self { keys }
+        Self::from_keys(keys)
     }
 }
 
@@ -282,6 +313,29 @@ mod tests {
     }
 
     // ── parse_c2sp_key happy path ──
+
+    #[test]
+    fn artifact_scope_is_order_independent_and_changes_with_trust() {
+        let (a, _) = make_c2sp_key(1, "first.example.com");
+        let (b, _) = make_c2sp_key(2, "second.example.com");
+        let (renamed_a, _) = make_c2sp_key(1, "renamed.example.com");
+        let both = ScittKeyStore::from_c2sp_keys(&[a.clone(), b.clone()]).unwrap();
+        let reversed = ScittKeyStore::from_c2sp_keys(&[b.clone(), a.clone()]).unwrap();
+        let renamed = ScittKeyStore::from_c2sp_keys(&[renamed_a, b]).unwrap();
+        let single = ScittKeyStore::from_c2sp_keys(&[a]).unwrap();
+        assert_eq!(
+            both.artifact_cache_key(b"artifact"),
+            reversed.artifact_cache_key(b"artifact")
+        );
+        assert_ne!(
+            both.artifact_cache_key(b"artifact"),
+            renamed.artifact_cache_key(b"artifact")
+        );
+        assert_ne!(
+            both.artifact_cache_key(b"artifact"),
+            single.artifact_cache_key(b"artifact")
+        );
+    }
 
     #[test]
     fn parse_valid_c2sp_key() {

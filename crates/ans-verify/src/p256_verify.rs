@@ -1,10 +1,10 @@
 //! ECDSA P-256 (ES256) signature-verification backend.
 //!
-//! The default backend is the pure-Rust `p256` crate, keeping the dependency
-//! tree free of native code. The `fast-verify` feature swaps verification to
-//! `ring`'s assembly implementation (~3x faster on typical hardware) — the
-//! same backend the `rustls` feature already links for TLS. Signing stays on
-//! `p256` either way; verification dominates every hot path.
+//! The default verification backend is `p256`. The `fast-verify` feature uses
+//! `ring` instead; signing stays on `p256`. Both verification paths are tested
+//! in CI. The networking dependency graph already includes native code
+//! regardless of this feature; compare performance on the deployment target
+//! with `benches/scitt_verification.rs`.
 
 use p256::ecdsa::{Signature, VerifyingKey};
 
@@ -41,6 +41,31 @@ mod tests {
     use p256::ecdsa::{Signature, SigningKey};
 
     use super::verify_p256_sha256;
+
+    #[test]
+    fn rfc6979_p256_sha256_known_answer() {
+        // RFC 6979 Appendix A.2.5, SHA-256 with message "sample".
+        // Fixed public key/signature from the RFC, independent of our signer.
+        let key = p256::ecdsa::VerifyingKey::from_sec1_bytes(
+            &hex::decode(concat!(
+                "04",
+                "60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6",
+                "7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let signature = Signature::from_slice(
+            &hex::decode(concat!(
+                "EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716",
+                "F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8"
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(verify_p256_sha256(&key, b"sample", &signature));
+        assert!(!verify_p256_sha256(&key, b"tampered", &signature));
+    }
 
     #[test]
     fn accepts_valid_signature_and_rejects_tampering() {

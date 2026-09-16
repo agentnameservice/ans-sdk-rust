@@ -283,6 +283,7 @@ async fn real_end_to_end_server_scitt_verification() {
     let tlog = Arc::new(MockTransparencyLogClient::new().with_badge(badge_url, badge));
 
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["transparency.ans.godaddy.com"])
         .dns_resolver(dns)
         .tlog_client(tlog)
         .scitt_config(ScittConfig::new().with_tier_policy(ScittTierPolicy::ScittWithBadgeFallback))

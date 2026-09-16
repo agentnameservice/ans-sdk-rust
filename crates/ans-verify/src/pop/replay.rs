@@ -118,8 +118,9 @@ impl MemoryReplayCache {
         inner.evict(now);
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_clock(self, now: fn() -> i64) -> Self {
+    /// Override the clock for deterministic tests and benchmarks.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_clock(self, now: fn() -> i64) -> Self {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

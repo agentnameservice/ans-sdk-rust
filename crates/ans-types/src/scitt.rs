@@ -55,30 +55,53 @@ impl std::fmt::Display for VerificationTier {
 
 /// Certificate type for status token cert entries.
 ///
-/// Constrains the `cert_type` field to known values, preventing typos or
-/// attacker-supplied garbage from bypassing cert-type-based verification logic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Informational metadata (ANS-6 §4.4). Verification matches certificate
+/// fingerprints, never this label. Known labels are normalized case-insensitively;
+/// unfamiliar labels are preserved for forward compatibility.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
 #[non_exhaustive]
 pub enum CertType {
     /// X.509 Domain-Validated server certificate.
-    #[serde(rename = "X509-DV-SERVER")]
     X509DvServer,
     /// X.509 Organization-Validated client certificate (mTLS identity).
-    #[serde(rename = "X509-OV-CLIENT")]
     X509OvClient,
+    /// X.509 Organization-Validated server certificate.
+    X509OvServer,
+    /// X.509 Extended-Validation client certificate.
+    X509EvClient,
+    /// X.509 Extended-Validation server certificate.
+    X509EvServer,
+    /// An informational label not yet known to this SDK.
+    Other(String),
+}
+
+impl From<String> for CertType {
+    fn from(value: String) -> Self {
+        match value.to_ascii_uppercase().as_str() {
+            "X509-DV-SERVER" => Self::X509DvServer,
+            "X509-OV-CLIENT" => Self::X509OvClient,
+            "X509-OV-SERVER" => Self::X509OvServer,
+            "X509-EV-CLIENT" => Self::X509EvClient,
+            "X509-EV-SERVER" => Self::X509EvServer,
+            _ => Self::Other(value),
+        }
+    }
+}
+
+impl From<CertType> for String {
+    fn from(value: CertType) -> Self {
+        value.to_string()
+    }
 }
 
 impl std::str::FromStr for CertType {
-    type Err = String;
+    type Err = std::convert::Infallible;
 
     /// Case-insensitive: ANS-6 §4.4 — implementations have emitted the CBOR
     /// form in lowercase, so consumers compare the type case-insensitively.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_uppercase().as_str() {
-            "X509-DV-SERVER" => Ok(Self::X509DvServer),
-            "X509-OV-CLIENT" => Ok(Self::X509OvClient),
-            other => Err(format!("unknown cert_type: {other}")),
-        }
+        Ok(Self::from(s.to_owned()))
     }
 }
 
@@ -87,6 +110,10 @@ impl std::fmt::Display for CertType {
         match self {
             Self::X509DvServer => write!(f, "X509-DV-SERVER"),
             Self::X509OvClient => write!(f, "X509-OV-CLIENT"),
+            Self::X509OvServer => write!(f, "X509-OV-SERVER"),
+            Self::X509EvClient => write!(f, "X509-EV-CLIENT"),
+            Self::X509EvServer => write!(f, "X509-EV-SERVER"),
+            Self::Other(value) => f.write_str(value),
         }
     }
 }
@@ -188,7 +215,31 @@ mod tests {
             "X509-DV-Server".parse::<CertType>().unwrap(),
             CertType::X509DvServer
         );
-        assert!("X509-EV-SERVER".parse::<CertType>().is_err());
+    }
+
+    #[test]
+    fn cert_types_accept_schema_values_and_preserve_extensions() {
+        for (label, expected) in [
+            ("X509-DV-SERVER", CertType::X509DvServer),
+            ("X509-OV-CLIENT", CertType::X509OvClient),
+            ("X509-OV-SERVER", CertType::X509OvServer),
+            ("X509-EV-CLIENT", CertType::X509EvClient),
+            ("X509-EV-SERVER", CertType::X509EvServer),
+            (
+                "Future-Certificate",
+                CertType::Other("Future-Certificate".into()),
+            ),
+        ] {
+            assert_eq!(label.parse::<CertType>().unwrap(), expected);
+            let json = serde_json::to_string(label).unwrap();
+            let parsed: CertType = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, expected);
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+        }
+        assert_eq!(
+            serde_json::from_str::<CertType>("\"x509-ev-server\"").unwrap(),
+            CertType::X509EvServer
+        );
     }
 
     #[test]

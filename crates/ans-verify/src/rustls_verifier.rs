@@ -15,7 +15,7 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Fetch the badge to get the expected fingerprint
-//! let verifier = AnsVerifier::new().await?;
+//! let verifier = AnsVerifier::new(["transparency.ans.godaddy.com"]).await?;
 //! let badge = verifier.prefetch("agent.example.com").await?;
 //!
 //! // Create the server cert verifier
@@ -243,7 +243,7 @@ impl ServerCertVerifier for AnsServerCertVerifier {
 ///     .with_single_cert(server_certs, server_key)?;
 ///
 /// // After handshake, verify against badge before processing requests
-/// let verifier = AnsVerifier::new().await?;
+/// let verifier = AnsVerifier::new(["transparency.ans.godaddy.com"]).await?;
 /// // let cert_identity = CertIdentity::from_der(peer_cert)?;
 /// // let outcome = verifier.verify_client(&cert_identity).await;
 /// # Ok(())

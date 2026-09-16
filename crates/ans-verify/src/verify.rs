@@ -517,30 +517,67 @@ pub enum FailurePolicy {
     },
 }
 
-/// Validate that a badge URL's domain is in the trusted RA domains set.
-///
-/// Returns `Ok(())` if:
-/// - `trusted` is `None` (no restriction configured — allow all domains)
-/// - The URL's host is present in the trusted set
-///
-/// Returns `Err(TlogError::UntrustedDomain)` if the host is not trusted.
+/// Require HTTPS and a host in the out-of-band trusted TL configuration.
 fn validate_badge_domain(trusted: Option<&HashSet<String>>, url: &str) -> Result<(), TlogError> {
-    let Some(trusted) = trusted else {
-        return Ok(());
-    };
     let parsed = url::Url::parse(url)
         .map_err(|e| TlogError::InvalidUrl(format!("Badge URL is invalid: {e}")))?;
+    if parsed.scheme() != "https" {
+        return Err(TlogError::InvalidUrl("Badge URL must use HTTPS".into()));
+    }
     let domain = parsed
         .host_str()
         .ok_or_else(|| TlogError::InvalidUrl(format!("Badge URL has no host: {url}")))?;
-    if trusted.contains(domain) {
+    if trusted.is_some_and(|trusted| trusted.contains(domain)) {
         Ok(())
     } else {
         Err(TlogError::UntrustedDomain {
             domain: domain.to_string(),
-            trusted: trusted.iter().cloned().collect(),
+            trusted: trusted.into_iter().flatten().cloned().collect(),
         })
     }
+}
+
+/// UNKNOWN is indeterminate, and must never replace a previously usable badge.
+fn require_known_badge_status(badge: Badge) -> Result<Badge, TlogError> {
+    if badge.status == BadgeStatus::Unknown {
+        Err(TlogError::StatusUnknown)
+    } else {
+        Ok(badge)
+    }
+}
+
+/// Keep determinate adverse evidence even if another TL request is unavailable.
+fn record_tlog_error(previous: &mut Option<AnsError>, error: TlogError) {
+    if !error.is_unavailable()
+        || !matches!(
+            previous,
+            Some(AnsError::TransparencyLog(prior)) if !prior.is_unavailable()
+        )
+    {
+        *previous = Some(AnsError::TransparencyLog(error));
+    }
+}
+
+fn validate_badge_configuration(
+    trusted: Option<&HashSet<String>>,
+    cache: Option<&CacheConfig>,
+    policy: FailurePolicy,
+) -> AnsResult<()> {
+    if trusted.is_none_or(HashSet::is_empty) {
+        return Err(VerificationError::Configuration(
+            "badge verification requires a non-empty trusted_ra_domains allowlist".into(),
+        )
+        .into());
+    }
+    if let (Some(cache), FailurePolicy::FailOpenWithCache { max_staleness }) = (cache, policy)
+        && cache.hard_ttl.max(cache.default_ttl) < max_staleness
+    {
+        return Err(VerificationError::Configuration(
+            "cache hard_ttl must be at least the failure policy's max_staleness".into(),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Server verifier for clients verifying agent servers.
@@ -722,17 +759,12 @@ impl ServerVerifier {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::debug!(url = %record.url, error = %e, "Failed to fetch badge, trying next");
-                    if !e.is_unavailable() {
-                        if let Some(cache) = &self.cache {
-                            cache.invalidate_fqdn(fqdn).await;
-                        }
-                        last_error = Some(AnsError::TransparencyLog(e));
-                    } else if !matches!(
-                        &last_error,
-                        Some(AnsError::TransparencyLog(previous)) if !previous.is_unavailable()
-                    ) {
-                        last_error = Some(AnsError::TransparencyLog(e));
+                    if !e.is_unavailable()
+                        && let Some(cache) = &self.cache
+                    {
+                        cache.invalidate_fqdn(fqdn).await;
                     }
+                    record_tlog_error(&mut last_error, e);
                     continue;
                 }
             };
@@ -879,7 +911,7 @@ impl ServerVerifier {
                     {
                         cache.invalidate_fqdn(fqdn).await;
                     }
-                    last_error = Some(e);
+                    record_tlog_error(&mut last_error, e);
                 }
             }
         }
@@ -887,7 +919,7 @@ impl ServerVerifier {
         match preferred {
             Some(badge) => Ok(badge),
             None => match last_error {
-                Some(e) => Err(AnsError::TransparencyLog(e)),
+                Some(e) => Err(e),
                 None => Err(AnsError::TransparencyLog(TlogError::InvalidResponse(
                     "no badge records available".to_string(),
                 ))),
@@ -955,7 +987,12 @@ impl ServerVerifier {
             let badge = match result {
                 Ok(b) => b,
                 Err(e) => {
-                    last_error = Some(AnsError::TransparencyLog(e));
+                    if !e.is_unavailable()
+                        && let Some(cache) = &self.cache
+                    {
+                        cache.invalidate_fqdn(fqdn).await;
+                    }
+                    record_tlog_error(&mut last_error, e);
                     continue;
                 }
             };
@@ -1016,7 +1053,10 @@ impl ServerVerifier {
                     if let Err(e) = validate_badge_domain(trusted.as_ref(), &record.url) {
                         (*record, Err(e))
                     } else {
-                        let result = tlog.fetch_badge(&record.url).await;
+                        let result = tlog
+                            .fetch_badge(&record.url)
+                            .await
+                            .and_then(require_known_badge_status);
                         (*record, result)
                     }
                 }
@@ -1038,7 +1078,7 @@ impl ServerVerifier {
         tracing::debug!(cert_type, "Verifying certificate against badge");
 
         // Check status
-        if badge.status.should_reject() {
+        if !badge.status.is_valid_for_connection() {
             tracing::warn!(
                 status = ?badge.status,
                 "Badge status is not valid for connections"
@@ -1352,17 +1392,27 @@ impl ServerVerifierBuilder {
     /// pointing to hosts not in the set are rejected with
     /// `TlogError::UntrustedDomain`.
     ///
-    /// By default (`None`), all domains are allowed.
+    /// Required: an absent or empty allowlist makes [`Self::build`] fail.
     pub fn trusted_ra_domains(
         mut self,
         domains: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        self.trusted_ra_domains = Some(domains.into_iter().map(Into::into).collect());
+        self.trusted_ra_domains = Some(
+            domains
+                .into_iter()
+                .map(|domain| domain.into().to_ascii_lowercase())
+                .collect(),
+        );
         self
     }
 
     /// Build the verifier.
     pub async fn build(self) -> AnsResult<ServerVerifier> {
+        validate_badge_configuration(
+            self.trusted_ra_domains.as_ref(),
+            self.cache.as_deref().map(BadgeCache::config),
+            self.failure_policy,
+        )?;
         let dns_resolver = match self.dns_resolver {
             Some(r) => r,
             None => Arc::new(
@@ -1537,7 +1587,12 @@ impl ClientVerifier {
 
         // Fetch badge
         tracing::debug!(url = %badge_record.url, "Fetching badge from transparency log");
-        let badge = match self.tlog_client.fetch_badge(&badge_record.url).await {
+        let badge = match self
+            .tlog_client
+            .fetch_badge(&badge_record.url)
+            .await
+            .and_then(require_known_badge_status)
+        {
             Ok(b) => {
                 tracing::debug!(
                     status = ?b.status,
@@ -1584,7 +1639,7 @@ impl ClientVerifier {
         tracing::debug!("Verifying client certificate against badge");
 
         // Check status
-        if badge.status.should_reject() {
+        if !badge.status.is_valid_for_connection() {
             tracing::warn!(status = ?badge.status, "Badge status is not valid for connections");
             return VerificationOutcome::InvalidStatus {
                 status: badge.status,
@@ -1717,7 +1772,12 @@ impl ClientVerifier {
         }
 
         // Re-fetch badge from transparency log
-        let badge = match self.tlog_client.fetch_badge(&badge_record.url).await {
+        let badge = match self
+            .tlog_client
+            .fetch_badge(&badge_record.url)
+            .await
+            .and_then(require_known_badge_status)
+        {
             Ok(b) => b,
             Err(e) => return VerificationOutcome::TlogError(e),
         };
@@ -1857,17 +1917,27 @@ impl ClientVerifierBuilder {
     /// pointing to hosts not in the set are rejected with
     /// `TlogError::UntrustedDomain`.
     ///
-    /// By default (`None`), all domains are allowed.
+    /// Required: an absent or empty allowlist makes [`Self::build`] fail.
     pub fn trusted_ra_domains(
         mut self,
         domains: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        self.trusted_ra_domains = Some(domains.into_iter().map(Into::into).collect());
+        self.trusted_ra_domains = Some(
+            domains
+                .into_iter()
+                .map(|domain| domain.into().to_ascii_lowercase())
+                .collect(),
+        );
         self
     }
 
     /// Build the verifier.
     pub async fn build(self) -> AnsResult<ClientVerifier> {
+        validate_badge_configuration(
+            self.trusted_ra_domains.as_ref(),
+            self.cache.as_deref().map(BadgeCache::config),
+            self.failure_policy,
+        )?;
         let dns_resolver = match self.dns_resolver {
             Some(r) => r,
             None => Arc::new(
@@ -1923,9 +1993,17 @@ impl fmt::Debug for AnsVerifier {
 }
 
 impl AnsVerifier {
-    /// Create a new verifier with default configuration.
-    pub async fn new() -> AnsResult<Self> {
-        Self::builder().build().await
+    /// Create a verifier trusting the given TL domains for HTTPS badge fetches.
+    ///
+    /// The allowlist must come from application configuration, never the DNS
+    /// records being verified. An empty list is a configuration error.
+    pub async fn new(
+        trusted_ra_domains: impl IntoIterator<Item = impl Into<String>>,
+    ) -> AnsResult<Self> {
+        Self::builder()
+            .trusted_ra_domains(trusted_ra_domains)
+            .build()
+            .await
     }
 
     /// Create a builder for custom configuration.
@@ -2314,16 +2392,17 @@ impl AnsVerifier {
         config: &ScittConfig,
         is_server: bool,
         dialed_host: Option<&str>,
-        cache: Option<&crate::scitt::ScittVerificationCache>,
+        mut cache: Option<&crate::scitt::ScittVerificationCache>,
     ) -> Option<VerificationOutcome> {
         let token_bytes = headers.status_token.as_ref()?;
 
-        // Compute content hashes for cache lookups (cheap: ~1μs each)
-        let token_hash = crate::scitt::hash_bytes(token_bytes);
+        // Cache hits vouch for bytes under this exact trust configuration.
+        let mut snapshot = key_store.current_snapshot().await;
+        let token_hash = snapshot.artifact_cache_key(token_bytes);
         let receipt_hash = headers
             .receipt
             .as_ref()
-            .map(|b| crate::scitt::hash_bytes(b));
+            .map(|b| snapshot.artifact_cache_key(b));
 
         // ── Layer 2: Full outcome cache ─────────────────────────────────
         if let Some(cache) = cache
@@ -2357,7 +2436,6 @@ impl AnsVerifier {
             (*cached_token).clone()
         } else {
             // Full COSE signature verification
-            let snapshot = key_store.current_snapshot().await;
             let first_result = crate::scitt::verify_status_token(
                 token_bytes,
                 &snapshot,
@@ -2376,10 +2454,13 @@ impl AnsVerifier {
                     };
 
                     if refreshed {
-                        let new_snapshot = key_store.current_snapshot().await;
+                        snapshot = key_store.current_snapshot().await;
+                        // The lookup hashes belong to the earlier snapshot.
+                        // Refill under the new scope on the next request.
+                        cache = None;
                         match crate::scitt::verify_status_token(
                             token_bytes,
-                            &new_snapshot,
+                            &snapshot,
                             config.clock_skew_tolerance,
                         ) {
                             Ok(vt) => vt,
@@ -2431,15 +2512,14 @@ impl AnsVerifier {
                 tracing::debug!("SCITT receipt cache hit (Layer 1 — skipping Merkle)");
                 cached_receipt
             } else {
-                // Full receipt verification — needs a key store snapshot
-                let snapshot = key_store.current_snapshot().await;
+                // Use the same snapshot as the cache keys/token verification.
                 let mut result = crate::scitt::verify_receipt(receipt_bytes, &snapshot);
                 if matches!(result, Err(crate::scitt::ScittError::UnknownKeyId(_))) {
                     match key_store.refresh_if_cooldown_elapsed().await {
                         Ok(true) => {
-                            let refreshed_snapshot = key_store.current_snapshot().await;
-                            result =
-                                crate::scitt::verify_receipt(receipt_bytes, &refreshed_snapshot);
+                            snapshot = key_store.current_snapshot().await;
+                            cache = None;
+                            result = crate::scitt::verify_receipt(receipt_bytes, &snapshot);
                         }
                         Ok(false) => {}
                         Err(error) => tracing::warn!(%error, "Receipt key refresh failed"),
@@ -2634,6 +2714,7 @@ impl AnsVerifierBuilder {
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let verifier = AnsVerifier::builder()
+    ///     .trusted_ra_domains(["transparency.ans.godaddy.com"])
     ///     .dns_preset(DnsResolverConfig::CloudflareTls)
     ///     .build()
     ///     .await?;
@@ -2679,6 +2760,7 @@ impl AnsVerifierBuilder {
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let verifier = AnsVerifier::builder()
+    ///     .trusted_ra_domains(["transparency.ans.godaddy.com"])
     ///     .dns_nameservers(&[
     ///         Ipv4Addr::new(1, 1, 1, 1),
     ///         Ipv4Addr::new(8, 8, 8, 8),
@@ -2755,11 +2837,17 @@ impl AnsVerifierBuilder {
     ///
     /// When configured, badge URLs discovered via DNS TXT records will be
     /// validated against this set before any HTTP request is made.
+    /// Required unless the verifier is configured with `RequireScitt`.
     pub fn trusted_ra_domains(
         mut self,
         domains: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        self.trusted_ra_domains = Some(domains.into_iter().map(Into::into).collect());
+        self.trusted_ra_domains = Some(
+            domains
+                .into_iter()
+                .map(|domain| domain.into().to_ascii_lowercase())
+                .collect(),
+        );
         self
     }
 
@@ -2850,6 +2938,21 @@ impl AnsVerifierBuilder {
                  scitt_refreshable_key_store() on the builder"
                     .to_string(),
             )));
+        }
+
+        #[cfg(feature = "scitt")]
+        let badge_enabled = !matches!(
+            self.scitt_config.as_ref().map(|config| config.tier_policy),
+            Some(ScittTierPolicy::RequireScitt)
+        );
+        #[cfg(not(feature = "scitt"))]
+        let badge_enabled = true;
+        if badge_enabled {
+            validate_badge_configuration(
+                self.trusted_ra_domains.as_ref(),
+                self.cache_config.as_ref(),
+                self.failure_policy,
+            )?;
         }
 
         // Determine DNS resolver: custom > nameservers > preset > default
@@ -2997,7 +3100,7 @@ mod tests {
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_test_cert_identity(host, fingerprint);
@@ -3019,7 +3122,7 @@ mod tests {
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_test_cert_identity(
@@ -3060,7 +3163,7 @@ mod tests {
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_test_cert_identity(host, cert_fingerprint);
@@ -3100,7 +3203,7 @@ mod tests {
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_test_cert_identity(host, fingerprint);
@@ -3162,7 +3265,7 @@ mod tests {
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_test_cert_identity(host, fingerprint);
@@ -3243,7 +3346,7 @@ mod tests {
             tlog_client,
             cache: None,
             failure_policy: FailurePolicy::FailClosed,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_mtls_cert_identity(host, version, identity_fp);
@@ -3262,7 +3365,7 @@ mod tests {
             tlog_client,
             cache: None,
             failure_policy: FailurePolicy::FailClosed,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         // Create cert with no CN or DNS SANs
@@ -3292,7 +3395,7 @@ mod tests {
             tlog_client,
             cache: None,
             failure_policy: FailurePolicy::FailClosed,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         // Create cert with CN but no URI SANs
@@ -3338,7 +3441,7 @@ mod tests {
             tlog_client,
             cache: None,
             failure_policy: FailurePolicy::FailClosed,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_mtls_cert_identity(host, version, cert_identity_fp);
@@ -3375,7 +3478,7 @@ mod tests {
             tlog_client,
             cache: None,
             failure_policy: FailurePolicy::FailClosed,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_mtls_cert_identity(host, cert_version, identity_fp);
@@ -3556,7 +3659,7 @@ mod tests {
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_test_cert_identity(cert_host, fingerprint);
@@ -3599,7 +3702,7 @@ mod tests {
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let fqdn = Fqdn::new(host).unwrap();
@@ -3621,7 +3724,7 @@ mod tests {
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let fqdn = Fqdn::new("unknown.example.com").unwrap();
@@ -3655,7 +3758,7 @@ mod tests {
             },
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_test_cert_identity(
@@ -3701,7 +3804,7 @@ mod tests {
             },
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_test_cert_identity(host, fingerprint);
@@ -3823,6 +3926,7 @@ mod tests {
 
         // with_dane_if_present convenience method
         let verifier = ServerVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns.clone())
             .tlog_client(tlog.clone())
             .with_dane_if_present()
@@ -3833,6 +3937,7 @@ mod tests {
 
         // require_dane convenience method
         let verifier = ServerVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns.clone())
             .tlog_client(tlog.clone())
             .require_dane()
@@ -3843,6 +3948,7 @@ mod tests {
 
         // explicit dane_policy
         let verifier = ServerVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns.clone())
             .tlog_client(tlog.clone())
             .dane_policy(DanePolicy::Disabled)
@@ -3859,6 +3965,7 @@ mod tests {
 
         // Default port is 443
         let verifier = ServerVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns.clone())
             .tlog_client(tlog.clone())
             .build()
@@ -3868,6 +3975,7 @@ mod tests {
 
         // Custom port
         let verifier = ServerVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns.clone())
             .tlog_client(tlog.clone())
             .dane_port(8443)
@@ -3883,6 +3991,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = ServerVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns)
             .tlog_client(tlog)
             .failure_policy(FailurePolicy::FailClosed)
@@ -3934,7 +4043,7 @@ mod tests {
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         // Cert has the NEW fingerprint — cache has OLD → mismatch → refresh → success
@@ -3973,7 +4082,7 @@ mod tests {
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_test_cert_identity(host, cert_fp);
@@ -4026,7 +4135,7 @@ mod tests {
             tlog_client,
             cache: Some(cache),
             failure_policy: FailurePolicy::FailClosed,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         // Client cert has new fingerprint — cache has old → mismatch → refresh → success
@@ -4044,8 +4153,8 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_validate_badge_domain_unit_allows_when_none() {
-        assert!(validate_badge_domain(None, "https://tlog.example.com/v1/agents/test").is_ok());
+    fn test_validate_badge_domain_unit_rejects_when_none() {
+        assert!(validate_badge_domain(None, "https://tlog.example.com/v1/agents/test").is_err());
     }
 
     #[test]
@@ -4080,7 +4189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_trusted_ra_none_allows_all() {
+    async fn test_trusted_ra_none_rejects_unconfigured_trust() {
         let host = "test.example.com";
         let fingerprint = "SHA256:e7b64d16f42055d6faf382a43dc35b98be76aba0db145a904b590a034b33b904";
         let badge = create_test_badge(host, "v1.0.0", fingerprint, "SHA256:aaa");
@@ -4094,20 +4203,26 @@ mod tests {
         let dns_resolver = Arc::new(MockDnsResolver::new().with_records(host, vec![dns_record]));
         let tlog_client = Arc::new(MockTransparencyLogClient::new().with_badge(badge_url, badge));
 
-        let verifier = ServerVerifier {
+        let mut verifier = ServerVerifier {
             dns_resolver,
             tlog_client,
             cache: None,
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Disabled,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
+        // Exercise the fetch-time guard even if internal construction bypasses
+        // the public builder's configuration validation.
+        verifier.trusted_ra_domains = None;
 
         let cert = create_test_cert_identity(host, fingerprint);
         let fqdn = Fqdn::new(host).unwrap();
         let outcome = verifier.verify(&fqdn, &cert).await;
-        assert!(outcome.is_success(), "None should allow all domains");
+        assert!(matches!(
+            outcome,
+            VerificationOutcome::TlogError(TlogError::UntrustedDomain { .. })
+        ));
     }
 
     #[tokio::test]
@@ -4297,6 +4412,7 @@ mod tests {
 
         // Test that the builder method configures correctly
         let verifier = AnsVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns as Arc<dyn DnsResolver>)
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .dns_cloudflare() // preset is ignored when custom resolver is set
@@ -4314,6 +4430,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = AnsVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_nameservers(&[std::net::Ipv4Addr::new(1, 1, 1, 1)])
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .build()
@@ -4329,6 +4446,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = AnsVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_preset(DnsResolverConfig::Cloudflare)
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .build()
@@ -4351,6 +4469,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = AnsVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns as Arc<dyn DnsResolver>)
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .build()
@@ -4372,6 +4491,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = AnsVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns as Arc<dyn DnsResolver>)
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .private_ca_pem(ca_pem.as_bytes().to_vec())
@@ -4394,6 +4514,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = AnsVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns as Arc<dyn DnsResolver>)
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .private_ca_pem(ca_pem.as_bytes().to_vec())
@@ -4413,6 +4534,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = AnsVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns as Arc<dyn DnsResolver>)
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .build()
@@ -4437,6 +4559,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = AnsVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns as Arc<dyn DnsResolver>)
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .with_caching()
@@ -4454,6 +4577,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = AnsVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns as Arc<dyn DnsResolver>)
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .with_cache_config(CacheConfig::default())
@@ -4470,6 +4594,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = ServerVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns as Arc<dyn DnsResolver>)
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .with_dane_if_present()
@@ -4486,6 +4611,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = ServerVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns as Arc<dyn DnsResolver>)
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .require_dane()
@@ -4502,6 +4628,7 @@ mod tests {
         let tlog = Arc::new(MockTransparencyLogClient::new());
 
         let verifier = ServerVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(dns as Arc<dyn DnsResolver>)
             .tlog_client(tlog as Arc<dyn TransparencyLogClient>)
             .dane_port(8443)
@@ -4563,7 +4690,7 @@ mod tests {
             failure_policy: FailurePolicy::FailClosed,
             dane_policy: DanePolicy::Required,
             dane_port: 443,
-            trusted_ra_domains: None,
+            trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
         };
 
         let cert = create_test_cert_identity(host, fingerprint);
@@ -4807,14 +4934,14 @@ mod tests {
                 failure_policy: FailurePolicy::FailClosed,
                 dane_policy: DanePolicy::Disabled,
                 dane_port: 443,
-                trusted_ra_domains: None,
+                trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
             };
             let client_verifier = ClientVerifier {
                 dns_resolver,
                 tlog_client,
                 cache: None,
                 failure_policy: FailurePolicy::FailClosed,
-                trusted_ra_domains: None,
+                trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
             };
 
             AnsVerifier {
@@ -4854,6 +4981,83 @@ mod tests {
                 &[],
             );
             make_token(signing_key, &payload)
+        }
+
+        #[tokio::test]
+        async fn scitt_only_builder_needs_signing_keys_but_not_badge_hosts() {
+            let (_, store) = make_key_and_store(1);
+            AnsVerifier::builder()
+                .dns_resolver(Arc::new(MockDnsResolver::new()))
+                .tlog_client(Arc::new(MockTransparencyLogClient::new()))
+                .scitt_config(ScittConfig::new().with_tier_policy(ScittTierPolicy::RequireScitt))
+                .scitt_key_store(Arc::new(store))
+                .build()
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn scitt_crypto_and_outcome_caches_do_not_cross_trust_scopes() {
+            let (signing_key, trusted) = make_key_and_store(1);
+            let (_, untrusted) = make_key_and_store(2);
+            let payload = build_cbor_payload(
+                &nil_uuid(),
+                "ACTIVE",
+                0,
+                future_exp(),
+                "ans://v1.0.0.agent.example.com",
+                &[],
+                &[
+                    (test_fp(), "X509-DV-SERVER".into()),
+                    (test_fp2(), "X509-DV-SERVER".into()),
+                ],
+            );
+            let headers = ScittHeaders {
+                status_token: Some(make_token(&signing_key, &payload)),
+                receipt: None,
+            };
+            let cache = crate::scitt::ScittVerificationCache::new(10);
+            let trusted = Arc::new(RefreshableKeyStore::from_static(trusted));
+            let untrusted = Arc::new(RefreshableKeyStore::from_static(untrusted));
+            let config = ScittConfig::new().with_tier_policy(ScittTierPolicy::RequireScitt);
+            let cert = create_test_cert_identity("agent.example.com", &test_fp());
+            for _ in 0..2 {
+                let outcome = AnsVerifier::try_scitt_verification(
+                    &cert,
+                    &headers,
+                    &trusted,
+                    &config,
+                    true,
+                    Some("agent.example.com"),
+                    Some(&cache),
+                )
+                .await
+                .unwrap();
+                assert!(outcome.is_success(), "{outcome:?}");
+            }
+            // The first certificate exercises Layer 2; the second would hit
+            // only the token cache if its key ignored the trust configuration.
+            for fingerprint in [test_fp(), test_fp2()] {
+                let cert = create_test_cert_identity("agent.example.com", &fingerprint);
+                let outcome = AnsVerifier::try_scitt_verification(
+                    &cert,
+                    &headers,
+                    &untrusted,
+                    &config,
+                    true,
+                    Some("agent.example.com"),
+                    Some(&cache),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    matches!(
+                        outcome,
+                        VerificationOutcome::ScittError(ScittError::UnknownKeyId(_))
+                    ),
+                    "{outcome:?}"
+                );
+            }
         }
 
         // ── ScittConfig / ScittTierPolicy tests ─────────────────────────
@@ -5362,6 +5566,7 @@ mod tests {
         #[test]
         fn builder_scitt_config_sets_field() {
             let builder = AnsVerifier::builder()
+                .trusted_ra_domains(["tlog.example.com"])
                 .scitt_config(ScittConfig::new().with_tier_policy(ScittTierPolicy::RequireScitt));
             assert!(builder.scitt_config.is_some());
             assert!(matches!(
@@ -5373,13 +5578,17 @@ mod tests {
         #[test]
         fn builder_scitt_key_store_sets_field() {
             let (_, store) = make_key_and_store(1);
-            let builder = AnsVerifier::builder().scitt_key_store(Arc::new(store));
+            let builder = AnsVerifier::builder()
+                .trusted_ra_domains(["tlog.example.com"])
+                .scitt_key_store(Arc::new(store));
             assert!(builder.scitt_key_store.is_some());
         }
 
         #[test]
         fn builder_debug_includes_scitt() {
-            let builder = AnsVerifier::builder().scitt_config(ScittConfig::default());
+            let builder = AnsVerifier::builder()
+                .trusted_ra_domains(["tlog.example.com"])
+                .scitt_config(ScittConfig::default());
             let dbg = format!("{builder:?}");
             assert!(dbg.contains("has_scitt_config"));
             assert!(dbg.contains("true"));
@@ -5426,14 +5635,14 @@ mod tests {
                 failure_policy: FailurePolicy::FailClosed,
                 dane_policy: DanePolicy::Disabled,
                 dane_port: 443,
-                trusted_ra_domains: None,
+                trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
             };
             let client_verifier = ClientVerifier {
                 dns_resolver,
                 tlog_client,
                 cache: None,
                 failure_policy: FailurePolicy::FailClosed,
-                trusted_ra_domains: None,
+                trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
             };
 
             // Config present, but NO key store
@@ -5483,14 +5692,14 @@ mod tests {
                 failure_policy: FailurePolicy::FailClosed,
                 dane_policy: DanePolicy::Disabled,
                 dane_port: 443,
-                trusted_ra_domains: None,
+                trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
             };
             let client_verifier = ClientVerifier {
                 dns_resolver,
                 tlog_client,
                 cache: None,
                 failure_policy: FailurePolicy::FailClosed,
-                trusted_ra_domains: None,
+                trusted_ra_domains: Some(HashSet::from(["tlog.example.com".to_string()])),
             };
 
             let verifier = AnsVerifier {

@@ -42,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Build verifier with SCITT enabled
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["transparency.ans.godaddy.com"])
         .dns_google()
         .with_caching()
         .scitt_config(ScittConfig::new().with_tier_policy(ScittTierPolicy::ScittWithBadgeFallback))

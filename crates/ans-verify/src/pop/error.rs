@@ -18,6 +18,8 @@ pub enum PopErrorKind {
     Replay,
     /// Replay cache is at capacity of still-live entries (fail closed).
     ReplayCacheFull,
+    /// Shared replay backend failed or timed out (fail closed).
+    ReplayCacheUnavailable,
     /// JWS signature does not verify under the `x5c[0]` key.
     SignatureInvalid,
     /// Missing, unparseable, non-P-256, or out-of-validity `x5c` leaf.
@@ -57,6 +59,7 @@ impl PopErrorKind {
             Self::ProofStale => "PROOF_STALE",
             Self::Replay => "REPLAY",
             Self::ReplayCacheFull => "REPLAY_CACHE_FULL",
+            Self::ReplayCacheUnavailable => "REPLAY_CACHE_UNAVAILABLE",
             Self::SignatureInvalid => "SIGNATURE_INVALID",
             Self::CertInvalid => "CERT_INVALID",
             Self::KeyMismatch => "KEY_MISMATCH",
@@ -92,7 +95,8 @@ pub struct PopError {
 }
 
 impl PopError {
-    pub(crate) fn new(kind: PopErrorKind, message: impl Into<String>) -> Self {
+    /// Construct an error for a public verification callback or replay backend.
+    pub fn new(kind: PopErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -100,7 +104,11 @@ impl PopError {
         }
     }
 
-    pub(crate) fn with_source(
+    /// Construct an error while preserving the underlying failure.
+    ///
+    /// Replay backends should use [`PopErrorKind::ReplayCacheUnavailable`] for
+    /// timeouts and transport errors; verification will reject the request.
+    pub fn with_source(
         kind: PopErrorKind,
         message: impl Into<String>,
         source: impl Into<Box<dyn std::error::Error + Send + Sync>>,

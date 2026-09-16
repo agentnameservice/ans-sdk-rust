@@ -32,16 +32,19 @@ const REPLAY_GRACE_SECS: i64 = 5;
 #[derive(Debug, Clone)]
 pub struct ProofResult {
     /// DER of the `x5c[0]` identity certificate.
+    #[cfg(any(test, feature = "test-support"))]
     pub cert_der: Vec<u8>,
-    /// SHA-256 fingerprint of `cert_der`.
+    /// SHA-256 fingerprint of the identity certificate DER.
     pub fingerprint: CertFingerprint,
     /// RFC 7638 thumbprint of the proof key (`cnf.jkt`).
     pub jkt: String,
     /// Proof identifier (raw `jti` claim).
     pub jti: String,
     /// Normalized `htu` from the proof.
+    #[cfg(any(test, feature = "test-support"))]
     pub htu: String,
     /// Proof `iat` as Unix seconds.
+    #[cfg(any(test, feature = "test-support"))]
     pub issued_at: i64,
     pub(crate) replay_exp: i64,
     /// The certificate's `ans://` URI SAN, extracted during cert parsing so
@@ -51,7 +54,8 @@ pub struct ProofResult {
     pub(crate) content_sha256: [u8; 32],
 }
 
-/// Options for [`verify_proof`].
+/// Options for possession verification. Exposed only with `test-support`;
+/// applications authenticate requests with [`super::verify_caller`].
 #[derive(Debug, Clone, Default)]
 pub struct VerifyProofOptions {
     /// Access token presented as `Authorization: DPoP <token>`.
@@ -61,17 +65,15 @@ pub struct VerifyProofOptions {
     pub access_token: Option<String>,
     /// SHA-256 of the received content; `None` means the digest of empty
     /// content. Every proof must carry a matching `ans_content_digest`.
+    #[cfg(any(test, feature = "test-support"))]
     pub content_sha256: Option<[u8; 32]>,
-    /// Retained for source compatibility. Content binding is always required
-    /// by ANS-6 §7.13, including when this field is `false`.
-    pub require_content_binding: bool,
     /// Freshness window. `None` or zero uses [`DEFAULT_POP_SKEW`].
     pub skew: Option<Duration>,
     /// Unix timestamp used as `now`. `None` uses the system clock.
     pub now: Option<i64>,
 }
 
-/// Verify a compact `DPoP` proof against an HTTP method and URL.
+/// Test-support utility to verify a compact proof without ANS identity binding.
 ///
 /// Order: size cap, compact structure, pinned `typ`/`alg` plus required
 /// `jwk`/`x5c`, payload shape and supported `ans_profile`, required content
@@ -88,6 +90,7 @@ pub struct VerifyProofOptions {
 ///
 /// Returns a [`PopError`] for any failed check, including replay-cache errors
 /// (fail closed).
+#[cfg(any(test, feature = "test-support"))]
 pub async fn verify_proof(
     proof_jws: &str,
     method: &str,
@@ -106,7 +109,7 @@ pub async fn verify_proof(
 
 /// `cert_cache`: when set, the parsed `x5c[0]` is reused for identical entry
 /// bytes; the validity window still checks against `now` on every call.
-pub fn verify_proof_unrecorded(
+pub(super) fn verify_proof_unrecorded(
     proof_jws: &str,
     method: &str,
     raw_url: &str,
@@ -170,12 +173,15 @@ pub fn verify_proof_unrecorded(
         jkt: leaf.jkt.clone(),
         ans_name: leaf.ans_name.clone(),
         jti: payload.jti,
+        #[cfg(any(test, feature = "test-support"))]
         htu: payload.htu,
+        #[cfg(any(test, feature = "test-support"))]
         issued_at: payload.iat,
         replay_exp: payload
             .iat
             .saturating_add(skew_secs)
             .saturating_add(REPLAY_GRACE_SECS),
+        #[cfg(any(test, feature = "test-support"))]
         cert_der: leaf.der.clone(),
         content_sha256,
     })

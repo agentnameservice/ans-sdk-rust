@@ -2,6 +2,8 @@
 
 Trust verification library for the Agent Name Service (ANS).
 
+See the [0.2 migration guide](../../MIGRATING.md) for ANS-6 model and configuration changes.
+
 ## Overview
 
 This crate implements the ANS trust verification flow, combining DNS lookups, transparency log badge retrieval, and certificate fingerprint comparison to verify agent identities.
@@ -14,6 +16,7 @@ use ans_verify::{AnsVerifier, CertIdentity, CertFingerprint, VerificationOutcome
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["transparency.ans.godaddy.com"])
         .with_caching()
         .build()
         .await?;
@@ -125,6 +128,7 @@ differently (`x-http` vs `http-api`); `AgentProtocol` normalizes both.
 use ans_verify::AnsVerifier;
 
 let verifier = AnsVerifier::builder()
+    .trusted_ra_domains(["transparency.ans.godaddy.com"])
     .dns_cloudflare()  // or .dns_google(), .dns_quad9()
     .build()
     .await?;
@@ -143,6 +147,7 @@ let verifier = AnsVerifier::builder()
 use ans_verify::ServerVerifier;
 
 let verifier = ServerVerifier::builder()
+    .trusted_ra_domains(["transparency.ans.godaddy.com"])
     .with_dane_if_present()  // verify TLSA if records exist
     // or .require_dane()    // fail if no TLSA records
     .dane_port(8443)         // custom port (default: 443)
@@ -154,6 +159,7 @@ let verifier = ServerVerifier::builder()
 
 ```rust
 let verifier = AnsVerifier::builder()
+    .trusted_ra_domains(["transparency.ans.godaddy.com"])
     .with_caching()   // enable Moka-based TTL cache
     .build()
     .await?;
@@ -172,7 +178,7 @@ let verifier = ServerVerifier::builder()
     .await?;
 ```
 
-When configured, badge URLs discovered via DNS TXT records are validated before any HTTP request is made. URLs pointing to hosts outside the set are rejected with `TlogError::UntrustedDomain`. The compatibility default (`None`) allows all domains and does not satisfy ANS-6's badge trust requirement.
+Missing or empty allowlists fail at build time. Badge URLs discovered via DNS TXT records must use HTTPS and name a configured host; the HTTP client does not follow redirects. HTTPS on a nondefault port remains supported. `RequireScitt` configurations with trusted signing keys can omit badge-host trust.
 
 V2 badges use `serverCerts` and `identityCerts` arrays; verification accepts any matching fingerprint in the relevant array. Identity certificates may be absent for server-only registrations. V1 singular attestations remain readable. In the Rust model, optional `identity_cert`, `server_cert`, `domain_validation`, and `expires_at` fields are `Option`; code accessing these fields directly must handle their absence. Prefer the fingerprint iterators when matching certificates.
 
@@ -267,7 +273,7 @@ Outbound minting: `Signer` / `attach_identity`. Inbound: `verify_caller` (three-
 
 Every proof must carry a valid `ans_content_digest`, including the empty-content digest when no content is sent (§7.13). Sign content with `attach_identity_with_content` / `Signer::sign_with_content`. On the callee, use `verify_caller_with_content`: its callback runs only after the proof is bound to a live identity. Enforce the body-size limit and read deadline there, hash after transfer-coding removal but before content decoding, and do not act on content until verification returns success. A digest mismatch or body-read error leaves the `jti` unconsumed. Recompression changes the digest; changing chunk framing does not.
 
-The precomputed `content_sha256` option remains available for content already hashed behind an authentication boundary; `None` means empty content. `require_content_binding` remains for source compatibility but cannot disable the required check. Revision `1` is the only supported profile: an absent `ans_profile` selects it, malformed values reject, and unknown revisions reject with `UNSUPPORTED_PROFILE`. Profile selection is deferred by the spec.
+The precomputed `content_sha256` option remains available for content already hashed behind an authentication boundary; `None` means empty content. Content binding is unconditional; the obsolete opt-in flags have been removed. Revision `1` is the only supported profile: an absent `ans_profile` selects it, malformed values reject, and unknown revisions reject with `UNSUPPORTED_PROFILE`. Profile selection is deferred by the spec.
 
 Callee hardening: `VerifyCallerOptions::with_trusted_authority` rejects requests for authorities this callee does not answer as (ANS-6 §7.7), and `with_artifact_cache` (`VerifiedArtifactCache`) skips re-verifying a status token or receipt whose exact bytes verified before, while still enforcing token expiry (§4.6). On an unknown signing key, `PopError::is_unknown_key_id()` signals the refresh-and-retry pattern (§9.5) — pair with `RefreshableKeyStore::refresh_if_cooldown_elapsed`.
 
@@ -346,6 +352,7 @@ let tlog = Arc::new(MockTransparencyLogClient::new()
     .with_badge("https://tlog.example.com/badge", badge));
 
 let verifier = ServerVerifier::builder()
+    .trusted_ra_domains(["tlog.example.com"])
     .dns_resolver(dns)
     .tlog_client(tlog)
     .build()
@@ -358,7 +365,7 @@ let verifier = ServerVerifier::builder()
 |---|---|
 | `rustls` | Enables `AnsServerCertVerifier` and `AnsClientCertVerifier` for rustls TLS integration |
 | `scitt` | Enables SCITT verification and ANS-6 DPoP: `ScittKeyStore`, `verify_status_token`, `verify_receipt`, `ScittHeaderSupplier`, `HttpScittClient`, `Signer`, `verify_caller` |
-| `fast-verify` | Swaps ECDSA P-256 *verification* to `ring`'s assembly implementation (~3x faster; implies `scitt`). The default stays pure-Rust `p256`. `ring` is the same backend the `rustls` feature already links |
+| `fast-verify` | Uses `ring` for ECDSA P-256 verification (implies `scitt`); the default backend is `p256`. Both are tested in CI. Benchmark on your deployment target |
 | `test-support` | Exposes `MockDnsResolver`, `MockTransparencyLogClient`, and `MockScittClient` for use in downstream integration tests |
 
 ## License

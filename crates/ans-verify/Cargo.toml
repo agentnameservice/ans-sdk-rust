@@ -69,9 +69,8 @@ ring = { workspace = true, optional = true }
 default = []
 rustls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
 scitt = ["dep:ciborium", "dep:p256", "dep:tokio-util", "dep:rand"]
-# Assembly-optimized ECDSA P-256 verification via ring (~3x faster than the
-# pure-Rust p256 default). ring is the same backend the `rustls` feature
-# already links for TLS.
+# ECDSA P-256 verification via ring instead of p256. Both backends are tested
+# in CI. ring is already present transitively through the networking stack.
 fast-verify = ["scitt", "dep:ring"]
 test-support = []
 

@@ -27,7 +27,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let verifier = AnsVerifier::builder().with_caching().build().await?;
+    let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["transparency.ans.godaddy.com"])
+        .with_caching()
+        .build()
+        .await?;
 
     // In practice, you'd extract this from the mTLS handshake.
     // The identity cert must have a URI SAN with the ANS name.

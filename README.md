@@ -152,6 +152,7 @@ use ans_verify::{AnsVerifier, CertFingerprint, CertIdentity, VerificationOutcome
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["transparency.ans.godaddy.com"])
         .with_caching()
         .build()
         .await?;
@@ -188,6 +189,7 @@ use ans_verify::{AnsVerifier, CertFingerprint, CertIdentity, VerificationOutcome
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["transparency.ans.godaddy.com"])
         .with_caching()
         .build()
         .await?;
@@ -244,6 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key_store = Arc::new(ScittKeyStore::from_c2sp_keys(&root_keys)?);
 
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["transparency.ans.godaddy.com"])
         .with_caching()
         .scitt_config(ScittConfig::new()
             .with_tier_policy(ScittTierPolicy::ScittWithBadgeFallback))
@@ -408,6 +411,7 @@ DANE binds certificates to DNS names via TLSA records, providing additional veri
 
 ```rust
 let verifier = AnsVerifier::builder()
+    .trusted_ra_domains(["transparency.ans.godaddy.com"])
     // Use Cloudflare DNS
     .dns_cloudflare()
 
@@ -534,6 +538,7 @@ let tlog_client = Arc::new(
 );
 
 let verifier = ServerVerifier::builder()
+    .trusted_ra_domains(["tlog.example.com"])
     .dns_resolver(dns_resolver)
     .tlog_client(tlog_client)
     .with_dane_if_present()
@@ -590,6 +595,7 @@ use std::sync::Arc;
 
 // Pre-fetch the badge to get expected fingerprint
 let verifier = AnsVerifier::builder()
+    .trusted_ra_domains(["transparency.ans.godaddy.com"])
     .dane_policy(DanePolicy::ValidateIfPresent)
     .with_caching()
     .build()
@@ -623,7 +629,11 @@ let server_config = rustls::ServerConfig::builder()
     .with_single_cert(server_certs, server_key)?;
 
 // After TLS handshake, verify client against badge
-let verifier = AnsVerifier::builder().with_caching().build().await?;
+let verifier = AnsVerifier::builder()
+    .trusted_ra_domains(["transparency.ans.godaddy.com"])
+    .with_caching()
+    .build()
+    .await?;
 
 // Extract client cert identity from the TLS connection
 let cert_identity = CertIdentity::from_der(client_cert_der)?;

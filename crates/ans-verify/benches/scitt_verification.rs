@@ -8,14 +8,14 @@
 //!
 //! ```bash
 //! cargo bench -p ans-verify --features scitt,test-support
-//! # ring-backed ECDSA verification (~3x faster verifies):
+//! # ring-backed ECDSA verification:
 //! cargo bench -p ans-verify --features scitt,test-support,fast-verify
 //! # squeeze the pure-Rust backend further:
 //! RUSTFLAGS="-C target-cpu=native" cargo bench -p ans-verify --features scitt,test-support
 //! ```
 
 use std::hint::black_box;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use ans_verify::{
@@ -36,6 +36,20 @@ use uuid::Uuid;
 const ANS_NAME: &str = "ans://v1.0.0.caller.example.com";
 const METHOD: &str = "POST";
 const URL: &str = "https://payments.example.com/api/task";
+const BENCH_NOW: i64 = 1_780_000_000;
+static REPLAY_CLOCK: AtomicI64 = AtomicI64::new(BENCH_NOW);
+
+fn benchmark_now() -> i64 {
+    BENCH_NOW
+}
+
+fn replay_benchmark_now() -> i64 {
+    REPLAY_CLOCK.load(Ordering::Relaxed)
+}
+
+fn request_replay_cache() -> MemoryReplayCache {
+    MemoryReplayCache::new(1).with_clock(benchmark_now)
+}
 
 // ── Fixtures (mirror examples/local_dpop.rs) ───────────────────────────────
 
@@ -261,13 +275,15 @@ fn bench_dpop(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let (id_key, cert_der, fp) = caller_identity();
     let (tl, store) = tl_key();
-    let now = chrono::Utc::now().timestamp();
+    let now = benchmark_now();
     let agent_id = Uuid::nil();
     // A 2^20-entry log: the receipt carries a 20-node inclusion path.
     let token = mint_status_token(&tl, agent_id, &fp, now);
     let receipt = mint_receipt(&tl, agent_id, 20);
     let headers = ScittHeaders::new(Some(receipt.clone()), Some(token.clone()));
-    let signer = Signer::new(id_key, cert_der).unwrap();
+    let signer = Signer::new(id_key, cert_der)
+        .unwrap()
+        .with_clock(benchmark_now);
 
     let mut group = c.benchmark_group("dpop");
     group.throughput(criterion::Throughput::Elements(1));
@@ -276,28 +292,31 @@ fn bench_dpop(c: &mut Criterion) {
         b.iter(|| attach_identity(black_box(&signer), METHOD, URL, None).unwrap());
     });
 
-    // Each proof is single-use (fresh jti), so mint per iteration in setup;
-    // only the verification is measured.
-    let replay = MemoryReplayCache::new(2_000_000);
+    // Mint each single-use proof and allocate its replay cache in untimed
+    // setup. Returning the cache also keeps its destruction outside timing.
+    // Replay occupancy is measured separately at 100k live entries below.
     group.bench_function("verify_proof", |b| {
         b.to_async(&rt).iter_batched(
-            || signer.sign(METHOD, URL, None).unwrap(),
-            |proof| {
-                let replay = &replay;
-                async move {
-                    verify_proof(
-                        &proof,
-                        METHOD,
-                        URL,
-                        replay,
-                        VerifyProofOptions {
-                            now: Some(now),
-                            ..VerifyProofOptions::default()
-                        },
-                    )
-                    .await
-                    .unwrap()
-                }
+            || {
+                (
+                    signer.sign(METHOD, URL, None).unwrap(),
+                    request_replay_cache(),
+                )
+            },
+            |(proof, replay)| async move {
+                let result = verify_proof(
+                    &proof,
+                    METHOD,
+                    URL,
+                    &replay,
+                    VerifyProofOptions {
+                        now: Some(now),
+                        ..VerifyProofOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+                (result, replay)
             },
             criterion::BatchSize::SmallInput,
         );
@@ -315,17 +334,22 @@ fn bench_dpop(c: &mut Criterion) {
 
     // Cold — first contact: nothing cached, every request re-verifies proof
     // + status token + receipt (3 ECDSA verifies + the Merkle walk).
-    let replay_cold = MemoryReplayCache::new(2_000_000);
     group.bench_function("verify_caller_cold", |b| {
         b.to_async(&rt).iter_batched(
-            || signer.sign(METHOD, URL, None).unwrap(),
-            |proof| {
-                let (headers, store, replay) = (&headers, &store, &replay_cold);
+            || {
+                (
+                    signer.sign(METHOD, URL, None).unwrap(),
+                    request_replay_cache(),
+                )
+            },
+            |(proof, replay)| {
+                let (headers, store) = (&headers, &store);
                 let opts = opts(None);
                 async move {
-                    verify_caller(&proof, headers, METHOD, URL, store, replay, opts)
+                    let result = verify_caller(&proof, headers, METHOD, URL, store, &replay, opts)
                         .await
-                        .unwrap()
+                        .unwrap();
+                    (result, replay)
                 }
             },
             criterion::BatchSize::SmallInput,
@@ -334,19 +358,24 @@ fn bench_dpop(c: &mut Criterion) {
 
     // No-receipt — the `require_receipt: false` deployment shape: liveness +
     // possession only, two ECDSA verifies instead of three.
-    let replay_no_receipt = MemoryReplayCache::new(2_000_000);
     let headers_no_receipt = ScittHeaders::new(None, Some(token.clone()));
     group.bench_function("verify_caller_no_receipt", |b| {
         b.to_async(&rt).iter_batched(
-            || signer.sign(METHOD, URL, None).unwrap(),
-            |proof| {
-                let (headers, store, replay) = (&headers_no_receipt, &store, &replay_no_receipt);
+            || {
+                (
+                    signer.sign(METHOD, URL, None).unwrap(),
+                    request_replay_cache(),
+                )
+            },
+            |(proof, replay)| {
+                let (headers, store) = (&headers_no_receipt, &store);
                 let mut o = opts(None);
                 o.require_receipt = false;
                 async move {
-                    verify_caller(&proof, headers, METHOD, URL, store, replay, o)
+                    let result = verify_caller(&proof, headers, METHOD, URL, store, &replay, o)
                         .await
-                        .unwrap()
+                        .unwrap();
+                    (result, replay)
                 }
             },
             criterion::BatchSize::SmallInput,
@@ -356,7 +385,6 @@ fn bench_dpop(c: &mut Criterion) {
     // Warm — known agent: the receipt is cached from an earlier request, but
     // the status token has rotated (fresh bytes each iteration, varying iat),
     // so it re-verifies (2 ECDSA verifies per request).
-    let replay_warm = MemoryReplayCache::new(2_000_000);
     let cache_warm = VerifiedArtifactCache::default();
     rt.block_on(async {
         let proof = signer.sign(METHOD, URL, None).unwrap();
@@ -366,7 +394,7 @@ fn bench_dpop(c: &mut Criterion) {
             METHOD,
             URL,
             &store,
-            &replay_warm,
+            &request_replay_cache(),
             opts(Some(cache_warm.clone())),
         )
         .await
@@ -379,15 +407,20 @@ fn bench_dpop(c: &mut Criterion) {
                 let iat = now + i64::try_from(iat_counter.fetch_add(1, Ordering::Relaxed)).unwrap();
                 let rotated = mint_status_token(&tl, agent_id, &fp, iat);
                 let headers = ScittHeaders::new(Some(receipt.clone()), Some(rotated));
-                (signer.sign(METHOD, URL, None).unwrap(), headers)
+                (
+                    signer.sign(METHOD, URL, None).unwrap(),
+                    headers,
+                    request_replay_cache(),
+                )
             },
-            |(proof, headers)| {
-                let (store, replay) = (&store, &replay_warm);
+            |(proof, headers, replay)| {
+                let store = &store;
                 let opts = opts(Some(cache_warm.clone()));
                 async move {
-                    verify_caller(&proof, &headers, METHOD, URL, store, replay, opts)
+                    let result = verify_caller(&proof, &headers, METHOD, URL, store, &replay, opts)
                         .await
-                        .unwrap()
+                        .unwrap();
+                    (result, replay)
                 }
             },
             criterion::BatchSize::SmallInput,
@@ -397,7 +430,6 @@ fn bench_dpop(c: &mut Criterion) {
     // Hot — steady state: receipt and status-token bytes are unchanged
     // between requests, so both verify from the artifact cache (ANS-6 §4.6)
     // and the per-request crypto collapses to the single proof verification.
-    let replay_hot = MemoryReplayCache::new(2_000_000);
     let cache_hot = VerifiedArtifactCache::default();
     rt.block_on(async {
         let proof = signer.sign(METHOD, URL, None).unwrap();
@@ -407,7 +439,7 @@ fn bench_dpop(c: &mut Criterion) {
             METHOD,
             URL,
             &store,
-            &replay_hot,
+            &request_replay_cache(),
             opts(Some(cache_hot.clone())),
         )
         .await
@@ -415,14 +447,20 @@ fn bench_dpop(c: &mut Criterion) {
     });
     group.bench_function("verify_caller_hot", |b| {
         b.to_async(&rt).iter_batched(
-            || signer.sign(METHOD, URL, None).unwrap(),
-            |proof| {
-                let (headers, store, replay) = (&headers, &store, &replay_hot);
+            || {
+                (
+                    signer.sign(METHOD, URL, None).unwrap(),
+                    request_replay_cache(),
+                )
+            },
+            |(proof, replay)| {
+                let (headers, store) = (&headers, &store);
                 let opts = opts(Some(cache_hot.clone()));
                 async move {
-                    verify_caller(&proof, headers, METHOD, URL, store, replay, opts)
+                    let result = verify_caller(&proof, headers, METHOD, URL, store, &replay, opts)
                         .await
-                        .unwrap()
+                        .unwrap();
+                    (result, replay)
                 }
             },
             criterion::BatchSize::SmallInput,
@@ -442,42 +480,51 @@ fn bench_dpop(c: &mut Criterion) {
         b.to_async(&rt).iter_custom(|iters| {
             let (signer, headers, store) = (signer.clone(), headers.clone(), store.clone());
             async move {
-                let total = usize::try_from(iters).unwrap();
-                let proofs: Vec<String> = (0..total)
-                    .map(|_| signer.sign(METHOD, URL, None).unwrap())
-                    .collect();
-                let proofs = std::sync::Arc::new(proofs);
-                let replay = std::sync::Arc::new(MemoryReplayCache::new(total + 1));
+                let mut remaining = iters;
+                let mut elapsed = Duration::ZERO;
+                while remaining > 0 {
+                    // Bound fixture memory independently of Criterion's sample size.
+                    let total = usize::try_from(remaining.min(1024)).unwrap();
+                    let proofs: Vec<String> = (0..total)
+                        .map(|_| signer.sign(METHOD, URL, None).unwrap())
+                        .collect();
+                    let proofs = std::sync::Arc::new(proofs);
+                    let replay = std::sync::Arc::new(
+                        MemoryReplayCache::new(total).with_clock(benchmark_now),
+                    );
 
-                let start = std::time::Instant::now();
-                let handles: Vec<_> = (0..workers)
-                    .map(|w| {
-                        let (proofs, headers, store, replay) = (
-                            proofs.clone(),
-                            headers.clone(),
-                            store.clone(),
-                            replay.clone(),
-                        );
-                        tokio::spawn(async move {
-                            for i in (w..proofs.len()).step_by(workers) {
-                                let opts = VerifyCallerOptions {
-                                    now: Some(now),
-                                    ..VerifyCallerOptions::default()
+                    let start = std::time::Instant::now();
+                    let handles: Vec<_> = (0..workers)
+                        .map(|w| {
+                            let (proofs, headers, store, replay) = (
+                                proofs.clone(),
+                                headers.clone(),
+                                store.clone(),
+                                replay.clone(),
+                            );
+                            tokio::spawn(async move {
+                                for i in (w..proofs.len()).step_by(workers) {
+                                    let opts = VerifyCallerOptions {
+                                        now: Some(now),
+                                        ..VerifyCallerOptions::default()
+                                    }
+                                    .with_trusted_authority("payments.example.com");
+                                    verify_caller(
+                                        &proofs[i], &headers, METHOD, URL, &store, &*replay, opts,
+                                    )
+                                    .await
+                                    .unwrap();
                                 }
-                                .with_trusted_authority("payments.example.com");
-                                verify_caller(
-                                    &proofs[i], &headers, METHOD, URL, &store, &*replay, opts,
-                                )
-                                .await
-                                .unwrap();
-                            }
+                            })
                         })
-                    })
-                    .collect();
-                for h in handles {
-                    h.await.unwrap();
+                        .collect();
+                    for h in handles {
+                        h.await.unwrap();
+                    }
+                    elapsed += start.elapsed();
+                    remaining -= u64::try_from(total).unwrap();
                 }
-                start.elapsed()
+                elapsed
             }
         });
     });
@@ -517,16 +564,14 @@ fn bench_ecdsa(c: &mut Criterion) {
 
 fn bench_replay_cache(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let now = chrono::Utc::now().timestamp();
-    let far_future = now + 86_400;
-    // Criterion drives tens of millions of iterations through this path, so
-    // measured inserts use an already-expired exp: each entry is evicted by
-    // the next call's housekeeping and occupancy stays flat at the prefill.
-    let already_expired = now - 60;
+    REPLAY_CLOCK.store(BENCH_NOW, Ordering::Relaxed);
+    // Preloaded entries stay live while the injected clock advances once per
+    // measured insert. Each measured entry expires before the following call.
+    let far_future = i64::MAX / 2;
 
     // Steady-state occupancy: 100k live entries, matching the §7.6 sizing
     // for ~800 req/s at the default window.
-    let cache = MemoryReplayCache::new(2_000_000);
+    let cache = MemoryReplayCache::new(100_002).with_clock(replay_benchmark_now);
     rt.block_on(async {
         for i in 0..100_000u64 {
             cache
@@ -543,12 +588,14 @@ fn bench_replay_cache(c: &mut Criterion) {
             |key| {
                 let cache = &cache;
                 async move {
-                    black_box(cache.check_and_store(&key, already_expired).await.unwrap());
+                    let now = REPLAY_CLOCK.fetch_add(60, Ordering::Relaxed) + 60;
+                    black_box(cache.check_and_store(&key, now + 1).await.unwrap());
                 }
             },
             criterion::BatchSize::SmallInput,
         );
     });
+    assert!(cache.len() <= 100_001, "benchmark replay occupancy grew");
 }
 
 criterion_group!(

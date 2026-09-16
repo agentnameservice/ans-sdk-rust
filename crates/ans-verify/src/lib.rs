@@ -24,7 +24,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let verifier = AnsVerifier::new().await?;
+//!     let verifier = AnsVerifier::new(["transparency.ans.godaddy.com"]).await?;
 //!
 //!     // After TLS handshake, extract server certificate and verify
 //!     let cert_der: &[u8] = &[]; // Your certificate bytes
@@ -169,14 +169,16 @@ pub use scitt::{
 pub use pop::{
     ANS_PROFILE_REVISION, CallerIdentity, DEFAULT_ARTIFACT_CACHE_ENTRIES, DEFAULT_POP_SKEW,
     DEFAULT_REPLAY_MAX_ENTRIES, DPOP_HEADER, MAX_JTI_SIZE, MAX_PROOF_SIZE, MemoryReplayCache,
-    PopError, PopErrorKind, ProofResult, ReplayCache, Signer, VerifiedArtifactCache,
-    VerifyCallerOptions, VerifyProofOptions, access_token_from_authorization, attach_identity,
-    attach_identity_with_content, normalize_authority, normalize_htu, reject_duplicate_header,
-    request_authority, verify_caller, verify_caller_with_content, verify_proof,
+    PopError, PopErrorKind, ReplayCache, Signer, VerifiedArtifactCache, VerifyCallerOptions,
+    access_token_from_authorization, attach_identity, attach_identity_with_content,
+    normalize_authority, normalize_htu, reject_duplicate_header, request_authority, verify_caller,
+    verify_caller_with_content,
 };
 
 #[cfg(all(feature = "scitt", any(test, feature = "test-support")))]
 pub use p256_verify::verify_p256_sha256;
+#[cfg(all(feature = "scitt", any(test, feature = "test-support")))]
+pub use pop::{ProofResult, VerifyProofOptions, verify_proof};
 #[cfg(all(feature = "scitt", any(test, feature = "test-support")))]
 pub use scitt::{
     MockScittClient, ParsedCoseSign1, compute_sig_structure_digest, matches_identity_cert,

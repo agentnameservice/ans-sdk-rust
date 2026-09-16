@@ -260,6 +260,7 @@ async fn make_scitt_verifier(
     let tlog = Arc::new(MockTransparencyLogClient::new().with_badge(BADGE_URL, badge));
 
     AnsVerifier::builder()
+        .trusted_ra_domains(["tlog.example.com"])
         .dns_resolver(dns)
         .tlog_client(tlog)
         .scitt_config(ScittConfig::new().with_tier_policy(policy))
@@ -408,6 +409,7 @@ async fn ans6_scitt_enforces_dane_on_fresh_and_cached_results() {
             })
             .collect();
         let verifier = AnsVerifier::builder()
+            .trusted_ra_domains(["tlog.example.com"])
             .dns_resolver(Arc::new(
                 MockDnsResolver::new().with_tlsa_records(HOST, 443, records),
             ))
@@ -1358,6 +1360,7 @@ async fn test_s9_1_unknown_key_triggers_refresh_and_succeeds() {
     let tlog = Arc::new(MockTransparencyLogClient::new().with_badge(BADGE_URL, badge));
 
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["tlog.example.com"])
         .dns_resolver(dns)
         .tlog_client(tlog)
         .scitt_config(ScittConfig::new().with_tier_policy(ScittTierPolicy::ScittWithBadgeFallback))
@@ -1399,6 +1402,7 @@ async fn make_cached_scitt_verifier(
     let tlog = Arc::new(MockTransparencyLogClient::new().with_badge(BADGE_URL, badge));
 
     AnsVerifier::builder()
+        .trusted_ra_domains(["tlog.example.com"])
         .dns_resolver(dns)
         .tlog_client(tlog)
         .scitt_config(ScittConfig::new().with_tier_policy(policy))
@@ -1443,6 +1447,7 @@ async fn test_s9_2_unknown_key_within_cooldown_returns_error() {
     let tlog = Arc::new(MockTransparencyLogClient::new().with_badge(BADGE_URL, badge));
 
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["tlog.example.com"])
         .dns_resolver(dns)
         .tlog_client(tlog)
         .scitt_config(ScittConfig::new().with_tier_policy(ScittTierPolicy::RequireScitt))
@@ -1670,6 +1675,7 @@ async fn test_s10_5_with_caching_enables_scitt_cache() {
     let tlog = Arc::new(MockTransparencyLogClient::new().with_badge(BADGE_URL, badge));
 
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["tlog.example.com"])
         .dns_resolver(dns)
         .tlog_client(tlog)
         .scitt_config(ScittConfig::new().with_tier_policy(ScittTierPolicy::ScittWithBadgeFallback))
@@ -1711,6 +1717,7 @@ async fn test_s10_6_explicit_cache_builder_method() {
 
     let custom_cache = ScittVerificationCache::new(50);
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(["tlog.example.com"])
         .dns_resolver(dns)
         .tlog_client(tlog)
         .scitt_config(ScittConfig::new().with_tier_policy(ScittTierPolicy::ScittWithBadgeFallback))
@@ -1952,6 +1959,7 @@ async fn test_fallback_policy_bad_receipt_rejects() {
 #[tokio::test]
 async fn test_builder_rejects_config_without_key_store() {
     let result = AnsVerifier::builder()
+        .trusted_ra_domains(["tlog.example.com"])
         .scitt_config(ScittConfig::new())
         .build()
         .await;

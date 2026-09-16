@@ -143,10 +143,11 @@ impl fmt::Debug for BadgeCache {
 
 impl BadgeCache {
     /// Create a new cache with the given configuration.
-    pub fn new(config: CacheConfig) -> Self {
+    pub fn new(mut config: CacheConfig) -> Self {
+        config.hard_ttl = config.hard_ttl.max(config.default_ttl);
         let cache = Cache::builder()
             .max_capacity(config.max_entries)
-            .time_to_live(config.hard_ttl.max(config.default_ttl))
+            .time_to_live(config.hard_ttl)
             .build();
 
         Self {
@@ -159,6 +160,13 @@ impl BadgeCache {
     /// Create a new cache with default configuration.
     pub fn with_defaults() -> Self {
         Self::new(CacheConfig::default())
+    }
+
+    /// Effective cache configuration, including the clamped hard retention TTL.
+    ///
+    /// Capacity eviction may remove entries before this retention bound.
+    pub fn config(&self) -> &CacheConfig {
+        &self.config
     }
 
     /// Get a cached badge by key.

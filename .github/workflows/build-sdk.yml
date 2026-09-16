@@ -27,8 +27,17 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
-    name: Clippy
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - backend: p256
+            name: Clippy
+            extra_features: ""
+          - backend: ring
+            name: Clippy (fast-verify)
+            extra_features: ",ans-verify/fast-verify"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -41,13 +50,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-clippy-${{ matrix.backend }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-clippy-
-      - run: cargo clippy --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt
+      - run: cargo clippy --locked --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt${{ matrix.extra_features }}
 
   test:
-    name: Test
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - backend: p256
+            name: Test
+            extra_features: ""
+          - backend: ring
+            name: Test (fast-verify)
+            extra_features: ",ans-verify/fast-verify"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -59,9 +77,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-test-${{ matrix.backend }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-test-
-      - run: cargo test --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt
+      - run: cargo test --locked --workspace --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt${{ matrix.extra_features }}
+      - name: Benchmark smoke test
+        run: cargo bench --locked --profile dev -p ans-verify --bench scitt_verification --features test-support,rustls,scitt${{ matrix.extra_features }} -- --test
 
   build:
     name: Build
@@ -100,8 +120,17 @@ jobs:
       - run: cargo doc --workspace --no-deps --features ans-verify/rustls,ans-verify/scitt
 
   msrv:
-    name: MSRV (1.88)
+    name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - backend: p256
+            name: MSRV (1.88)
+            extra_features: ""
+          - backend: ring
+            name: MSRV (1.88, fast-verify)
+            extra_features: ",ans-verify/fast-verify"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -113,9 +142,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-msrv-${{ matrix.backend }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-msrv-
-      - run: cargo check --workspace --features ans-verify/rustls,ans-verify/scitt
+      - run: cargo check --locked --workspace --features ans-verify/rustls,ans-verify/scitt${{ matrix.extra_features }}
 
   audit:
     name: Security Audit

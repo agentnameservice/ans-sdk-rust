@@ -112,10 +112,11 @@ pub fn accept_es256_dpop(header: &ProofHeader) -> Result<(), PopError> {
 #[derive(Debug, Clone)]
 pub struct LeafCert {
     /// DER of the certificate.
+    #[cfg(any(test, feature = "test-support"))]
     pub der: Vec<u8>,
     /// The certificate's ECDSA P-256 public key.
     pub key: VerifyingKey,
-    /// SHA-256 fingerprint of `der`.
+    /// SHA-256 fingerprint of the certificate DER.
     pub fingerprint: ans_types::CertFingerprint,
     /// RFC 7638 thumbprint of `key`.
     pub jkt: String,
@@ -149,6 +150,7 @@ pub fn parse_leaf_cert(x5c0: &str) -> Result<LeafCert, PopError> {
         fingerprint: ans_types::CertFingerprint::from_der(&der),
         jkt: jwk_thumbprint(&key)?,
         ans_name: identity.ans_name(),
+        #[cfg(any(test, feature = "test-support"))]
         der,
         key,
         not_before,

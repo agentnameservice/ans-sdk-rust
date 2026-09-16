@@ -120,6 +120,32 @@ fn sign_cose(
     buf
 }
 
+fn add_signed_issuer(tl_key: &SigningKey, artifact: &[u8], issuer: &str) -> Vec<u8> {
+    let ciborium::Value::Array(parts) = ciborium::de::from_reader(artifact).unwrap() else {
+        panic!("fixture must be COSE_Sign1");
+    };
+    let ciborium::Value::Map(mut protected) =
+        ciborium::de::from_reader(parts[0].as_bytes().unwrap().as_slice()).unwrap()
+    else {
+        panic!("fixture protected headers must be a map");
+    };
+    protected.push((
+        ciborium::Value::Integer(15.into()),
+        ciborium::Value::Map(vec![(
+            ciborium::Value::Integer(1.into()),
+            ciborium::Value::Text(issuer.into()),
+        )]),
+    ));
+    let mut encoded = Vec::new();
+    ciborium::ser::into_writer(&ciborium::Value::Map(protected), &mut encoded).unwrap();
+    sign_cose(
+        tl_key,
+        encoded,
+        parts[1].clone(),
+        parts[2].as_bytes().unwrap(),
+    )
+}
+
 fn make_status_token(
     tl_key: &SigningKey,
     agent_id: Uuid,
@@ -937,7 +963,7 @@ async fn trusted_authority_preflight_accepts_and_rejects() {
 }
 
 #[tokio::test]
-async fn artifact_cache_reuses_verified_artifacts() {
+async fn artifact_cache_is_scoped_to_trusted_keys() {
     let (id_key, cert, fp) = identity_material(23, ANS_NAME);
     let (tl_key, store) = make_tl_key(7);
     let agent_id = Uuid::nil();
@@ -968,12 +994,25 @@ async fn artifact_cache_reuses_verified_artifacts() {
     .await
     .unwrap();
 
-    // Same bytes against a store that does NOT trust the TL key: only a
-    // cache hit (skipped crypto) can make this succeed.
-    let (_, wrong_store) = make_tl_key(8);
+    // Identical bytes still work under an equivalent cloned trust store.
     let proof2 = signer.sign(METHOD, URL, None).unwrap();
-    let id = verify_caller(
+    verify_caller(
         &proof2,
+        &headers(&receipt, &token),
+        METHOD,
+        URL,
+        &store.clone(),
+        &replay(),
+        opts(&cache),
+    )
+    .await
+    .unwrap();
+
+    // A different trust store must not inherit the previous verification.
+    let (_, wrong_store) = make_tl_key(8);
+    let proof3 = signer.sign(METHOD, URL, None).unwrap();
+    let error = verify_caller(
+        &proof3,
         &headers(&receipt, &token),
         METHOD,
         URL,
@@ -982,8 +1021,114 @@ async fn artifact_cache_reuses_verified_artifacts() {
         opts(&cache),
     )
     .await
+    .unwrap_err();
+    assert!(error.is_unknown_key_id());
+}
+
+#[tokio::test]
+async fn artifact_cache_scope_includes_issuer_name_for_tokens_and_receipts() {
+    use crate::scitt::ScittError;
+    use std::error::Error as _;
+
+    let (id_key, cert, fp) = identity_material(23, ANS_NAME);
+    let signer = signer_at_now(id_key, cert);
+    let (tl_key, trusted) = make_tl_key(7);
+    let spki = tl_key.verifying_key().to_public_key_der().unwrap();
+    let renamed = ScittKeyStore::from_c2sp_keys(&[format!(
+        "different-tl.example.com+{}+{}",
+        hex::encode(&Sha256::digest(spki.as_bytes())[..4]),
+        BASE64_STANDARD.encode(spki.as_bytes()),
+    )])
     .unwrap();
-    assert_eq!(id.ans_name.to_string(), ANS_NAME);
+
+    for token_issuer in [true, false] {
+        let cache = VerifiedArtifactCache::new(8);
+        let mut token = make_status_token(&tl_key, Uuid::nil(), ANS_NAME, &fp);
+        let mut receipt = make_receipt(&tl_key, Uuid::nil(), ANS_NAME);
+        if token_issuer {
+            token = add_signed_issuer(&tl_key, &token, "tl.example.com");
+        } else {
+            receipt = add_signed_issuer(&tl_key, &receipt, "tl.example.com");
+        }
+        let options = || VerifyCallerOptions {
+            now: Some(NOW),
+            artifact_cache: Some(cache.clone()),
+            ..Default::default()
+        };
+        verify_caller(
+            &signer.sign(METHOD, URL, None).unwrap(),
+            &headers(&receipt, &token),
+            METHOD,
+            URL,
+            &trusted,
+            &replay(),
+            options(),
+        )
+        .await
+        .unwrap();
+        let replay_cache = replay();
+        let error = verify_caller(
+            &signer.sign(METHOD, URL, None).unwrap(),
+            &headers(&receipt, &token),
+            METHOD,
+            URL,
+            &renamed,
+            &replay_cache,
+            options(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.kind,
+            if token_issuer {
+                PopErrorKind::StatusInvalid
+            } else {
+                PopErrorKind::ReceiptInvalid
+            }
+        );
+        assert!(matches!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<ScittError>()),
+            Some(ScittError::IssuerMismatch { .. })
+        ));
+        assert!(replay_cache.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn unavailable_shared_replay_backend_rejects_authenticated_callers() {
+    struct Unavailable;
+    #[async_trait::async_trait]
+    impl ReplayCache for Unavailable {
+        async fn check_and_store(&self, _key: &str, _exp: i64) -> Result<bool, PopError> {
+            Err(PopError::with_source(
+                PopErrorKind::ReplayCacheUnavailable,
+                "replay backend timed out",
+                std::io::Error::from(std::io::ErrorKind::TimedOut),
+            ))
+        }
+    }
+    let (key, cert, fp) = identity_material(23, ANS_NAME);
+    let (tl_key, store) = make_tl_key(7);
+    let token = make_status_token(&tl_key, Uuid::nil(), ANS_NAME, &fp);
+    let receipt = make_receipt(&tl_key, Uuid::nil(), ANS_NAME);
+    let signer = signer_at_now(key, cert);
+    let error = verify_caller(
+        &signer.sign(METHOD, URL, None).unwrap(),
+        &headers(&receipt, &token),
+        METHOD,
+        URL,
+        &store,
+        &Unavailable,
+        VerifyCallerOptions {
+            now: Some(NOW),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, PopErrorKind::ReplayCacheUnavailable);
 }
 
 #[tokio::test]
@@ -1111,63 +1256,49 @@ async fn content_binding_both_directions() {
     let signer = signer_at_now(key, cert);
     let body = br#"{"amount": 100}"#;
     let digest: [u8; 32] = Sha256::digest(body).into();
-    let opts = |content: Option<[u8; 32]>, require: bool| VerifyProofOptions {
+    let opts = |content: Option<[u8; 32]>| VerifyProofOptions {
         content_sha256: content,
-        require_content_binding: require,
         now: Some(NOW),
         ..VerifyProofOptions::default()
     };
 
     // Bound content, matching digest → ok.
     let bound = signer.sign_with_content(METHOD, URL, None, body).unwrap();
-    verify_proof(&bound, METHOD, URL, &replay(), opts(Some(digest), false))
+    verify_proof(&bound, METHOD, URL, &replay(), opts(Some(digest)))
         .await
         .unwrap();
 
     // Bound content, tampered body → reject.
     let tampered: [u8; 32] = Sha256::digest(br#"{"amount": 9999}"#).into();
-    let err = verify_proof(&bound, METHOD, URL, &replay(), opts(Some(tampered), false))
+    let err = verify_proof(&bound, METHOD, URL, &replay(), opts(Some(tampered)))
         .await
         .unwrap_err();
     assert_eq!(err.kind, PopErrorKind::ContentBindingMismatch);
 
     // Claim present but request carries no content → reject.
     let bound2 = signer.sign_with_content(METHOD, URL, None, body).unwrap();
-    let err = verify_proof(&bound2, METHOD, URL, &replay(), opts(None, false))
+    let err = verify_proof(&bound2, METHOD, URL, &replay(), opts(None))
         .await
         .unwrap_err();
     assert_eq!(err.kind, PopErrorKind::ContentBindingMismatch);
 
-    // Adding content to an empty request breaks its signed empty digest,
-    // even when the obsolete opt-in flag is false.
+    // Adding content to an empty request breaks its signed empty digest.
     let empty_request = signer.sign(METHOD, URL, None).unwrap();
-    let err = verify_proof(
-        &empty_request,
-        METHOD,
-        URL,
-        &replay(),
-        opts(Some(digest), false),
-    )
-    .await
-    .unwrap_err();
+    let err = verify_proof(&empty_request, METHOD, URL, &replay(), opts(Some(digest)))
+        .await
+        .unwrap_err();
     assert_eq!(err.kind, PopErrorKind::ContentBindingMismatch);
 
     // Empty content is explicitly bound, with either representation of the
     // received digest accepted by the low-level options.
     let empty = signer.sign_with_content(METHOD, URL, None, b"").unwrap();
-    verify_proof(&empty, METHOD, URL, &replay(), opts(None, false))
+    verify_proof(&empty, METHOD, URL, &replay(), opts(None))
         .await
         .unwrap();
     let empty_digest: [u8; 32] = Sha256::digest(b"").into();
-    verify_proof(
-        &empty,
-        METHOD,
-        URL,
-        &replay(),
-        opts(Some(empty_digest), true),
-    )
-    .await
-    .unwrap();
+    verify_proof(&empty, METHOD, URL, &replay(), opts(Some(empty_digest)))
+        .await
+        .unwrap();
 }
 
 #[test]

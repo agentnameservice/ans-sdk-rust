@@ -15,12 +15,14 @@
 //!
 //! - `ANS_CERT_PATH` (required): Path to identity certificate (PEM)
 //! - `ANS_KEY_PATH` (required): Path to identity private key (PEM)
+//! - `ANS_TRUSTED_TL_DOMAINS` (required): Comma-separated trusted TL hosts
 //! - `ANS_SERVER_URL`: MCP server URL (default: `https://agent.example.com/mcp`)
 //! - `ANS_SERVER_HOST`: Server hostname for badge lookup (default: `agent.example.com`)
 //!
 //! # Run
 //!
 //! ```bash
+//! ANS_TRUSTED_TL_DOMAINS=transparency.ans.godaddy.com \
 //! ANS_CERT_PATH=./identity.crt ANS_KEY_PATH=./identity.key \
 //!   cargo run --example mcp_mtls_client --features rustls
 //! ```
@@ -60,10 +62,18 @@ async fn main() -> Result<()> {
         .expect("ANS_CERT_PATH required: path to identity certificate");
     let key_path =
         std::env::var("ANS_KEY_PATH").expect("ANS_KEY_PATH required: path to identity private key");
+    let trusted_domains = std::env::var("ANS_TRUSTED_TL_DOMAINS")
+        .context("ANS_TRUSTED_TL_DOMAINS required: configure trusted TL hosts out of band")?;
 
     // Step 1: Fetch the ANS badge and get expected server fingerprint
     println!("Fetching ANS badge for {server_host}...");
     let verifier = AnsVerifier::builder()
+        .trusted_ra_domains(
+            trusted_domains
+                .split(',')
+                .map(str::trim)
+                .filter(|host| !host.is_empty()),
+        )
         .dane_policy(DanePolicy::ValidateIfPresent)
         .dns_google()
         .with_caching()

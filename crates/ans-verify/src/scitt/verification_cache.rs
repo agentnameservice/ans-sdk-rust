@@ -26,7 +26,9 @@
 //! [`StatusTokenCache`](super::scitt_cache::StatusTokenCache) and
 //! [`ReceiptCache`](super::scitt_cache::ReceiptCache) are **agent-side**
 //! caches keyed by agent UUID, used by [`ScittHeaderSupplier`](super::supplier::ScittHeaderSupplier).
-//! This module provides **verifier-side** caches keyed by content hash.
+//! This module provides **verifier-side** caches keyed by content and trust
+//! scope. The scope includes the trusted key IDs, public keys, and TL names,
+//! so a result verified under one trust configuration cannot satisfy another.
 
 use std::fmt;
 use std::sync::Arc;
@@ -54,17 +56,17 @@ const DEFAULT_RECEIPT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Cache key for the Layer 2 outcome cache.
 ///
-/// Combines the certificate fingerprint, status token content hash, and
-/// optional receipt content hash. This naturally provides connection-level
+/// Combines the certificate fingerprint, trust-scoped status token hash, and
+/// optional trust-scoped receipt hash. This naturally provides connection-level
 /// deduplication: within a single TLS connection the cert never changes,
 /// and the agent typically sends the same token on every request.
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct OutcomeKey {
     /// Raw bytes of the certificate fingerprint (SHA-256).
     cert_fingerprint_bytes: [u8; 32],
-    /// SHA-256 of the raw status token bytes.
+    /// Hash of the trust scope and raw status token bytes.
     token_hash: [u8; 32],
-    /// SHA-256 of the raw receipt bytes, if present.
+    /// Hash of the trust scope and raw receipt bytes, if present.
     receipt_hash: Option<[u8; 32]>,
 }
 
@@ -172,12 +174,14 @@ impl Expiry<OutcomeKey, Arc<CachedScittOutcome>> for OutcomeExpiry {
 /// use ans_verify::{AnsVerifier, ScittVerificationCache};
 ///
 /// let verifier = AnsVerifier::builder()
+///     .trusted_ra_domains(["transparency.ans.godaddy.com"])
 ///     .with_caching() // enables badge + SCITT verification caching
 ///     .build()
 ///     .await?;
 ///
 /// // Or with custom sizing:
 /// let verifier = AnsVerifier::builder()
+///     .trusted_ra_domains(["transparency.ans.godaddy.com"])
 ///     .with_scitt_verification_cache(ScittVerificationCache::new(5000))
 ///     .build()
 ///     .await?;
@@ -185,10 +189,10 @@ impl Expiry<OutcomeKey, Arc<CachedScittOutcome>> for OutcomeExpiry {
 #[allow(clippy::struct_field_names)]
 pub struct ScittVerificationCache {
     /// Layer 1: Content-addressed store for verified status tokens.
-    /// Key = SHA-256 of raw token bytes.
+    /// Key = hash of the trust scope and raw token bytes.
     token_cache: Cache<[u8; 32], Arc<VerifiedStatusToken>>,
     /// Layer 1: Content-addressed store for verified receipts.
-    /// Key = SHA-256 of raw receipt bytes.
+    /// Key = hash of the trust scope and raw receipt bytes.
     receipt_cache: Cache<[u8; 32], Arc<VerifiedReceipt>>,
     /// Layer 2: Full outcome store keyed by
     /// (`cert_fingerprint`, `token_hash`, `receipt_hash`?).
