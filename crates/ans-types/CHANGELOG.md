@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-types-v0.1.5...ans-types-v0.2.0) (2026-09-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* Badge-capable builders require trusted TL hosts, and AnsVerifier::new takes them explicitly. AgentEvent.expires_at and the domain_validation, identity_cert, and server_cert attestations are optional in this release. CertType and EventType no longer implement Copy. The possession-only proof API requires test-support and the no-op content binding flag is removed. See MIGRATING.md and use the badge fingerprint iterators when consuming certificate evidence.
+
+### Features
+
+* add ANS-6 Method B authentication ([#105](https://github.com/agentnameservice/ans-sdk-rust/issues/105)) ([6188283](https://github.com/agentnameservice/ans-sdk-rust/commit/61882837ae2f465fdc805f0745f62b88841bddec))
+* add SVCB endpoint discovery with profile autodiscovery ([#99](https://github.com/agentnameservice/ans-sdk-rust/issues/99)) ([8cfd887](https://github.com/agentnameservice/ans-sdk-rust/commit/8cfd8877280f4e042da40db0da1469ff71b940f0))
+
 ## [0.1.5](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-types-v0.1.4...ans-types-v0.1.5) (2026-06-23)
 
 
