@@ -32,6 +32,7 @@ version = "0.1.5"
 dependencies = [
  "ans-types",
  "chrono",
+ "pkcs8",
  "rand",
  "rcgen",
  "reqwest",

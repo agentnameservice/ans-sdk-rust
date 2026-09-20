@@ -73,7 +73,28 @@ pub enum CsrError {
     /// A caller-supplied key uses an algorithm the RA rejects.
     #[error("unsupported key algorithm: the RA accepts RSA and ECDSA P-256/P-384")]
     UnsupportedKeyAlgorithm,
+
+    /// A caller-supplied key is not PKCS#8.
+    #[error("private key must be PKCS#8 (BEGIN PRIVATE KEY); convert PKCS#1 or SEC1 keys first")]
+    KeyNotPkcs8,
+
+    /// The host exceeds the DNS presentation limit.
+    #[error("agent host too long: {octets} octets, maximum {MAX_HOST_OCTETS}")]
+    HostTooLong {
+        /// Octet length of the offending host.
+        octets: usize,
+    },
+
+    /// The host is an IP literal, which cannot anchor an ANS name.
+    #[error("agent host must be a domain name, not an IP literal")]
+    HostIsIpLiteral,
+
+    /// The host is a single label; ANS requires at least two.
+    #[error("agent host must have at least two labels")]
+    HostNotFullyQualified,
 }
+
+const MAX_HOST_OCTETS: usize = 253;
 
 /// Mirrors the RA's own allowlist, which excludes Ed25519, ML-DSA and P-521.
 const ACCEPTED_ALGORITHMS: &[&SignatureAlgorithm] = &[
@@ -92,9 +113,9 @@ enum CsrKind {
 
 /// Builder for ANS-compliant Certificate Signing Requests.
 ///
-/// Taking [`Fqdn`] and [`Version`] rather than strings makes a malformed host
-/// or version unrepresentable; parse untrusted input with [`Fqdn::new`] and
-/// [`Version::parse`] first.
+/// Taking [`Fqdn`] and [`Version`] rather than strings keeps malformed input
+/// out of the constructors, and [`build`](Self::build) re-checks the ANS host
+/// profile because `Fqdn`'s derived `Deserialize` can bypass [`Fqdn::new`].
 #[derive(Debug)]
 pub struct AnsCsrBuilder {
     host: Fqdn,
@@ -129,7 +150,9 @@ impl AnsCsrBuilder {
     /// Sign with an existing PKCS#8 PEM key instead of generating a new one.
     ///
     /// Renewal reuses the key so the certificate's public key is unchanged;
-    /// this is also the way to request an ECDSA certificate.
+    /// this is also the way to request an ECDSA certificate. PKCS#1
+    /// (`RSA PRIVATE KEY`) and SEC1 (`EC PRIVATE KEY`) input is rejected
+    /// rather than relabelled.
     #[must_use]
     pub fn with_key_pair_pem(mut self, key_pair_pem: SecretString) -> Self {
         self.key_pair_pem = Some(key_pair_pem);
@@ -141,19 +164,25 @@ impl AnsCsrBuilder {
     ///
     /// # Errors
     /// [`CsrError::InvalidName`] if the host and version do not form a
-    /// parseable [`AnsName`], [`CsrError::InvalidKeyPair`] or
-    /// [`CsrError::UnsupportedKeyAlgorithm`] if a supplied key is unreadable or
-    /// uses an algorithm the RA rejects, [`CsrError::Serialization`] if key
-    /// generation or CSR encoding fails.
+    /// parseable [`AnsName`]; [`CsrError::HostTooLong`],
+    /// [`CsrError::HostIsIpLiteral`] or [`CsrError::HostNotFullyQualified`] if
+    /// the host is outside the ANS profile; [`CsrError::InvalidKeyPair`],
+    /// [`CsrError::UnsupportedKeyAlgorithm`] or [`CsrError::KeyNotPkcs8`] if a
+    /// supplied key is unreadable, uses an algorithm the RA rejects, or is not
+    /// PKCS#8; [`CsrError::Serialization`] if key generation or CSR encoding
+    /// fails.
     pub fn build(self) -> Result<CsrOutput, CsrError> {
-        // Validated before key generation, which is the expensive step.
-        let sans = build_sans(&self.host, &self.version, self.kind)?;
+        // Canonical, not merely valid: a deserialized `Fqdn` skips `Fqdn::new`,
+        // so casing and a trailing dot would otherwise reach the encoded name.
+        // Ahead of the key work, which is the expensive step.
+        let host = canonical_ans_host(&self.host)?;
+        let sans = build_sans(&host, &self.version, self.kind)?;
 
         let key_pair = match &self.key_pair_pem {
             Some(pem) => load_key_pair(pem)?,
             None => generate_rsa_key_pair()?,
         };
-        let csr_pem = build_csr(&key_pair, &self.host, sans, self.kind)?;
+        let csr_pem = build_csr(&key_pair, &host, sans, self.kind)?;
 
         Ok(CsrOutput {
             csr_pem,
@@ -168,13 +197,40 @@ fn generate_rsa_key_pair() -> Result<KeyPair, CsrError> {
     KeyPair::generate_for(&PKCS_RSA_SHA256).map_err(CsrError::Serialization)
 }
 
-fn load_key_pair(pem: &SecretString) -> Result<KeyPair, CsrError> {
-    let key_pair = KeyPair::from_pem(pem.expose_secret()).map_err(CsrError::InvalidKeyPair)?;
-    if ACCEPTED_ALGORITHMS.contains(&key_pair.algorithm()) {
-        Ok(key_pair)
-    } else {
-        Err(CsrError::UnsupportedKeyAlgorithm)
+fn canonical_ans_host(host: &Fqdn) -> Result<Fqdn, CsrError> {
+    // Re-parsing closes the `Deserialize` bypass: the derived impl skips
+    // `Fqdn::new`, so charset and label rules are otherwise never applied.
+    let host = Fqdn::new(host.as_str())?;
+    let value = host.as_str();
+
+    if value.len() > MAX_HOST_OCTETS {
+        return Err(CsrError::HostTooLong {
+            octets: value.len(),
+        });
     }
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return Err(CsrError::HostIsIpLiteral);
+    }
+    if value.split('.').count() < 2 {
+        return Err(CsrError::HostNotFullyQualified);
+    }
+
+    Ok(host)
+}
+
+fn load_key_pair(pem: &SecretString) -> Result<KeyPair, CsrError> {
+    let pem = pem.expose_secret();
+    let algorithm = KeyPair::from_pem(pem)
+        .map_err(CsrError::InvalidKeyPair)?
+        .algorithm();
+
+    if !ACCEPTED_ALGORITHMS.contains(&algorithm) {
+        return Err(CsrError::UnsupportedKeyAlgorithm);
+    }
+
+    // rcgen also takes PKCS#1 and SEC1, then re-emits them under a PKCS#8
+    // label; this entry point parses the body as PKCS#8 or not at all.
+    KeyPair::from_pkcs8_pem_and_sign_algo(pem, algorithm).map_err(|_| CsrError::KeyNotPkcs8)
 }
 
 fn build_sans(host: &Fqdn, version: &Version, kind: CsrKind) -> Result<Vec<SanType>, CsrError> {

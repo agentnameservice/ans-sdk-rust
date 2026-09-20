@@ -378,17 +378,14 @@ fn identity_csr_embeds_rsa_2048_public_key() {
     );
 }
 
-/// PKCS#8 loads into rustls and openssl without conversion; PKCS#1 does not.
+/// Strict-parsed, not substring-matched: rcgen stamps a PKCS#8 label on
+/// whatever DER it holds, so only decoding the body proves the format.
 #[rstest]
 #[case::server(server_csr("agent.example.com", "1.0.0"))]
 #[case::identity(identity_csr("agent.example.com", "1.0.0"))]
-fn private_key_pem_is_pkcs8(#[case] out: ans_client::CsrOutput) {
-    let key = out.private_key_pem.expose_secret();
-    assert!(
-        key.contains("BEGIN PRIVATE KEY"),
-        "private key must be PKCS#8 (BEGIN PRIVATE KEY), got: {}",
-        &key[..key.find('\n').unwrap_or(40)]
-    );
+fn private_key_pem_parses_as_pkcs8(#[case] out: ans_client::CsrOutput) {
+    let (oid, _) = strict_pkcs8(out.private_key_pem.expose_secret());
+    assert_eq!(oid, RSA_ENCRYPTION);
 }
 
 // ── Secret handling ───────────────────────────────────────────────────────────
@@ -550,4 +547,214 @@ fn malformed_key_pair_is_rejected() {
         .expect_err("garbage key must be rejected");
 
     assert!(matches!(err, ans_client::CsrError::InvalidKeyPair(_)));
+}
+
+// ── ANS host profile ──────────────────────────────────────────────────────────
+
+type Ctor = fn(Fqdn, Version) -> AnsCsrBuilder;
+
+/// Builds a host of exactly `total` octets from three 63-octet labels plus a
+/// remainder label.
+fn host_of_octets(total: usize) -> String {
+    let head = format!("{}.{}.{}.", "a".repeat(63), "b".repeat(63), "c".repeat(63));
+    format!("{head}{}", "d".repeat(total - head.len()))
+}
+
+/// `Fqdn` derives `Deserialize`, so this reaches the builder without ever
+/// running `Fqdn::new`.
+fn deserialized_fqdn(host: &str) -> Fqdn {
+    let json = serde_json::to_string(host).expect("str serializes");
+    serde_json::from_str::<Fqdn>(&json).expect("Fqdn derives Deserialize")
+}
+
+#[rstest]
+#[case::server(AnsCsrBuilder::server as Ctor)]
+#[case::identity(AnsCsrBuilder::identity as Ctor)]
+fn host_over_253_octets_is_rejected(#[case] ctor: Ctor) {
+    let host = host_of_octets(255);
+    assert!(
+        Fqdn::new(&host).is_ok(),
+        "the shared type permits this; the builder is the gate"
+    );
+
+    let err = ctor(fqdn(&host), version("1.0.0"))
+        .build()
+        .expect_err("over-long host must be rejected");
+    assert!(matches!(
+        err,
+        ans_client::CsrError::HostTooLong { octets: 255 }
+    ));
+}
+
+#[rstest]
+#[case::server(AnsCsrBuilder::server as Ctor)]
+#[case::identity(AnsCsrBuilder::identity as Ctor)]
+fn host_of_exactly_253_octets_is_accepted(#[case] ctor: Ctor) {
+    let host = host_of_octets(253);
+    let out = ctor(fqdn(&host), version("1.0.0"))
+        .build()
+        .expect("253 octets is within the limit");
+    assert!(subject_alt_names(&out.csr_pem).contains(&format!("DNS:{host}")));
+}
+
+#[rstest]
+#[case::server(AnsCsrBuilder::server as Ctor)]
+#[case::identity(AnsCsrBuilder::identity as Ctor)]
+fn single_label_host_is_rejected(#[case] ctor: Ctor) {
+    assert!(Fqdn::new("localhost").is_ok(), "pinned by ans-types");
+
+    let err = ctor(fqdn("localhost"), version("1.0.0"))
+        .build()
+        .expect_err("a single-label host must be rejected");
+    assert!(matches!(err, ans_client::CsrError::HostNotFullyQualified));
+}
+
+/// `Fqdn::new` accepts a dotted quad as four numeric labels; the RA rejects it
+/// so a registrant cannot aim the challenge at an internal address.
+#[rstest]
+#[case("127.0.0.1")]
+#[case("192.168.0.1")]
+#[case("169.254.169.254")]
+fn ip_literal_host_is_rejected(#[case] host: &str) {
+    assert!(Fqdn::new(host).is_ok());
+
+    let err = AnsCsrBuilder::server(fqdn(host), version("1.0.0"))
+        .build()
+        .expect_err("IP literal must be rejected");
+    assert!(matches!(err, ans_client::CsrError::HostIsIpLiteral));
+}
+
+#[rstest]
+#[case("bad host.example.com")]
+#[case("bad_host.example.com")]
+#[case("-bad.example.com")]
+#[case("a..b")]
+#[case("")]
+fn deserialized_invalid_host_is_rejected(#[case] host: &str) {
+    let err = AnsCsrBuilder::server(deserialized_fqdn(host), version("1.0.0"))
+        .build()
+        .expect_err("deserialization must not bypass validation");
+    assert!(matches!(err, ans_client::CsrError::InvalidName(_)));
+}
+
+/// Validation must also canonicalize: a deserialized value keeps its casing and
+/// trailing dot, which would otherwise be encoded verbatim.
+#[test]
+fn deserialized_host_is_canonicalized_before_encoding() {
+    let out = AnsCsrBuilder::identity(deserialized_fqdn("Agent.Example.COM."), version("1.0.0"))
+        .build()
+        .expect("canonicalizable host should build");
+
+    assert_eq!(
+        common_name(&out.csr_pem),
+        Some("agent.example.com".to_string())
+    );
+    assert_eq!(
+        subject_alt_names(&out.csr_pem),
+        vec![
+            "DNS:agent.example.com".to_string(),
+            "URI:ans://v1.0.0.agent.example.com".to_string(),
+        ]
+    );
+}
+
+/// Makes the "before any key work" ordering observable rather than implicit.
+#[test]
+fn host_is_validated_before_the_supplied_key() {
+    let err = AnsCsrBuilder::server(fqdn("localhost"), version("1.0.0"))
+        .with_key_pair_pem(SecretString::from("-----BEGIN PRIVATE KEY-----\nnope\n"))
+        .build()
+        .expect_err("must fail");
+    assert!(matches!(err, ans_client::CsrError::HostNotFullyQualified));
+}
+
+// ── Key encoding ──────────────────────────────────────────────────────────────
+
+const RSA_ENCRYPTION: pkcs8::ObjectIdentifier =
+    pkcs8::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+const EC_PUBLIC_KEY: pkcs8::ObjectIdentifier =
+    pkcs8::ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+
+/// Decodes a PKCS#8 PEM strictly, returning its algorithm OID and inner key DER.
+fn strict_pkcs8(pem: &str) -> (pkcs8::ObjectIdentifier, Vec<u8>) {
+    let (label, doc) = pkcs8::SecretDocument::from_pem(pem).expect("must be valid PEM");
+    assert_eq!(label, "PRIVATE KEY", "PKCS#8 uses the PRIVATE KEY label");
+    let info =
+        pkcs8::PrivateKeyInfoRef::try_from(doc.as_bytes()).expect("body must decode as PKCS#8");
+    (info.algorithm.oid, info.private_key.as_bytes().to_vec())
+}
+
+/// The PKCS#8 `privateKey` octet string is itself the PKCS#1/SEC1 DER, so
+/// re-wrapping it under `label` yields a genuine legacy key.
+fn inner_key_pem(pkcs8_pem: &str, label: &'static str) -> SecretString {
+    let (_, inner) = strict_pkcs8(pkcs8_pem);
+    let doc = pkcs8::SecretDocument::try_from(inner.as_slice()).expect("inner DER is a sequence");
+    let pem = doc
+        .to_pem(label, pkcs8::LineEnding::LF)
+        .expect("PEM re-encode");
+    SecretString::from(pem.to_string())
+}
+
+#[test]
+fn pkcs1_key_is_rejected() {
+    let rsa = server_csr("agent.example.com", "1.0.0");
+    let pkcs1 = inner_key_pem(rsa.private_key_pem.expose_secret(), "RSA PRIVATE KEY");
+
+    let err = AnsCsrBuilder::server(fqdn("agent.example.com"), version("1.0.0"))
+        .with_key_pair_pem(pkcs1)
+        .build()
+        .expect_err("PKCS#1 must be rejected");
+    assert!(matches!(err, ans_client::CsrError::KeyNotPkcs8));
+}
+
+#[test]
+fn sec1_key_is_rejected() {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("P-256 keygen");
+    let sec1 = inner_key_pem(&key.serialize_pem(), "EC PRIVATE KEY");
+
+    let err = AnsCsrBuilder::identity(fqdn("agent.example.com"), version("1.0.0"))
+        .with_key_pair_pem(sec1)
+        .build()
+        .expect_err("SEC1 must be rejected");
+    assert!(matches!(err, ans_client::CsrError::KeyNotPkcs8));
+}
+
+/// Byte-for-byte what the unfixed builder emitted, and the reason the gate has
+/// to decode the body rather than trust the PEM label.
+#[test]
+fn pkcs1_body_mislabelled_as_pkcs8_is_rejected() {
+    let rsa = server_csr("agent.example.com", "1.0.0");
+    let mislabelled = inner_key_pem(rsa.private_key_pem.expose_secret(), "PRIVATE KEY");
+
+    let err = AnsCsrBuilder::server(fqdn("agent.example.com"), version("1.0.0"))
+        .with_key_pair_pem(mislabelled)
+        .build()
+        .expect_err("a PKCS#1 body under a PKCS#8 label must be rejected");
+    assert!(matches!(err, ans_client::CsrError::KeyNotPkcs8));
+}
+
+#[test]
+fn supplied_key_round_trip_stays_pkcs8() {
+    let first = server_csr("agent.example.com", "1.0.0");
+    let again = AnsCsrBuilder::server(fqdn("agent.example.com"), version("1.0.1"))
+        .with_key_pair_pem(SecretString::from(
+            first.private_key_pem.expose_secret().to_string(),
+        ))
+        .build()
+        .expect("renewal should build");
+
+    let (oid, _) = strict_pkcs8(again.private_key_pem.expose_secret());
+    assert_eq!(oid, RSA_ENCRYPTION);
+}
+
+#[test]
+fn supplied_ecdsa_key_output_is_pkcs8() {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("P-256 keygen");
+    let out = AnsCsrBuilder::identity(fqdn("agent.example.com"), version("1.0.0"))
+        .with_key_pair_pem(SecretString::from(key.serialize_pem()))
+        .build()
+        .expect("P-256 CSR should build");
+
+    let (oid, _) = strict_pkcs8(out.private_key_pem.expose_secret());
+    assert_eq!(oid, EC_PUBLIC_KEY);
 }

@@ -56,3 +56,6 @@ rand = { workspace = true }
 # verify-aws reuses the aws-lc-rs already pulled in by rcgen, so the CSR
 # self-signature can be checked without adding a second crypto backend.
 x509-parser = { workspace = true, features = ["verify-aws"] }
+# Strict PKCS#8 reader: rcgen's importer accepts PKCS#1/SEC1, so it cannot
+# detect the mislabelled output this crate must not produce.
+pkcs8 = { workspace = true }
