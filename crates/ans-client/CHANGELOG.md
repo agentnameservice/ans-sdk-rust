@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-client-v0.1.5...ans-client-v0.2.0) (2026-09-21)
+
+
+### Features
+
+* **ans-client:** add AnsCsrBuilder for ANS-compliant CSR generation ([#111](https://github.com/agentnameservice/ans-sdk-rust/issues/111)) ([f8004e1](https://github.com/agentnameservice/ans-sdk-rust/commit/f8004e1a2d263db0af02f131dae8e9f5361b3d0a))
+* **ans-client:** add V2 API lane and DNS discovery profiles support ([#88](https://github.com/agentnameservice/ans-sdk-rust/issues/88)) ([72027c9](https://github.com/agentnameservice/ans-sdk-rust/commit/72027c93f73dd98800fdcdcfc0579453c106ad7b))
+
 ## [0.1.5](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-client-v0.1.4...ans-client-v0.1.5) (2026-06-23)
 
 
