@@ -96,7 +96,7 @@ name = "scitt_real_data"
 required-features = ["test-support", "scitt"]
 
 [dev-dependencies]
-criterion = { version = "0.7", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 tokio-test = { workspace = true }
 wiremock = { workspace = true }
 rstest = { workspace = true }
