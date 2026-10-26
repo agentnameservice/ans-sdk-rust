@@ -53,7 +53,7 @@ moka = { workspace = true }
 # TLS integration (optional)
 rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
-webpki-roots = { version = "1.0", optional = true }
+webpki-roots = { version = "1.0.11", optional = true }
 futures-util = { workspace = true }
 
 # SCITT verification (optional, behind "scitt" feature)
@@ -96,7 +96,7 @@ name = "scitt_real_data"
 required-features = ["test-support", "scitt"]
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["async_tokio"] }
+criterion = { version = "0.8.2", features = ["async_tokio"] }
 tokio-test = { workspace = true }
 wiremock = { workspace = true }
 rstest = { workspace = true }
@@ -106,9 +106,9 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 rcgen = { workspace = true }
-rmcp = { version = "2.2", features = ["client", "transport-streamable-http-client-reqwest"] }
-anyhow = "1.0"
-webpki-roots = "1.0"
+rmcp = { version = "3.7.0", features = ["client", "transport-streamable-http-client-reqwest"] }
+anyhow = "1.0.104"
+webpki-roots = "1.0.11"
 
 [[example]]
 name = "verify_server"
