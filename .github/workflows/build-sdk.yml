@@ -192,8 +192,13 @@ jobs:
             --features ans-verify/test-support,ans-verify/rustls,ans-verify/scitt \
             --fail-under-lines 90 \
             | tee coverage-report.txt
+      # Fork pull requests receive a read-only token. Keep enforcement,
+      # the job summary, and the artifact available without a write-only comment.
       - name: Post coverage to PR
-        if: github.event_name == 'pull_request' && always()
+        if: >-
+          always() &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
