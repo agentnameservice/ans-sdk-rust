@@ -1,2 +1,2 @@
-# Repository Maintainers; see /MAINTAINERS.md.
-* @agentnameservice/sdk-rust-maintainers
+# Repository Maintainers and TSC fallback reviewers; see /MAINTAINERS.md.
+* @agentnameservice/sdk-rust-maintainers @agentnameservice/tsc
