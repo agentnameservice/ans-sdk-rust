@@ -704,3 +704,11 @@ cargo run -p ans-verify --features scitt --example inspect_scitt -- \
 RUST_LOG=ans_verify=debug cargo run -p ans-verify --example verify_server
 RUST_LOG=ans_verify=debug cargo run -p ans-verify --example verify_mtls_client
 ```
+
+## Contributing
+
+This repository follows [ANS governance](https://github.com/agentnameservice/governance/blob/main/GOVERNANCE.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance and
+[MAINTAINERS.md](MAINTAINERS.md) for the repository's Maintainers.
+The [Code of Conduct](CODE_OF_CONDUCT.md) applies to participation;
+report vulnerabilities privately using [SECURITY.md](SECURITY.md).
