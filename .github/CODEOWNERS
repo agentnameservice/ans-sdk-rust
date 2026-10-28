@@ -1,2 +1,2 @@
-# Repository Maintainers; see /MAINTAINERS.md.
-* @agentnameservice/sdk-rust-maintainers
+# Review routing; merge permissions are managed separately.
+* @agentnameservice/sdk-rust-maintainers @agentnameservice/tsc-owners
