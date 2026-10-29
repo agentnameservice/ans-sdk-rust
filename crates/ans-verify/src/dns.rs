@@ -2099,7 +2099,7 @@ mod tests {
     // -----------------------------------------------------------------
     // Discovery records: ANS_DNSAID (SVCB) and ANS_TXT (`_ans` TXT)
     //
-    // Wire shapes are normative per the ans-registry discovery profiles:
+    // Wire shapes are normative per the ans-spec discovery profiles:
     // - discovery-profiles/ans-dnsaid.md (SVCB, DNS-AID SvcParams)
     // - discovery-profiles/ans-txt.md (`_ans` TXT rows)
     // - ans-3-dns-publication.md §3.1 (discoverer fallback chain)
