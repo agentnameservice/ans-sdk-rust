@@ -94,3 +94,8 @@ retention guarantee.
 HTTP 429 and interrupted response bodies now use outage handling. HTTP 401/403,
 404, and complete but malformed responses remain determinate failures and cannot
 enable stale-cache fallback.
+
+## Caller badge versions
+
+Caller badge lookup prefers an exact version, then a legacy versionless record.
+A different numbered version is never substituted.
