@@ -13,6 +13,11 @@ use uuid::Uuid;
 use crate::error::TlogError;
 use ans_types::Badge;
 
+mod identities;
+pub use identities::IdentityLogClient;
+#[cfg(any(test, feature = "test-support"))]
+pub use identities::MockIdentityLogClient;
+
 // =========================================================================
 // Audit Types
 // =========================================================================
@@ -340,6 +345,11 @@ impl TransparencyLogClient for MockTransparencyLogClient {
         // Check for configured error first
         if let Some(error) = self.errors.get(&url_str) {
             return Err(match error {
+                TlogError::CheckpointPending {
+                    retry_after_seconds,
+                } => TlogError::CheckpointPending {
+                    retry_after_seconds: *retry_after_seconds,
+                },
                 TlogError::NotFound { url } => TlogError::NotFound { url: url.clone() },
                 TlogError::ServiceUnavailable => TlogError::ServiceUnavailable,
                 TlogError::StatusUnknown => TlogError::StatusUnknown,

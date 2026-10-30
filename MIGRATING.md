@@ -126,3 +126,25 @@ Response models preserve endpoint `metaDataHash`, badge `metadataHashes`, and
 server-renewal methods. Listing limits are 1–100; status filters are repeated
 query parameters and cursors are opaque. Renewal constructors select exactly
 one CSR or BYOC certificate source. Cancellation accepts empty 204 responses.
+
+## Verified Identity APIs
+
+Use `ApiVersion::V2` for all eight identity-management operations. Listing limits
+are 1–100. Proof batches contain 1–16 entries; link batches contain 1–256 agents.
+Unlinking accepts empty 204 responses.
+
+The independent `IdentityLogClient` trait provides six TL reads without changing
+existing custom `TransparencyLogClient` implementations. TL limits are 1–200,
+with a default of 50. Identity receipt 503 responses return
+`TlogError::CheckpointPending` and retain numeric `Retry-After`.
+`MockIdentityLogClient` is available with `test-support` for all six reads.
+
+Agent badge `identities` preserves omission separately from an empty list, and
+`identities_unavailable` preserves the TL's failure marker. An unavailable join
+must not be treated as no visible identities.
+
+Call `prepare_proof` with your trusted RA identifier and the chosen method's
+`kid`, sign `signing_bytes()` through your local/KMS signer, then call `finish`
+with the raw JOSE signature. ES256 uses P1363, not DER. The RA's served payload
+is preserved verbatim. Submit each distinct key's proof in one
+`VerifyIdentityControlRequest`; private keys remain with the signer.

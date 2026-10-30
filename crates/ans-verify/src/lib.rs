@@ -129,6 +129,11 @@ pub use ans_types::{
 };
 
 // Re-export from this crate
+pub use ans_types::{
+    IdentityAuditResponse, IdentityBadge, IdentityEvent, IdentityEventType, IdentityKind,
+    IdentityStatus, LinkedAgentsResponse, LinkedIdentitiesResponse, LinkedIdentity,
+    ProvenIdentityKey,
+};
 pub use cache::{BadgeCache, CacheConfig, CacheKey, CachedBadge};
 pub use dane::{
     DanePolicy, DaneVerificationResult, TlsaMatchingType, TlsaRecord, TlsaSelector, TlsaUsage,
@@ -143,9 +148,11 @@ pub use dns::{
 pub use error::{
     AnsError, AnsResult, DaneError, DnsError, HttpError, TlogError, VerificationError,
 };
+pub use tlog::{
+    AuditResponse, HttpTransparencyLogClient, IdentityLogClient, TransparencyLogClient,
+};
 #[cfg(any(test, feature = "test-support"))]
-pub use tlog::MockTransparencyLogClient;
-pub use tlog::{AuditResponse, HttpTransparencyLogClient, TransparencyLogClient};
+pub use tlog::{MockIdentityLogClient, MockTransparencyLogClient};
 pub use verify::{
     AnsVerifier, AnsVerifierBuilder, CertIdentity, ClientVerifier, FailurePolicy, ServerVerifier,
     VerificationOutcome,
