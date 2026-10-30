@@ -36,7 +36,7 @@ use ans_verify::{AnsServerCertVerifier, AnsVerifier, CertFingerprint, DanePolicy
 use anyhow::{Context, Result};
 use rmcp::{
     ServiceExt,
-    model::ClientInfo,
+    model::{ClientConfig, ProtocolVersion},
     transport::{
         StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
     },
@@ -111,18 +111,18 @@ async fn main() -> Result<()> {
         StreamableHttpClientTransportConfig::with_uri(server_url),
     );
 
-    let mut client_info = ClientInfo::default();
+    let mut client_info =
+        ClientConfig::default().with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE);
     client_info.client_info.name = "ans-mcp-example".to_string();
     client_info.client_info.version = env!("CARGO_PKG_VERSION").to_string();
 
     let client = client_info.serve(transport).await?;
     println!("Connected — server certificate verified against ANS badge");
 
-    if let Some(info) = client.peer_info() {
-        println!(
-            "  Server: {} v{}",
-            info.server_info.name, info.server_info.version
-        );
+    if let Some(info) = client.peer_info()
+        && let Some(server_info) = info.server_info.as_ref()
+    {
+        println!("  Server: {} v{}", server_info.name, server_info.version);
     }
 
     // Step 4: List available tools
