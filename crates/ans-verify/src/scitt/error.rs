@@ -96,6 +96,10 @@ pub enum ScittError {
     #[error("Invalid receipt identity: {0}")]
     InvalidReceiptIdentity(String),
 
+    /// The signed receipt payload is not canonical JSON per RFC 8785.
+    #[error("Invalid receipt payload: {0}")]
+    InvalidReceiptPayload(String),
+
     /// Certificate, receipt, and status token do not name the same peer.
     #[error("ANS identity binding failed: {0}")]
     IdentityBinding(String),

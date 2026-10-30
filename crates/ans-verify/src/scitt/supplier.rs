@@ -700,7 +700,7 @@ mod tests {
         let agent_id = Uuid::nil();
         let exp = chrono::Utc::now().timestamp() + 3600;
 
-        let receipt_bytes = make_receipt_bytes(&signing_key, b"test-event");
+        let receipt_bytes = make_receipt_bytes(&signing_key, br#""test-event""#);
         let token_bytes = make_status_token_bytes(&signing_key, exp);
 
         let client: Arc<dyn ScittClient> = Arc::new(
@@ -732,7 +732,7 @@ mod tests {
         // valid when verify_status_token runs but will be expired by the time
         // current_headers checks. We use 2h in the past to make verify fail.
         // Instead, test by manually injecting expired artifacts.
-        let receipt_bytes = make_receipt_bytes(&signing_key, b"test-event");
+        let receipt_bytes = make_receipt_bytes(&signing_key, br#""test-event""#);
 
         let client: Arc<dyn ScittClient> =
             Arc::new(MockScittClient::new().with_receipt(agent_id, receipt_bytes));
@@ -761,7 +761,7 @@ mod tests {
         let agent_id = Uuid::nil();
         let exp = chrono::Utc::now().timestamp() + 3600;
 
-        let receipt_bytes = make_receipt_bytes(&signing_key, b"event");
+        let receipt_bytes = make_receipt_bytes(&signing_key, br#""event""#);
         let token_bytes = make_status_token_bytes(&signing_key, exp);
 
         let client: Arc<dyn ScittClient> = Arc::new(

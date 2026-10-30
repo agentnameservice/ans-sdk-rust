@@ -160,3 +160,9 @@ and cannot satisfy `Required`.
 
 SCITT HTTP clients require HTTPS and reject redirects, including root-key
 fetches. Configure the final trusted TL URL.
+
+## Canonical SCITT receipts
+
+Receipt payloads must already be RFC 8785 canonical JSON. Verification checks
+the original COSE signature before issuer and canonical-form checks. Producers
+must canonicalize before signing.
