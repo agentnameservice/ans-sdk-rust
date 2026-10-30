@@ -6,7 +6,7 @@ use std::fmt;
 use std::str::FromStr;
 
 /// A Fully Qualified Domain Name (FQDN).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct Fqdn(String);
 
 impl Fqdn {
@@ -23,7 +23,17 @@ impl Fqdn {
         }
 
         // Remove trailing dot if present
-        let domain = domain.trim_end_matches('.');
+        let domain = domain.strip_suffix('.').unwrap_or(&domain);
+        if domain.len() > 253 || domain.split('.').count() < 2 {
+            return Err(ParseError::InvalidFqdn(
+                "ANS hosts require at least two labels and at most 253 octets".into(),
+            ));
+        }
+        if domain.parse::<std::net::IpAddr>().is_ok() {
+            return Err(ParseError::InvalidFqdn(
+                "ANS hosts cannot be IP literals".into(),
+            ));
+        }
 
         // Check for valid characters and structure
         for label in domain.split('.') {
@@ -74,6 +84,13 @@ impl Fqdn {
     /// Get the TLSA record name for this FQDN and port.
     pub fn tlsa_name(&self, port: u16) -> String {
         format!("_{port}._tcp.{}", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Fqdn {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -157,6 +174,16 @@ impl Version {
                 parts.len(),
                 s
             )));
+        }
+
+        if parts.iter().any(|part| {
+            part.is_empty()
+                || !part.bytes().all(|b| b.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+        }) {
+            return Err(ParseError::InvalidVersion(
+                "version components must be decimal integers without leading zeros".into(),
+            ));
         }
 
         let major = parts[0].parse().map_err(|_| {
@@ -418,8 +445,7 @@ mod tests {
 
         #[test]
         fn test_fqdn_single_label() {
-            let fqdn = Fqdn::new("localhost").unwrap();
-            assert_eq!(fqdn.as_str(), "localhost");
+            assert!(Fqdn::new("localhost").is_err());
         }
 
         #[test]
@@ -583,5 +609,46 @@ mod tests {
             let result = AnsName::parse("ans://1.0.0.agent.example.com");
             assert!(result.is_err());
         }
+    }
+    #[test]
+    fn ans_names_and_deserialization_share_the_host_profile() {
+        for host in [
+            "localhost".to_string(),
+            "127.0.0.1".into(),
+            "agent.example.com..".into(),
+            "bad_host.example.com".into(),
+            [
+                "a".repeat(63),
+                "b".repeat(63),
+                "c".repeat(63),
+                "d".repeat(63),
+            ]
+            .join("."),
+        ] {
+            assert!(Fqdn::new(&host).is_err());
+            assert!(serde_json::from_value::<Fqdn>(serde_json::json!(host)).is_err());
+            assert!(AnsName::parse(&format!("ans://v1.0.0.{host}")).is_err());
+        }
+        let host: Fqdn = serde_json::from_str("\"Agent.Example.COM.\"").unwrap();
+        assert_eq!(host.as_str(), "agent.example.com");
+    }
+
+    #[test]
+    fn version_components_reject_noncanonical_numbers() {
+        for version in [
+            "01.0.0",
+            "1.00.0",
+            "1.0.01",
+            "+1.0.0",
+            "1.+0.0",
+            "1.0.+1",
+            "1..0",
+            "1.0.0-rc1",
+            "1.0.0+build",
+        ] {
+            assert!(Version::parse(version).is_err());
+            assert!(AnsName::parse(&format!("ans://v{version}.agent.example.com")).is_err());
+        }
+        assert_eq!(Version::parse("0.0.0").unwrap(), Version::new(0, 0, 0));
     }
 }

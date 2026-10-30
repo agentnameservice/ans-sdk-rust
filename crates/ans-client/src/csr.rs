@@ -28,7 +28,7 @@
 //! # }
 //! ```
 
-use ans_types::{AnsName, Fqdn, ParseError, Version};
+use ans_types::{Fqdn, Version};
 use rcgen::{
     CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, KeyPair,
     KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_RSA_SHA256,
@@ -54,10 +54,6 @@ pub struct CsrOutput {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum CsrError {
-    /// The host and version do not form a parseable ANS name.
-    #[error("invalid ANS name: {0}")]
-    InvalidName(#[from] ParseError),
-
     /// A SAN value could not be encoded as an IA5 string.
     #[error("invalid SAN value: {0}")]
     InvalidSan(String),
@@ -77,24 +73,7 @@ pub enum CsrError {
     /// A caller-supplied key is not PKCS#8.
     #[error("private key must be PKCS#8 (BEGIN PRIVATE KEY); convert PKCS#1 or SEC1 keys first")]
     KeyNotPkcs8,
-
-    /// The host exceeds the DNS presentation limit.
-    #[error("agent host too long: {octets} octets, maximum {MAX_HOST_OCTETS}")]
-    HostTooLong {
-        /// Octet length of the offending host.
-        octets: usize,
-    },
-
-    /// The host is an IP literal, which cannot anchor an ANS name.
-    #[error("agent host must be a domain name, not an IP literal")]
-    HostIsIpLiteral,
-
-    /// The host is a single label; ANS requires at least two.
-    #[error("agent host must have at least two labels")]
-    HostNotFullyQualified,
 }
-
-const MAX_HOST_OCTETS: usize = 253;
 
 /// Mirrors the RA's own allowlist, which excludes Ed25519, ML-DSA and P-521.
 const ACCEPTED_ALGORITHMS: &[&SignatureAlgorithm] = &[
@@ -114,8 +93,8 @@ enum CsrKind {
 /// Builder for ANS-compliant Certificate Signing Requests.
 ///
 /// Taking [`Fqdn`] and [`Version`] rather than strings keeps malformed input
-/// out of the constructors, and [`build`](Self::build) re-checks the ANS host
-/// profile because `Fqdn`'s derived `Deserialize` can bypass [`Fqdn::new`].
+/// out of the constructors. `Fqdn` enforces the ANS host profile on both
+/// construction and deserialization.
 #[derive(Debug)]
 pub struct AnsCsrBuilder {
     host: Fqdn,
@@ -163,19 +142,13 @@ impl AnsCsrBuilder {
     /// [`with_key_pair_pem`](Self::with_key_pair_pem) supplied one.
     ///
     /// # Errors
-    /// [`CsrError::InvalidName`] if the host and version do not form a
-    /// parseable [`AnsName`]; [`CsrError::HostTooLong`],
-    /// [`CsrError::HostIsIpLiteral`] or [`CsrError::HostNotFullyQualified`] if
-    /// the host is outside the ANS profile; [`CsrError::InvalidKeyPair`],
+    /// [`CsrError::InvalidKeyPair`],
     /// [`CsrError::UnsupportedKeyAlgorithm`] or [`CsrError::KeyNotPkcs8`] if a
     /// supplied key is unreadable, uses an algorithm the RA rejects, or is not
     /// PKCS#8; [`CsrError::Serialization`] if key generation or CSR encoding
     /// fails.
     pub fn build(self) -> Result<CsrOutput, CsrError> {
-        // Canonical, not merely valid: a deserialized `Fqdn` skips `Fqdn::new`,
-        // so casing and a trailing dot would otherwise reach the encoded name.
-        // Ahead of the key work, which is the expensive step.
-        let host = canonical_ans_host(&self.host)?;
+        let host = self.host;
         let sans = build_sans(&host, &self.version, self.kind)?;
 
         let key_pair = match &self.key_pair_pem {
@@ -195,27 +168,6 @@ fn generate_rsa_key_pair() -> Result<KeyPair, CsrError> {
     // aws-lc-rs, because `ring` cannot generate RSA keys at all and the `rsa`
     // crate carries RUSTSEC-2023-0071 (Marvin timing side-channel).
     KeyPair::generate_for(&PKCS_RSA_SHA256).map_err(CsrError::Serialization)
-}
-
-fn canonical_ans_host(host: &Fqdn) -> Result<Fqdn, CsrError> {
-    // Re-parsing closes the `Deserialize` bypass: the derived impl skips
-    // `Fqdn::new`, so charset and label rules are otherwise never applied.
-    let host = Fqdn::new(host.as_str())?;
-    let value = host.as_str();
-
-    if value.len() > MAX_HOST_OCTETS {
-        return Err(CsrError::HostTooLong {
-            octets: value.len(),
-        });
-    }
-    if value.parse::<std::net::IpAddr>().is_ok() {
-        return Err(CsrError::HostIsIpLiteral);
-    }
-    if value.split('.').count() < 2 {
-        return Err(CsrError::HostNotFullyQualified);
-    }
-
-    Ok(host)
 }
 
 fn load_key_pair(pem: &SecretString) -> Result<KeyPair, CsrError> {
@@ -238,10 +190,7 @@ fn build_sans(host: &Fqdn, version: &Version, kind: CsrKind) -> Result<Vec<SanTy
     let mut sans = vec![SanType::DnsName(dns_san)];
 
     if kind == CsrKind::Identity {
-        // Round-tripped rather than pushed as a string so a malformed name
-        // fails here instead of at the RA.
-        let ans_name: AnsName = format!("ans://{version}.{host}").parse()?;
-        sans.push(SanType::URI(ia5(&ans_name.to_string())?));
+        sans.push(SanType::URI(ia5(&format!("ans://{version}.{host}"))?));
     }
 
     Ok(sans)
