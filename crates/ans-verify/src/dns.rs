@@ -777,13 +777,13 @@ pub trait DnsResolver: Send + Sync {
         version: &Version,
     ) -> Result<Option<BadgeRecord>, DnsError> {
         let records = self.get_badge_records(fqdn).await?;
-        // Find record with matching version, or if version is None in record, it matches any
-        Ok(records.into_iter().find(|r| {
-            match &r.version {
-                Some(v) => v == version,
-                None => true, // Record without version can match any version
-            }
-        }))
+        // Exact version wins regardless of DNS answer order. Retain the
+        // legacy versionless fallback only when no exact record exists.
+        Ok(records
+            .iter()
+            .find(|record| record.version.as_ref() == Some(version))
+            .or_else(|| records.iter().find(|record| record.version.is_none()))
+            .cloned())
     }
 
     /// Find the first ACTIVE badge (or any if none specified as active).
@@ -1700,6 +1700,39 @@ mod tests {
             .await
             .unwrap();
         assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_badge_version_precedes_legacy_versionless_record() {
+        let legacy = BadgeRecord::new("ans-badge1", None, "https://tl.example.com/legacy");
+        let exact = BadgeRecord::new(
+            "ans-badge1",
+            Some(Version::new(1, 2, 3)),
+            "https://tl.example.com/exact",
+        );
+        let host = Fqdn::new("agent.example.com").unwrap();
+        for records in [
+            vec![legacy.clone(), exact.clone()],
+            vec![exact.clone(), legacy.clone()],
+        ] {
+            let resolver = MockDnsResolver::new().with_records(host.as_str(), records);
+            assert_eq!(
+                resolver
+                    .find_badge_for_version(&host, &Version::new(1, 2, 3))
+                    .await
+                    .unwrap()
+                    .map(|record| record.url),
+                Some(exact.url.clone())
+            );
+            assert_eq!(
+                resolver
+                    .find_badge_for_version(&host, &Version::new(2, 0, 0))
+                    .await
+                    .unwrap()
+                    .map(|record| record.url),
+                Some(legacy.url.clone())
+            );
+        }
     }
 
     // -----------------------------------------------------------------
