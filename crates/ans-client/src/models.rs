@@ -4,6 +4,9 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+mod lifecycle;
+pub use lifecycle::*;
 use std::fmt;
 use uuid::Uuid;
 
@@ -106,6 +109,9 @@ pub struct AgentEndpoint {
     /// URL for agent metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta_data_url: Option<String>,
+    /// Declared SHA256 digest of the metadata document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta_data_hash: Option<String>,
     /// URL for agent documentation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub documentation_url: Option<String>,
@@ -125,6 +131,7 @@ impl AgentEndpoint {
         Self {
             agent_url: agent_url.into(),
             meta_data_url: None,
+            meta_data_hash: None,
             documentation_url: None,
             protocol,
             transports: Vec::new(),
@@ -195,9 +202,9 @@ pub struct AgentRegistrationRequest {
     /// Optional description.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_description: Option<String>,
-    /// CSR for identity certificate (required).
-    #[serde(rename = "identityCsrPEM")]
-    pub identity_csr_pem: String,
+    /// Optional identity CSR. Absence creates a server-certificate-only agent.
+    #[serde(rename = "identityCsrPEM", skip_serializing_if = "Option::is_none")]
+    pub identity_csr_pem: Option<String>,
     /// CSR for server certificate (mutually exclusive with `server_certificate_pem`).
     #[serde(rename = "serverCsrPEM", skip_serializing_if = "Option::is_none")]
     pub server_csr_pem: Option<String>,
@@ -238,13 +245,26 @@ impl AgentRegistrationRequest {
             agent_host: agent_host.into(),
             version: version.into(),
             agent_description: None,
-            identity_csr_pem: identity_csr_pem.into(),
+            identity_csr_pem: Some(identity_csr_pem.into()),
             server_csr_pem: None,
             server_certificate_pem: None,
             server_certificate_chain_pem: None,
             endpoints,
             discovery_profiles: Vec::new(),
         }
+    }
+
+    /// Create a registration that will never hold an ANS identity certificate.
+    /// A server CSR or BYOC certificate must still be supplied.
+    pub fn without_identity(
+        agent_display_name: impl Into<String>,
+        agent_host: impl Into<String>,
+        version: impl Into<String>,
+        endpoints: Vec<AgentEndpoint>,
+    ) -> Self {
+        let mut request = Self::new(agent_display_name, agent_host, version, "", endpoints);
+        request.identity_csr_pem = None;
+        request
     }
 
     /// Set the DNS discovery profiles (V2 lane only — see
@@ -303,6 +323,8 @@ pub enum AgentLifecycleStatus {
     PendingDns,
     /// Agent is active.
     Active,
+    /// Registration is deprecated but remains discoverable.
+    Deprecated,
     /// Registration failed.
     Failed,
     /// Registration expired.
