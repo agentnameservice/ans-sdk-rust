@@ -13,7 +13,7 @@ use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError as HickoryDnsError, NetError, NoRecords as HickoryNoRecords};
 use hickory_resolver::proto::op::ResponseCode;
 use hickory_resolver::proto::rr::rdata::svcb::{SVCB, SvcParamKey, SvcParamValue};
-use hickory_resolver::proto::rr::{RData, RecordType};
+use hickory_resolver::proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
 /// Well-known DNS resolver configurations.
@@ -709,7 +709,9 @@ pub trait DnsResolver: Send + Sync {
     /// Query TLSA records for an FQDN and port.
     ///
     /// Returns TLSA records from `_<port>._tcp.<fqdn>`.
-    /// Used for DANE verification of server certificates.
+    /// Used for DANE verification of server certificates. Implementations
+    /// must return only records with a secure DNSSEC validation result;
+    /// unsigned or indeterminate answers must not become DANE bindings.
     async fn lookup_tlsa(
         &self,
         fqdn: &Fqdn,
@@ -922,6 +924,7 @@ impl HickoryDnsResolver {
         let dnssec_opts = dnssec_builder.options_mut();
         *dnssec_opts = opts;
         dnssec_opts.validate = true;
+        dnssec_opts.preserve_intermediates = true;
         let dnssec_resolver = dnssec_builder.build().map_err(|e| DnsError::LookupFailed {
             fqdn: "(dnssec resolver init)".to_string(),
             reason: e.to_string(),
@@ -971,6 +974,7 @@ impl HickoryDnsResolver {
         let mut dnssec_builder =
             TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
         dnssec_builder.options_mut().validate = true;
+        dnssec_builder.options_mut().preserve_intermediates = true;
         let dnssec_resolver = dnssec_builder.build().map_err(|e| DnsError::LookupFailed {
             fqdn: "(dnssec resolver init)".to_string(),
             reason: e.to_string(),
@@ -999,6 +1003,7 @@ impl HickoryDnsResolver {
         let dnssec_opts = dnssec_builder.options_mut();
         *dnssec_opts = opts;
         dnssec_opts.validate = true;
+        dnssec_opts.preserve_intermediates = true;
         let dnssec_resolver = dnssec_builder.build().map_err(|e| DnsError::LookupFailed {
             fqdn: "(dnssec resolver init)".to_string(),
             reason: e.to_string(),
@@ -1027,6 +1032,7 @@ impl HickoryDnsResolver {
             TokioRuntimeProvider::default(),
         );
         dnssec_builder.options_mut().validate = true;
+        dnssec_builder.options_mut().preserve_intermediates = true;
         let dnssec_resolver = dnssec_builder.build().map_err(|e| DnsError::LookupFailed {
             fqdn: "(dnssec resolver init)".to_string(),
             reason: e.to_string(),
@@ -1214,7 +1220,12 @@ impl DnsResolver for HickoryDnsResolver {
         fqdn: &Fqdn,
         port: u16,
     ) -> Result<DnsLookupResult<TlsaRecord>, DnsError> {
-        let query_name = fqdn.tlsa_name(port);
+        // Query the absolute service name, without resolver search suffixes.
+        let query_name = format!("{}.", fqdn.tlsa_name(port));
+        let owner = Name::from_ascii(&query_name).map_err(|error| DnsError::LookupFailed {
+            fqdn: fqdn.to_string(),
+            reason: error.to_string(),
+        })?;
 
         // Use DNSSEC-validating resolver for TLSA lookups
         // This ensures TLSA records are protected by DNSSEC when available
@@ -1278,53 +1289,9 @@ impl DnsResolver for HickoryDnsResolver {
             }
         };
 
-        // Note: If we reach here, either:
-        // 1. DNSSEC validated successfully (secure)
-        // 2. Domain doesn't have DNSSEC (insecure but not bogus)
-        // Hickory doesn't easily expose which case we're in at the high-level API,
-        // so we log a general message. For domains without DNSSEC, the TLSA record
-        // provides no cryptographic binding guarantee.
-        tracing::debug!(
-            fqdn = %fqdn,
-            port,
-            "TLSA lookup succeeded (DNSSEC validated if domain has DNSSEC)"
-        );
-
-        let mut records = Vec::new();
-        for record in response.answers() {
-            let RData::TLSA(tlsa) = &record.data else {
-                continue;
-            };
-            // Build RDATA from TLSA record fields
-            let mut rdata = vec![
-                u8::from(tlsa.cert_usage),
-                u8::from(tlsa.selector),
-                u8::from(tlsa.matching),
-            ];
-            rdata.extend(&tlsa.cert_data);
-
-            match TlsaRecord::from_rdata(&rdata) {
-                Ok(record) => {
-                    tracing::debug!(
-                        fqdn = %fqdn,
-                        port,
-                        usage = ?record.usage,
-                        selector = ?record.selector,
-                        matching_type = ?record.matching_type,
-                        "Parsed TLSA record"
-                    );
-                    records.push(record);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        fqdn = %fqdn,
-                        port,
-                        error = %e,
-                        "Skipping malformed TLSA record"
-                    );
-                }
-            }
-        }
+        // A successful resolver query may still contain unsigned answers.
+        // Only authenticated TLSA records may contribute to DANE (ANS-6 §5.3).
+        let records = secure_tlsa_records(&owner, response.answers());
 
         if records.is_empty() {
             Ok(DnsLookupResult::NotFound)
@@ -1332,6 +1299,65 @@ impl DnsResolver for HickoryDnsResolver {
             Ok(DnsLookupResult::Found(records))
         }
     }
+}
+
+/// Authenticate the complete owner-to-TLSA path, not just the terminal record set.
+/// Hickory preserves individual record-set proofs; a secure target does not make
+/// an insecure alias secure. Missing/ambiguous alias evidence is unusable.
+fn secure_tlsa_records(owner: &Name, answers: &[Record]) -> Vec<TlsaRecord> {
+    let Some(owner) = secure_tlsa_owner(owner, answers) else {
+        return Vec::new();
+    };
+    answers
+        .iter()
+        .filter(|record| {
+            record.name == *owner && record.dns_class == DNSClass::IN && record.proof.is_secure()
+        })
+        .filter_map(|record| {
+            let RData::TLSA(tlsa) = &record.data else {
+                return None;
+            };
+            let mut rdata = vec![
+                u8::from(tlsa.cert_usage),
+                u8::from(tlsa.selector),
+                u8::from(tlsa.matching),
+            ];
+            rdata.extend(&tlsa.cert_data);
+            match TlsaRecord::from_rdata(&rdata) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    tracing::warn!(%error, "Skipping malformed TLSA record");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Follow only authenticated CNAME hops. The visited set bounds cycles by
+/// the finite answer set. An unproven/synthesized alias never supplies trust.
+fn secure_tlsa_owner<'a>(owner: &'a Name, answers: &'a [Record]) -> Option<&'a Name> {
+    let mut owner = owner;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(owner) {
+        let mut target = None;
+        for record in answers
+            .iter()
+            .filter(|r| r.name == *owner && r.dns_class == DNSClass::IN)
+        {
+            if let RData::CNAME(cname) = &record.data {
+                if !record.proof.is_secure() || target.is_some_and(|prior| prior != &cname.0) {
+                    return None;
+                }
+                target = Some(&cname.0);
+            }
+        }
+        match target {
+            Some(next) => owner = next,
+            None => return Some(owner),
+        }
+    }
+    None
 }
 
 /// Returns true if the given error string contains patterns indicating a
@@ -1733,6 +1759,154 @@ mod tests {
                 Some(legacy.url.clone())
             );
         }
+    }
+
+    #[test]
+    fn only_secure_dnssec_answers_become_tlsa_bindings() {
+        use hickory_resolver::proto::{
+            dnssec::Proof,
+            rr::{Name, rdata::TLSA},
+        };
+        let make_record = |proof| {
+            let mut record = Record::from_rdata(
+                Name::from_ascii("_443._tcp.agent.example.com.").unwrap(),
+                300,
+                RData::TLSA(TLSA::new(3.into(), 0.into(), 1.into(), vec![0x42; 32])),
+            );
+            record.proof = proof;
+            record
+        };
+        for proof in [Proof::Insecure, Proof::Bogus, Proof::Indeterminate] {
+            assert!(
+                secure_tlsa_records(
+                    &Name::from_ascii("_443._tcp.agent.example.com.").unwrap(),
+                    &[make_record(proof)]
+                )
+                .is_empty()
+            );
+        }
+        let secure = make_record(Proof::Secure);
+        let records = secure_tlsa_records(
+            &Name::from_ascii("_443._tcp.agent.example.com.").unwrap(),
+            &[make_record(Proof::Insecure), secure],
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].certificate_data, vec![0x42; 32]);
+    }
+
+    #[test]
+    fn insecure_alias_must_not_authenticate_a_signed_foreign_tlsa() {
+        use hickory_resolver::proto::{
+            dnssec::Proof,
+            rr::{
+                Name,
+                rdata::{CNAME, TLSA},
+            },
+        };
+        let queried = Name::from_ascii("_443._tcp.agent.example.com.").unwrap();
+        let target = Name::from_ascii("_443._tcp.attacker.example.net.").unwrap();
+        let mut alias =
+            Record::from_rdata(queried.clone(), 300, RData::CNAME(CNAME(target.clone())));
+        alias.proof = Proof::Insecure;
+        let mut tlsa = Record::from_rdata(
+            target,
+            300,
+            RData::TLSA(TLSA::new(3.into(), 0.into(), 1.into(), vec![0x42; 32])),
+        );
+        tlsa.proof = Proof::Secure;
+        assert!(secure_tlsa_records(&queried, &[alias, tlsa]).is_empty());
+    }
+
+    #[test]
+    fn tlsa_owner_binding_covers_alias_chains_foreign_records_and_cycles() {
+        use hickory_resolver::proto::{
+            dnssec::Proof,
+            rr::rdata::{CNAME, TLSA},
+        };
+        let queried = Name::from_ascii("_443._tcp.agent.example.com.").unwrap();
+        let middle = Name::from_ascii("middle.example.com.").unwrap();
+        let target = Name::from_ascii("target.example.com.").unwrap();
+        let alias = |name: &Name, destination: &Name, proof| {
+            let mut r =
+                Record::from_rdata(name.clone(), 300, RData::CNAME(CNAME(destination.clone())));
+            r.proof = proof;
+            r
+        };
+        let tlsa = |name: &Name, proof| {
+            let mut r = Record::from_rdata(
+                name.clone(),
+                300,
+                RData::TLSA(TLSA::new(3.into(), 0.into(), 1.into(), vec![0x42; 32])),
+            );
+            r.proof = proof;
+            r
+        };
+        // Foreign signed data cannot supply the queried service's binding.
+        assert!(secure_tlsa_records(&queried, &[tlsa(&target, Proof::Secure)]).is_empty());
+        assert_eq!(
+            secure_tlsa_records(
+                &queried,
+                &[tlsa(&target, Proof::Secure), tlsa(&queried, Proof::Secure)]
+            )
+            .len(),
+            1
+        );
+        // Legitimate signed aliases work even when records arrive out of order.
+        let first = alias(&queried, &middle, Proof::Secure);
+        let second = alias(&middle, &target, Proof::Secure);
+        assert_eq!(
+            secure_tlsa_records(
+                &queried,
+                &[tlsa(&target, Proof::Secure), second.clone(), first.clone()]
+            )
+            .len(),
+            1
+        );
+        for proof in [Proof::Insecure, Proof::Bogus, Proof::Indeterminate] {
+            assert!(
+                secure_tlsa_records(
+                    &queried,
+                    &[
+                        first.clone(),
+                        alias(&middle, &target, proof),
+                        tlsa(&target, Proof::Secure)
+                    ]
+                )
+                .is_empty()
+            );
+            assert!(
+                secure_tlsa_records(
+                    &queried,
+                    &[first.clone(), second.clone(), tlsa(&target, proof)]
+                )
+                .is_empty()
+            );
+        }
+        assert!(
+            secure_tlsa_records(
+                &queried,
+                &[
+                    first.clone(),
+                    alias(&queried, &target, Proof::Secure),
+                    tlsa(&target, Proof::Secure)
+                ]
+            )
+            .is_empty()
+        );
+        assert!(
+            secure_tlsa_records(&queried, &[first, alias(&middle, &queried, Proof::Secure)])
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn tlsa_resolver_preserves_alias_proofs_even_if_custom_options_disable_them() {
+        let mut options = ResolverOpts::default();
+        options.preserve_intermediates = false;
+        let resolver = HickoryDnsResolver::with_config(ResolverConfig::default(), options)
+            .await
+            .unwrap();
+        assert!(resolver.dnssec_resolver.options().preserve_intermediates);
     }
 
     // -----------------------------------------------------------------
