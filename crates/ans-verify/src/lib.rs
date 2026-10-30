@@ -191,3 +191,10 @@ pub use scitt::{
     MockScittClient, ParsedCoseSign1, compute_sig_structure_digest, matches_identity_cert,
     matches_server_cert, parse_cose_sign1,
 };
+
+#[cfg(feature = "scitt")]
+pub mod identities;
+#[cfg(feature = "scitt")]
+pub use identities::{
+    IdentityVerificationError, IdentityVerifier, MAX_IDENTITY_PROOF_SIZE, VerifiedIdentityProof,
+};

@@ -218,6 +218,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## V2 management and Verified Identities
+
+Select `ApiVersion::V2` to use owner-scoped cursor listing, server certificate
+renewal (CSR or BYOC), and the Verified Identity lifecycle. The identity APIs
+cover registration, listing, detail, rotation, control verification, revocation,
+batch linking, and unlinking. They preserve API error codes and opaque cursors.
+
+`IdentityChallengeResponse::prepare_proof` validates the expected RA, identity,
+nonce, and eligible key, then exposes exact signing bytes for a local key or KMS.
+It preserves the RA's `signingInput` verbatim. `PreparedIdentityProof::finish`
+accepts a raw ES256, Ed25519, or RS256 signature; submit the compact JWS through
+`verify_identity_control`. Private keys remain with the signer.
+
+`ans-verify::IdentityLogClient` adds all six public identity transparency reads.
+With `scitt` enabled, `IdentityVerifier` verifies operator proofs using sealed
+JWK/Multikey methods for `did:web` and `did:key`, checks the current badge against
+its `keysLogId`, and remembers terminal revocation. Historical proofs and current
+status are separate checks: fetch the proof event from the audit, authenticate it
+through a COSE receipt or the configured trusted HTTPS log, then call
+`verify_badge` on the current trusted badge. LEI and ENS proof profiles remain
+postponed by the merged specification.
+
+Run the public verification workflow against your trusted log:
+
+```bash
+cargo run -p ans-verify --features scitt --example verify_identity -- \
+  https://tl.example.com 0193f0c5-7b2e-7a41-9c3d-aaaaaaaaaaaa
+```
+
+`MockIdentityLogClient` is available with `test-support` for fixture-backed
+badge, audit, receipt, and association reads, including pagination.
+
+See [the feature and validation matrix](docs/SPEC-COMPLIANCE.md) and
+[migration notes](MIGRATING.md) for compatibility changes and trust boundaries.
+
 ## SCITT Verification (Optional)
 
 SCITT (Supply Chain Integrity, Transparency, and Trust) provides offline-capable verification using cryptographically signed artifacts from the transparency log. Enable with `features = ["scitt"]`.
@@ -285,19 +320,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Policy | Behavior |
 |--------|----------|
-| `ScittWithBadgeFallback` | Try SCITT first, fall back to badge if no headers (default) |
+| `ScittWithBadgeFallback` | Use SCITT with both artifacts; validate and bind any partial evidence before badge fallback (default) |
 | `RequireScitt` | SCITT required, no badge fallback |
-| `BadgeWithScittEnhancement` | Badge first, upgrade to SCITT if headers present |
+| `BadgeWithScittEnhancement` | Use the badge tier when artifacts are missing; validate all supplied evidence |
 
 ### Verification Tiers
 
 | Tier | Meaning |
 |------|---------|
 | `FullScitt` | Status token + receipt verified and bound to the same peer |
-| `StatusTokenVerified` | Status token verified, receipt absent |
 | `BadgeOnly` | Traditional badge-based verification |
 
-Present but invalid receipts reject under every policy. `RequireScitt` disables badge fallback but still permits the `StatusTokenVerified` tier; applications requiring an inclusion receipt must require `FullScitt`.
+Regular SCITT verification requires both a receipt and status token. `RequireScitt` rejects an incomplete pair. Other policies may use the badge tier after validating any supplied artifact and binding it to the same registration. Present but invalid evidence always rejects. Method B retains its explicitly configured receipt waiver.
 
 ### Inspect SCITT Artifacts
 
@@ -447,7 +481,7 @@ let verifier = AnsVerifier::builder()
 | Outcome | Meaning |
 |---------|---------|
 | `Verified` | Certificate matches registered ANS agent (badge-based) |
-| `ScittVerified` | Certificate verified via SCITT status token (+ optional receipt) |
+| `ScittVerified` | Certificate verified via SCITT receipt and status token |
 | `NotAnsAgent` | No `_ans-badge` or `_ra-badge` DNS record found |
 | `InvalidStatus` | Badge status is `EXPIRED` or `REVOKED` |
 | `FingerprintMismatch` | Certificate fingerprint doesn't match badge |
