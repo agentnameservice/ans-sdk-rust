@@ -173,3 +173,10 @@ Regular SCITT verification requires both artifacts. `RequireScitt` rejects an
 incomplete pair. Fallback policies verify any supplied evidence before
 consulting the badge and bind it to the same registration. Invalid evidence
 always rejects. Method B's explicit receipt waiver is unchanged.
+
+## Outgoing SCITT headers
+
+`ScittHeaderSupplier::current_headers()` is cache-only. Call
+`initialize().await?` during startup, then retain `start_auto_refresh()`'s handle.
+`with_init_timeout()` bounds explicit startup initialization. Until acquisition
+succeeds, cached fields remain absent.

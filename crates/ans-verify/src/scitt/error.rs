@@ -104,6 +104,10 @@ pub enum ScittError {
     #[error("Missing SCITT artifact: {0}")]
     MissingArtifact(&'static str),
 
+    /// Initial artifact acquisition exceeded its configured deadline.
+    #[error("SCITT initialization timed out")]
+    InitializationTimeout,
+
     /// Certificate, receipt, and status token do not name the same peer.
     #[error("ANS identity binding failed: {0}")]
     IdentityBinding(String),
