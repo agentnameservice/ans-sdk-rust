@@ -148,3 +148,10 @@ Call `prepare_proof` with your trusted RA identifier and the chosen method's
 with the raw JOSE signature. ES256 uses P1363, not DER. The RA's served payload
 is preserved verbatim. Submit each distinct key's proof in one
 `VerifyIdentityControlRequest`; private keys remain with the signer.
+
+## DNSSEC-authenticated DANE
+
+DANE binds TLSA records to the queried service name and requires every CNAME hop
+and the terminal TLSA record set to be DNSSEC-secure. Unrelated signed answers,
+unsigned records, and unproven aliases are ignored with `ValidateIfPresent`
+and cannot satisfy `Required`.
