@@ -267,6 +267,9 @@ pub struct Attestations {
     /// Domain validation method, when this event includes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_validation: Option<String>,
+    /// Protocol-keyed metadata digests from the sealed registration.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub metadata_hashes: std::collections::BTreeMap<String, String>,
     /// Legacy V1 identity certificate, absent for server-only registrations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_cert: Option<CertAttestation>,
@@ -306,10 +309,12 @@ pub struct MerkleProof {
     /// Root hash of the tree.
     pub root_hash: String,
     /// Signature over the root.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub root_signature: String,
     /// Total size of the tree.
     pub tree_size: u64,
     /// Version of the tree.
+    #[serde(default)]
     pub tree_version: u64,
 }
 
