@@ -8,11 +8,11 @@
 //! The supplier is `Clone` (wraps `Arc<Inner>`) so a single instance can
 //! be shared across server middleware and client request builders.
 //!
-//! # Lazy initialization
+//! # Initialization
 //!
-//! Construction is infallible — no network calls. The first call to
-//! [`ScittHeaderSupplier::current_headers`] or [`ScittHeaderSupplier::start_auto_refresh`]
-//! triggers the initial fetch lazily.
+//! Construction and header reads perform no network calls. Call
+//! [`ScittHeaderSupplier::initialize`] during startup to await initial artifacts,
+//! or let [`ScittHeaderSupplier::start_auto_refresh`] fetch them in the background.
 //!
 //! # Background refresh
 //!
@@ -87,7 +87,7 @@ struct CachedArtifacts {
     token_exp: Option<i64>,
 }
 
-/// Default timeout for the lazy-init fetch in `current_headers`.
+/// Default timeout for explicit startup initialization.
 const DEFAULT_INIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Inner state shared via `Arc`.
@@ -98,7 +98,7 @@ struct ScittHeaderSupplierInner {
     clock_skew: Duration,
     /// Clock function for time-sensitive security checks.
     clock: ClockFn,
-    /// Maximum time to wait for the initial fetch in `current_headers`.
+    /// Maximum time to wait for explicit startup initialization.
     init_timeout: Duration,
     artifacts: RwLock<CachedArtifacts>,
     /// Serialises the lazy-init path so that concurrent first-callers
@@ -121,6 +121,7 @@ impl std::fmt::Debug for ScittHeaderSupplierInner {
 ///
 /// ```rust,ignore
 /// let supplier = ScittHeaderSupplier::new(agent_id, scitt_client, key_store);
+/// supplier.initialize().await?; // acquire artifacts before serving requests
 /// let _refresh = supplier.start_auto_refresh(); // keep token fresh
 ///
 /// let headers = supplier.current_headers().await;
@@ -136,9 +137,9 @@ pub struct ScittHeaderSupplier {
 impl ScittHeaderSupplier {
     /// Create a supplier with a refreshable key store.
     ///
-    /// Construction is infallible — no network calls. The first call to
-    /// [`current_headers`](Self::current_headers) or
-    /// [`start_auto_refresh`](Self::start_auto_refresh) triggers the initial fetch.
+    /// Construction is infallible and performs no network calls. Use
+    /// [`initialize`](Self::initialize) during startup, then retain the handle
+    /// returned by [`start_auto_refresh`](Self::start_auto_refresh).
     pub fn new(
         agent_id: Uuid,
         client: Arc<dyn ScittClient>,
@@ -158,12 +159,8 @@ impl ScittHeaderSupplier {
         }
     }
 
-    /// Set the maximum time to wait for the initial fetch in
-    /// [`current_headers`](Self::current_headers).
-    ///
-    /// Defaults to 30 seconds. If the init fetch exceeds this timeout,
-    /// `current_headers` returns empty headers (the verifier falls back
-    /// to badge-based verification).
+    /// Set the startup acquisition deadline for [`initialize`](Self::initialize).
+    /// Defaults to 30 seconds. Header reads never wait for network acquisition.
     #[allow(clippy::expect_used)] // Intentional: builder-phase invariant, Arc is unshared
     pub fn with_init_timeout(mut self, timeout: Duration) -> Self {
         Arc::get_mut(&mut self.inner)
@@ -276,48 +273,38 @@ impl ScittHeaderSupplier {
         ScittRefreshHandle { cancel, task }
     }
 
-    /// Get the current headers for outgoing HTTP requests/responses.
+    /// Acquire initial artifacts before serving requests.
     ///
-    /// On first call, performs initial fetch (lazy init). If the fetch fails,
-    /// returns `None` for both fields (remote verifier falls back to badge).
-    ///
-    /// If the status token has expired, returns `None` for the token field.
-    pub async fn current_headers(&self) -> ScittOutgoingHeaders {
-        // Lazy init: serialise via init_gate so concurrent first-callers
-        // don't all trigger redundant fetches.  Re-check artifact state
-        // inside the mutex (double-checked locking) so a failed first
-        // attempt doesn't permanently suppress retries.
-        //
-        // The entire init path (mutex acquisition + HTTP fetch) is wrapped
-        // in a timeout to prevent a slow/hanging TL from blocking all
-        // concurrent requests indefinitely.
-        {
-            let needs_init = {
+    /// Concurrent initializers share one acquisition. A failed or expired
+    /// acquisition may be retried explicitly; header reads never retry it.
+    pub async fn initialize(&self) -> Result<(), ScittError> {
+        let initialize = async {
+            let _guard = self.inner.init_gate.lock().await;
+            let ready = {
                 let artifacts = self.inner.artifacts.read().await;
-                artifacts.receipt_bytes.is_none() || artifacts.status_token_bytes.is_none()
+                artifacts.receipt_bytes.is_some()
+                    && artifacts.status_token_bytes.is_some()
+                    && artifacts
+                        .token_exp
+                        .is_some_and(|exp| (self.inner.clock)() < exp)
             };
-            if needs_init {
-                let timeout = self.inner.init_timeout;
-                let init_future = async {
-                    let _guard = self.inner.init_gate.lock().await;
-                    let still_needs_init = {
-                        let artifacts = self.inner.artifacts.read().await;
-                        artifacts.receipt_bytes.is_none() || artifacts.status_token_bytes.is_none()
-                    };
-                    if still_needs_init {
-                        Self::do_refresh_inner(&self.inner).await;
-                    }
-                };
-                if tokio::time::timeout(timeout, init_future).await.is_err() {
-                    tracing::warn!(
-                        agent_id = %self.inner.agent_id,
-                        timeout_secs = timeout.as_secs(),
-                        "SCITT init fetch timed out — returning empty headers"
-                    );
-                }
+            if ready {
+                Ok(())
+            } else {
+                self.refresh_now().await
             }
-        }
+        };
+        tokio::time::timeout(self.inner.init_timeout, initialize)
+            .await
+            .map_err(|_| ScittError::InitializationTimeout)?
+    }
 
+    /// Read cached headers for outgoing HTTP requests/responses, without I/O.
+    ///
+    /// Before initialization, fields are absent. Expired status tokens are
+    /// omitted; receipts remain available. Use explicit startup initialization
+    /// and background refresh to acquire artifacts outside the request path.
+    pub async fn current_headers(&self) -> ScittOutgoingHeaders {
         let artifacts = self.inner.artifacts.read().await;
 
         let receipt_base64 = artifacts
@@ -711,6 +698,7 @@ mod tests {
         let supplier =
             ScittHeaderSupplier::from_static_key_store(agent_id, client, Arc::new(store));
 
+        supplier.initialize().await.unwrap();
         let headers = supplier.current_headers().await;
         assert!(headers.receipt_base64.is_some());
         assert!(headers.status_token_base64.is_some());
@@ -748,7 +736,7 @@ mod tests {
         }
 
         let headers = supplier.current_headers().await;
-        // Receipt was not fetched (only manually injected token), but receipt fetch failed
+        // Header reads do not try to fetch the missing receipt.
         // Token should be None because it's expired
         assert!(headers.status_token_base64.is_none());
     }
@@ -884,5 +872,87 @@ mod tests {
         let headers = ScittOutgoingHeaders::default();
         assert!(headers.receipt_base64.is_none());
         assert!(headers.status_token_base64.is_none());
+    }
+
+    #[derive(Debug)]
+    struct CountingClient {
+        inner: MockScittClient,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ScittClient for CountingClient {
+        async fn fetch_receipt(&self, id: Uuid) -> Result<Vec<u8>, ScittError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fetch_receipt(id).await
+        }
+        async fn fetch_status_token(&self, id: Uuid) -> Result<Vec<u8>, ScittError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fetch_status_token(id).await
+        }
+        async fn fetch_root_keys(&self) -> Result<Vec<String>, ScittError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.fetch_root_keys().await
+        }
+    }
+
+    #[tokio::test]
+    async fn header_reads_never_fetch_cold_cached_or_partial_artifacts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (key, store) = make_key_and_store(1);
+        let id = Uuid::nil();
+        let client = Arc::new(CountingClient {
+            inner: MockScittClient::new()
+                .with_receipt(id, make_receipt_bytes(&key, br#"{}"#))
+                .with_status_token(
+                    id,
+                    make_status_token_bytes(&key, chrono::Utc::now().timestamp() + 3600),
+                ),
+            calls: AtomicUsize::new(0),
+        });
+        let supplier =
+            ScittHeaderSupplier::from_static_key_store(id, client.clone(), Arc::new(store));
+        let (a, b) = tokio::join!(supplier.current_headers(), supplier.current_headers());
+        assert!(a.receipt_base64.is_none() && b.status_token_base64.is_none());
+        assert_eq!(client.calls.load(Ordering::SeqCst), 0);
+        supplier.initialize().await.unwrap();
+        supplier.initialize().await.unwrap();
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            supplier
+                .current_headers()
+                .await
+                .status_token_base64
+                .is_some()
+        );
+        {
+            let mut cached = supplier.inner.artifacts.write().await;
+            cached.receipt_bytes = None;
+            cached.token_exp = Some(0);
+        }
+        let headers = supplier.current_headers().await;
+        assert!(headers.receipt_base64.is_none() && headers.status_token_base64.is_none());
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_initialization_is_only_retried_explicitly() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_, store) = make_key_and_store(1);
+        let client = Arc::new(CountingClient {
+            inner: MockScittClient::new(),
+            calls: AtomicUsize::new(0),
+        });
+        let supplier = ScittHeaderSupplier::from_static_key_store(
+            Uuid::nil(),
+            client.clone(),
+            Arc::new(store),
+        );
+        assert!(supplier.initialize().await.is_err());
+        supplier.current_headers().await;
+        supplier.current_headers().await;
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        assert!(supplier.initialize().await.is_err());
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
     }
 }
