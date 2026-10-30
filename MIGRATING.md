@@ -166,3 +166,10 @@ fetches. Configure the final trusted TL URL.
 Receipt payloads must already be RFC 8785 canonical JSON. Verification checks
 the original COSE signature before issuer and canonical-form checks. Producers
 must canonicalize before signing.
+
+## Regular SCITT artifact policy
+
+Regular SCITT verification requires both artifacts. `RequireScitt` rejects an
+incomplete pair. Fallback policies verify any supplied evidence before
+consulting the badge and bind it to the same registration. Invalid evidence
+always rejects. Method B's explicit receipt waiver is unchanged.
