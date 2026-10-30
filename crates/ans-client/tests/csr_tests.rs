@@ -560,30 +560,17 @@ fn host_of_octets(total: usize) -> String {
     format!("{head}{}", "d".repeat(total - head.len()))
 }
 
-/// `Fqdn` derives `Deserialize`, so this reaches the builder without ever
-/// running `Fqdn::new`.
+/// Deserialize through the same validated host boundary as the constructor.
 fn deserialized_fqdn(host: &str) -> Fqdn {
     let json = serde_json::to_string(host).expect("str serializes");
-    serde_json::from_str::<Fqdn>(&json).expect("Fqdn derives Deserialize")
+    serde_json::from_str::<Fqdn>(&json).expect("valid FQDN")
 }
 
-#[rstest]
-#[case::server(AnsCsrBuilder::server as Ctor)]
-#[case::identity(AnsCsrBuilder::identity as Ctor)]
-fn host_over_253_octets_is_rejected(#[case] ctor: Ctor) {
+#[test]
+fn host_over_253_octets_is_rejected() {
     let host = host_of_octets(255);
-    assert!(
-        Fqdn::new(&host).is_ok(),
-        "the shared type permits this; the builder is the gate"
-    );
-
-    let err = ctor(fqdn(&host), version("1.0.0"))
-        .build()
-        .expect_err("over-long host must be rejected");
-    assert!(matches!(
-        err,
-        ans_client::CsrError::HostTooLong { octets: 255 }
-    ));
+    assert!(Fqdn::new(&host).is_err());
+    assert!(serde_json::from_value::<Fqdn>(serde_json::json!(host)).is_err());
 }
 
 #[rstest]
@@ -597,31 +584,20 @@ fn host_of_exactly_253_octets_is_accepted(#[case] ctor: Ctor) {
     assert!(subject_alt_names(&out.csr_pem).contains(&format!("DNS:{host}")));
 }
 
-#[rstest]
-#[case::server(AnsCsrBuilder::server as Ctor)]
-#[case::identity(AnsCsrBuilder::identity as Ctor)]
-fn single_label_host_is_rejected(#[case] ctor: Ctor) {
-    assert!(Fqdn::new("localhost").is_ok(), "pinned by ans-types");
-
-    let err = ctor(fqdn("localhost"), version("1.0.0"))
-        .build()
-        .expect_err("a single-label host must be rejected");
-    assert!(matches!(err, ans_client::CsrError::HostNotFullyQualified));
+#[test]
+fn single_label_host_is_rejected() {
+    assert!(Fqdn::new("localhost").is_err());
+    assert!(serde_json::from_str::<Fqdn>("\"localhost\"").is_err());
 }
 
-/// `Fqdn::new` accepts a dotted quad as four numeric labels; the RA rejects it
-/// so a registrant cannot aim the challenge at an internal address.
+/// IP literals cannot reach the CSR builder through the shared type.
 #[rstest]
 #[case("127.0.0.1")]
 #[case("192.168.0.1")]
 #[case("169.254.169.254")]
 fn ip_literal_host_is_rejected(#[case] host: &str) {
-    assert!(Fqdn::new(host).is_ok());
-
-    let err = AnsCsrBuilder::server(fqdn(host), version("1.0.0"))
-        .build()
-        .expect_err("IP literal must be rejected");
-    assert!(matches!(err, ans_client::CsrError::HostIsIpLiteral));
+    assert!(Fqdn::new(host).is_err());
+    assert!(serde_json::from_value::<Fqdn>(serde_json::json!(host)).is_err());
 }
 
 #[rstest]
@@ -631,14 +607,10 @@ fn ip_literal_host_is_rejected(#[case] host: &str) {
 #[case("a..b")]
 #[case("")]
 fn deserialized_invalid_host_is_rejected(#[case] host: &str) {
-    let err = AnsCsrBuilder::server(deserialized_fqdn(host), version("1.0.0"))
-        .build()
-        .expect_err("deserialization must not bypass validation");
-    assert!(matches!(err, ans_client::CsrError::InvalidName(_)));
+    assert!(serde_json::from_value::<Fqdn>(serde_json::json!(host)).is_err());
 }
 
-/// Validation must also canonicalize: a deserialized value keeps its casing and
-/// trailing dot, which would otherwise be encoded verbatim.
+/// Canonical names from deserialization remain canonical in both CSR SANs.
 #[test]
 fn deserialized_host_is_canonicalized_before_encoding() {
     let out = AnsCsrBuilder::identity(deserialized_fqdn("Agent.Example.COM."), version("1.0.0"))
@@ -661,11 +633,14 @@ fn deserialized_host_is_canonicalized_before_encoding() {
 /// Makes the "before any key work" ordering observable rather than implicit.
 #[test]
 fn host_is_validated_before_the_supplied_key() {
-    let err = AnsCsrBuilder::server(fqdn("localhost"), version("1.0.0"))
-        .with_key_pair_pem(SecretString::from("-----BEGIN PRIVATE KEY-----\nnope\n"))
-        .build()
-        .expect_err("must fail");
-    assert!(matches!(err, ans_client::CsrError::HostNotFullyQualified));
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let host: Fqdn = serde_json::from_str("\"localhost\"")?;
+        AnsCsrBuilder::server(host, version("1.0.0"))
+            .with_key_pair_pem(SecretString::from("-----BEGIN PRIVATE KEY-----\nnope\n"))
+            .build()?;
+        Ok(())
+    })();
+    assert!(result.unwrap_err().is::<serde_json::Error>());
 }
 
 // ── Key encoding ──────────────────────────────────────────────────────────────
