@@ -66,7 +66,8 @@ impl HttpScittClient {
     ///
     /// # Errors
     ///
-    /// Returns [`ScittError::InvalidUrl`] if the URL cannot be parsed.
+    /// Returns [`ScittError::InvalidUrl`] unless the URL has an HTTPS scheme
+    /// and a host. Redirects are rejected to preserve the configured TL origin.
     pub fn new(base_url: impl AsRef<str>) -> Result<Self, ScittError> {
         let raw = base_url.as_ref();
         // Ensure the URL has a trailing slash so `.join("v1/...")` works correctly.
@@ -77,12 +78,25 @@ impl HttpScittClient {
         };
         let parsed = Url::parse(&normalised)
             .map_err(|e| ScittError::InvalidUrl(format!("invalid base URL '{raw}': {e}")))?;
+        if parsed.scheme() != "https" || parsed.host_str().is_none() {
+            return Err(ScittError::InvalidUrl(
+                "SCITT base URL must use HTTPS and include a host".into(),
+            ));
+        }
         Ok(Self {
-            client: Client::new(),
+            client: Self::client_builder()
+                .build()
+                .map_err(crate::error::HttpError::from)?,
             base_url: parsed,
             timeout: Duration::from_secs(30),
             extra_headers: Vec::new(),
         })
+    }
+
+    fn client_builder() -> reqwest::ClientBuilder {
+        Client::builder()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
     }
 
     /// Set the request timeout (default: 30 s).
@@ -442,6 +456,76 @@ mod tests {
         let client = HttpScittClient::new("https://tl.example.com").unwrap();
         let dbg = format!("{client:?}");
         assert!(dbg.contains("HttpScittClient"));
+    }
+
+    #[test]
+    fn http_client_rejects_insecure_schemes() {
+        for url in [
+            "http://tl.example.com",
+            "http://localhost:8080",
+            "ftp://tl.example.com",
+            "file:///root-keys",
+        ] {
+            assert!(matches!(
+                HttpScittClient::new(url),
+                Err(ScittError::InvalidUrl(_))
+            ));
+        }
+    }
+
+    fn loopback_client(base_url: &str) -> HttpScittClient {
+        let mut client = HttpScittClient::new("https://tl.example.com").unwrap();
+        client.base_url = Url::parse(&format!("{base_url}/")).unwrap();
+        // Only relax TLS for the loopback fixture; retain the production
+        // redirect policy and all request handling.
+        client.client = HttpScittClient::client_builder()
+            .https_only(false)
+            .build()
+            .unwrap();
+        client
+    }
+
+    #[tokio::test]
+    async fn scitt_fetches_reject_redirects_and_preserve_direct_responses() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let origin = MockServer::start().await;
+        let other = MockServer::start().await;
+        let client = loopback_client(&origin.uri());
+        let agent_id = Uuid::nil();
+        for endpoint in [
+            "root-keys".to_string(),
+            format!("v1/agents/{agent_id}/receipt"),
+            format!("v1/agents/{agent_id}/status-token"),
+        ] {
+            origin.reset().await;
+            Mock::given(method("GET"))
+                .and(path(format!("/{endpoint}")))
+                .respond_with(ResponseTemplate::new(302).insert_header("Location", other.uri()))
+                .mount(&origin)
+                .await;
+            let result = if endpoint == "root-keys" {
+                client.fetch_root_keys().await.map(|_| ())
+            } else if endpoint.ends_with("/receipt") {
+                client.fetch_receipt(agent_id).await.map(|_| ())
+            } else {
+                client.fetch_status_token(agent_id).await.map(|_| ())
+            };
+            assert!(matches!(
+                result,
+                Err(ScittError::UnexpectedHttpStatus { status: 302, .. })
+            ));
+        }
+        assert!(other.received_requests().await.unwrap().is_empty());
+        origin.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/root-keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("test-key\n"))
+            .mount(&origin)
+            .await;
+        assert_eq!(client.fetch_root_keys().await.unwrap(), vec!["test-key"]);
     }
 
     // ── MockScittClient ───────────────────────────────────────────────

@@ -155,3 +155,8 @@ DANE binds TLSA records to the queried service name and requires every CNAME hop
 and the terminal TLSA record set to be DNSSEC-secure. Unrelated signed answers,
 unsigned records, and unproven aliases are ignored with `ValidateIfPresent`
 and cannot satisfy `Required`.
+
+## SCITT transport
+
+SCITT HTTP clients require HTTPS and reject redirects, including root-key
+fetches. Configure the final trusted TL URL.
