@@ -126,6 +126,13 @@ impl From<reqwest::Error> for HttpError {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum TlogError {
+    /// The leaf exists but is not covered by a signed checkpoint yet.
+    #[error("Transparency log checkpoint pending")]
+    CheckpointPending {
+        /// Retry-After delay advertised by the receipt endpoint.
+        retry_after_seconds: Option<u64>,
+    },
+
     /// HTTP request failed (network error, timeout, etc.)
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] HttpError),
@@ -172,7 +179,10 @@ impl TlogError {
     pub(crate) fn is_unavailable(&self) -> bool {
         matches!(
             self,
-            Self::HttpError(_) | Self::ServiceUnavailable | Self::StatusUnknown
+            Self::HttpError(_)
+                | Self::ServiceUnavailable
+                | Self::CheckpointPending { .. }
+                | Self::StatusUnknown
         )
     }
 }
