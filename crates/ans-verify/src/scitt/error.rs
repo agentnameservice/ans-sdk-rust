@@ -100,6 +100,10 @@ pub enum ScittError {
     #[error("Invalid receipt payload: {0}")]
     InvalidReceiptPayload(String),
 
+    /// A required per-request SCITT artifact is absent.
+    #[error("Missing SCITT artifact: {0}")]
+    MissingArtifact(&'static str),
+
     /// Certificate, receipt, and status token do not name the same peer.
     #[error("ANS identity binding failed: {0}")]
     IdentityBinding(String),
