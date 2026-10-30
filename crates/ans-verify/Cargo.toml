@@ -62,6 +62,7 @@ ciborium = { workspace = true, optional = true }
 p256 = { workspace = true, optional = true }
 # Used unconditionally for SVCB cap-sha256 (base64url) decoding; also by scitt.
 base64 = { workspace = true }
+bs58 = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 ring = { workspace = true, optional = true }
@@ -69,7 +70,7 @@ ring = { workspace = true, optional = true }
 [features]
 default = []
 rustls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
-scitt = ["dep:ciborium", "dep:p256", "dep:tokio-util", "dep:rand", "dep:serde_json_canonicalizer"]
+scitt = ["dep:ciborium", "dep:p256", "dep:tokio-util", "dep:rand", "dep:serde_json_canonicalizer", "dep:ring", "dep:bs58"]
 # ECDSA P-256 verification via ring instead of p256. Both backends are tested
 # in CI. ring is already present transitively through the networking stack.
 fast-verify = ["scitt", "dep:ring"]
@@ -106,7 +107,7 @@ tracing-subscriber = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
-rcgen = { workspace = true }
+rcgen = { workspace = true, features = ["aws_lc_rs"] }
 rmcp = { version = "3.7.0", features = ["client", "transport-streamable-http-client-reqwest"] }
 anyhow = "1.0.104"
 webpki-roots = "1.0.11"
@@ -152,3 +153,9 @@ required-features = ["scitt"]
 name = "local_dpop"
 path = "examples/local_dpop.rs"
 required-features = ["scitt", "test-support"]
+
+[[example]]
+name = "verify_identity"
+path = "examples/verify_identity.rs"
+required-features = ["scitt"]
+test = true

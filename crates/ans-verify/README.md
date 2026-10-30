@@ -192,9 +192,9 @@ Enable with `features = ["scitt"]` for offline-capable verification using signed
 2. Verify the status token: COSE_Sign1 signature, expiry, agent status
 3. Match certificate fingerprint against the token's cert array
 4. Verify the receipt's COSE_Sign1 signature and Merkle inclusion proof, then bind its full ANS name and agent identifier to the token and its host to the peer
-5. Result: `ScittVerified` with tier (`FullScitt` or `StatusTokenVerified`)
+5. Result: `ScittVerified` with tier `FullScitt`
 
-Badge fallback is available only when both SCITT headers are absent and the configured `ScittTierPolicy` allows it. Present but invalid evidence rejects, including an expired token or invalid receipt. A valid token without a receipt yields `StatusTokenVerified`, even under `RequireScitt`; require `FullScitt` if your application needs an inclusion receipt. Status-token clock skew is capped at ten minutes.
+When either artifact is absent, policies permitting badge fallback first validate any supplied artifact and bind it to the live badge. Invalid or expired evidence rejects. `RequireScitt` requires both artifacts. Method B retains its explicit receipt waiver. Status-token clock skew is capped at ten minutes.
 
 ```rust
 use std::sync::Arc;
@@ -225,12 +225,14 @@ let outcome = verifier
 
 ### Agent-Side Header Supply
 
-Use `ScittHeaderSupplier` for agents to maintain fresh SCITT artifacts:
+Use `ScittHeaderSupplier` for agents to maintain fresh SCITT artifacts. Initialize before serving requests and retain the refresh handle; `current_headers()` only reads cached artifacts and never performs network I/O:
 
 ```rust
 use ans_verify::{ScittHeaderSupplier, HttpScittClient};
 
 let supplier = ScittHeaderSupplier::new(agent_id, scitt_client, key_store);
+supplier.initialize().await?; // startup only
+let _refresh = supplier.start_auto_refresh();
 let headers = supplier.current_headers().await;
 // headers.receipt_base64 → X-SCITT-Receipt
 // headers.status_token_base64 → X-ANS-Status-Token
@@ -371,3 +373,30 @@ let verifier = ServerVerifier::builder()
 ## License
 
 MIT
+
+## Verified Identity evidence
+
+The separate `IdentityLogClient` trait exposes all six public identity TL reads
+on `HttpTransparencyLogClient`. With `scitt` enabled, use `IdentityVerifier` for
+`did:web` and `did:key` possession proofs from sealed events. It supports
+Ed25519, P-256, and RSA public keys in JWK and Multikey forms, preserves full
+verification methods, binds current badges to `keysLogId`, and remembers
+terminal revocation.
+
+Use `observe_receipt` for COSE-authenticated evidence. `observe_trusted_entry`
+relies on a configured trusted HTTPS TL for envelope provenance. Fetch the proof
+event when the current event is only a link/unlink, then separately verify the
+current badge with `verify_badge`. Historical signature validity alone does not
+establish current status. Missing sealed `raId` is incomplete evidence. Neither
+path proves audit completeness or checkpoint consistency. See the repository's
+[feature matrix](../../docs/SPEC-COMPLIANCE.md) for supported contracts.
+
+The `verify_identity` example demonstrates the public fetch/verify workflow:
+
+```bash
+cargo run -p ans-verify --features scitt --example verify_identity -- \
+  https://tl.example.com 0193f0c5-7b2e-7a41-9c3d-aaaaaaaaaaaa
+```
+
+With `test-support`, `MockIdentityLogClient` provides fixture-backed responses
+for all six identity reads and applies the same pagination limits.

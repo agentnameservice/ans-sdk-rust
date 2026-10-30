@@ -180,3 +180,21 @@ always rejects. Method B's explicit receipt waiver is unchanged.
 `initialize().await?` during startup, then retain `start_auto_refresh()`'s handle.
 `with_init_timeout()` bounds explicit startup initialization. Until acquisition
 succeeds, cached fields remain absent.
+
+## Identity proof verification
+
+Current identity badges contain verification methods, not operator JWS proofs.
+Fetch the proof event at `keysLogId`; `IdentityVerifier::observe_receipt` verifies
+its COSE envelope and possession proofs. `observe_trusted_entry` verifies
+possession proofs and relies on the explicitly trusted HTTPS TL for provenance;
+it does not independently verify JSON producer/TL detached signatures.
+
+`verify_badge` binds historical proofs to current VERIFIED status and the exact
+method set. Missing sealed `raId` returns incomplete evidence. Never derive the
+expected RA from an untrusted proof. Observed revocation remains terminal.
+These APIs do not prove audit completeness or checkpoint consistency, and a
+historical proof alone does not attest current status.
+
+The `verify_identity` example demonstrates the public fetch/verify workflow,
+including a historical proof behind a current link event. LEI and ENS proof
+profiles remain postponed by the merged specification.
