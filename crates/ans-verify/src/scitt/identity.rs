@@ -44,23 +44,59 @@ pub fn bind_receipt_to_status(
     status: &StatusTokenPayload,
     expected_host: Option<&str>,
 ) -> Result<(), ScittError> {
+    bind_receipt_to_peer(
+        receipt,
+        &status.ans_name.to_string(),
+        status.agent_id,
+        expected_host,
+    )
+}
+
+pub fn bind_status_to_badge(
+    status: &StatusTokenPayload,
+    badge: &ans_types::Badge,
+) -> Result<(), ScittError> {
+    if status.agent_id != badge.agent_id()
+        || !status
+            .ans_name
+            .to_string()
+            .eq_ignore_ascii_case(badge.agent_name())
+    {
+        return Err(ScittError::IdentityBinding(
+            "status token does not match the badge registration".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn bind_receipt_to_badge(
+    receipt: &VerifiedReceipt,
+    badge: &ans_types::Badge,
+    expected_host: Option<&str>,
+) -> Result<(), ScittError> {
+    bind_receipt_to_peer(receipt, badge.agent_name(), badge.agent_id(), expected_host)
+}
+
+fn bind_receipt_to_peer(
+    receipt: &VerifiedReceipt,
+    ans_name: &str,
+    agent_id: Uuid,
+    expected_host: Option<&str>,
+) -> Result<(), ScittError> {
     let leaf: ReceiptLeaf = serde_json::from_slice(&receipt.event_bytes)
         .map_err(|e| ScittError::InvalidReceiptIdentity(e.to_string()))?;
     let identity = match leaf {
         ReceiptLeaf::Envelope { payload } => payload.producer.event,
         ReceiptLeaf::Event(identity) => identity,
     };
-    if !identity
-        .ans_name
-        .eq_ignore_ascii_case(&status.ans_name.to_string())
-    {
+    if !identity.ans_name.eq_ignore_ascii_case(ans_name) {
         return Err(ScittError::IdentityBinding(
-            "receipt ansName does not match status token ansName".into(),
+            "receipt ansName does not match the live registration ansName".into(),
         ));
     }
-    if identity.ans_id.is_some_and(|id| id != status.agent_id) {
+    if identity.ans_id.is_some_and(|id| id != agent_id) {
         return Err(ScittError::IdentityBinding(
-            "receipt ansId does not match status token agentId".into(),
+            "receipt ansId does not match the live registration agentId".into(),
         ));
     }
     if let Some(expected) = expected_host {
