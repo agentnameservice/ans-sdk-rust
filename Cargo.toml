@@ -10,7 +10,7 @@ members = [
 version = "0.1.5"
 edition = "2024"
 rust-version = "1.88"
-license = "MIT"
+license = "Apache-2.0 AND MIT"
 homepage = "https://github.com/agentnameservice/ans-sdk-rust"
 repository = "https://github.com/agentnameservice/ans-sdk-rust"
 
