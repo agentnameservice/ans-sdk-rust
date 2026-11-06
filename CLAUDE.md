@@ -180,13 +180,13 @@ SCITT-enhanced verification (`verify_server_with_scitt` / `verify_client_with_sc
 5. Result is `VerificationOutcome::ScittVerified` with verification tier
 
 Fallback behavior (governed by `ScittTierPolicy`):
-- `ScittWithBadgeFallback` (default): SCITT first, badge fallback only if headers absent
+- `ScittWithBadgeFallback` (default): SCITT first, badge fallback for missing artifacts after validating any supplied evidence
 - `RequireScitt`: SCITT required, no badge fallback
 - `BadgeWithScittEnhancement`: Badge first, SCITT enhances if headers present
 
 Key rules:
-- Present headers are final: any SCITT failure (including `TokenExpired`) = REJECT, no badge fallback
-- Badge fallback only when SCITT headers are completely absent
+- Invalid present evidence (including `TokenExpired`) = REJECT, no badge fallback
+- Missing artifacts may use badge fallback; supplied evidence must verify and agree with that badge. `RequireScitt` requires a complete pair.
 - Terminal status (`REVOKED`/`EXPIRED`) = always reject regardless of policy
 
 ### DPoP / Method B (feature = "scitt")

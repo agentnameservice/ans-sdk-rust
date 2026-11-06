@@ -112,17 +112,6 @@ pub fn verify_receipt(
     let trusted_key = key_store.get(parsed.protected.kid)?;
     tracing::debug!(kid = %kid_hex, key_domain = %trusted_key.name, "Key lookup succeeded");
 
-    // Step 3b: bind iss claim to signing key domain
-    if let Some(iss) = &parsed.protected.cwt_iss
-        && iss != &trusted_key.name
-    {
-        tracing::warn!(claimed_iss = %iss, key_domain = %trusted_key.name, "Issuer mismatch");
-        return Err(ScittError::IssuerMismatch {
-            claimed: iss.clone(),
-            key_domain: trusted_key.name.clone(),
-        });
-    }
-
     // Step 4: verify ECDSA P-256 signature
     let sig_structure = build_sig_structure(&parsed.protected_bytes, &parsed.payload)?;
     let sig = Signature::from_slice(&parsed.signature).map_err(|_| {
@@ -134,6 +123,29 @@ pub fn verify_receipt(
         return Err(ScittError::SignatureInvalid);
     }
     tracing::debug!(kid = %kid_hex, "ECDSA signature verified");
+
+    // Step 4b: bind iss claim to signing key domain
+    if let Some(iss) = &parsed.protected.cwt_iss
+        && iss != &trusted_key.name
+    {
+        tracing::warn!(claimed_iss = %iss, key_domain = %trusted_key.name, "Issuer mismatch");
+        return Err(ScittError::IssuerMismatch {
+            claimed: iss.clone(),
+            key_domain: trusted_key.name.clone(),
+        });
+    }
+
+    // The leaf is signed in its canonical wire form. Never rewrite bytes
+    // before checking the signature or hash a different representation.
+    let payload: serde_json::Value = serde_json::from_slice(&parsed.payload)
+        .map_err(|error| ScittError::InvalidReceiptPayload(error.to_string()))?;
+    let canonical = serde_json_canonicalizer::to_vec(&payload)
+        .map_err(|error| ScittError::InvalidReceiptPayload(error.to_string()))?;
+    if canonical != parsed.payload {
+        return Err(ScittError::InvalidReceiptPayload(
+            "payload must use JCS canonical JSON".into(),
+        ));
+    }
 
     // Step 5: extract VDP from unprotected header (label 396)
     let vdp = extract_vdp(&parsed.unprotected)?;
@@ -429,13 +441,13 @@ mod tests {
     #[test]
     fn valid_single_leaf_receipt() {
         let (signing_key, store) = make_key_and_store(1);
-        let leaves: &[&[u8]] = &[b"event-0"];
+        let leaves: &[&[u8]] = &[br#""event-0""#];
         let receipt = make_receipt(&signing_key, leaves, 0);
 
         let result = verify_receipt(&receipt, &store).unwrap();
         assert_eq!(result.tree_size, 1);
         assert_eq!(result.leaf_index, 0);
-        assert_eq!(result.event_bytes, b"event-0");
+        assert_eq!(result.event_bytes, br#""event-0""#);
         assert!(result.iss.is_none());
         assert!(result.iat.is_none());
     }
@@ -443,7 +455,7 @@ mod tests {
     #[test]
     fn valid_4_leaf_tree_all_positions() {
         let (signing_key, store) = make_key_and_store(1);
-        let leaves: &[&[u8]] = &[b"a", b"b", b"c", b"d"];
+        let leaves: &[&[u8]] = &[br#""a""#, br#""b""#, br#""c""#, br#""d""#];
 
         for i in 0..4 {
             let receipt = make_receipt(&signing_key, leaves, i);
@@ -457,7 +469,9 @@ mod tests {
     #[test]
     fn valid_7_leaf_non_power_of_2_tree() {
         let (signing_key, store) = make_key_and_store(1);
-        let leaves: &[&[u8]] = &[b"v0", b"v1", b"v2", b"v3", b"v4", b"v5", b"v6"];
+        let leaves: &[&[u8]] = &[
+            br#""v0""#, br#""v1""#, br#""v2""#, br#""v3""#, br#""v4""#, br#""v5""#, br#""v6""#,
+        ];
 
         for i in 0..7 {
             let receipt = make_receipt(&signing_key, leaves, i);
@@ -472,7 +486,7 @@ mod tests {
         let (signing_key, store) = make_key_and_store(2);
         // 1024 leaves → 10 levels deep
         let event_data: Vec<Vec<u8>> = (0u16..1024)
-            .map(|i| format!("event{i}").into_bytes())
+            .map(|i| serde_json::to_vec(&format!("event{i}")).unwrap())
             .collect();
         let leaf_refs: Vec<&[u8]> = event_data.iter().map(|v| v.as_slice()).collect();
         let receipt = make_receipt(&signing_key, &leaf_refs, 511);
@@ -488,7 +502,7 @@ mod tests {
         let digest = Sha256::digest(spki_doc.as_bytes());
         let expected_kid: [u8; 4] = [digest[0], digest[1], digest[2], digest[3]];
 
-        let leaves: &[&[u8]] = &[b"event"];
+        let leaves: &[&[u8]] = &[br#""event""#];
         let receipt = make_receipt(&signing_key, leaves, 0);
         let result = verify_receipt(&receipt, &store).unwrap();
         assert_eq!(result.key_id, expected_kid);
@@ -499,11 +513,11 @@ mod tests {
     #[test]
     fn invalid_signature_flipped_byte() {
         let (signing_key, store) = make_key_and_store(1);
-        let leaves: &[&[u8]] = &[b"event"];
+        let leaves: &[&[u8]] = &[br#""event""#];
         let (_, inclusion_path) = build_tree_and_proof(leaves, 0);
 
         let protected_bytes = build_receipt_protected_bytes(&signing_key);
-        let payload = b"event".to_vec();
+        let payload = br#""event""#.to_vec();
         let digest = compute_sig_structure_digest(&protected_bytes, &payload).unwrap();
         let (sig, _): (p256::ecdsa::Signature, _) = signing_key.sign_prehash(&digest).unwrap();
         let mut sig_bytes = sig.to_bytes().to_vec();
@@ -529,7 +543,7 @@ mod tests {
     fn wrong_key_not_in_store() {
         let (signing_key, _) = make_key_and_store(1);
         let (_, store2) = make_key_and_store(2);
-        let leaves: &[&[u8]] = &[b"event"];
+        let leaves: &[&[u8]] = &[br#""event""#];
         let receipt = make_receipt(&signing_key, leaves, 0);
 
         let err = verify_receipt(&receipt, &store2).unwrap_err();
@@ -542,7 +556,7 @@ mod tests {
     fn missing_vdp_label_396() {
         let (signing_key, store) = make_key_and_store(1);
         let protected_bytes = build_receipt_protected_bytes(&signing_key);
-        let payload = b"event".to_vec();
+        let payload = br#""event""#.to_vec();
         let digest = compute_sig_structure_digest(&protected_bytes, &payload).unwrap();
         let (sig, _): (p256::ecdsa::Signature, _) = signing_key.sign_prehash(&digest).unwrap();
         let sig_bytes = sig.to_bytes().to_vec();
@@ -568,7 +582,7 @@ mod tests {
     fn vdp_missing_tree_size() {
         let (signing_key, store) = make_key_and_store(1);
         let protected_bytes = build_receipt_protected_bytes(&signing_key);
-        let payload = b"event".to_vec();
+        let payload = br#""event""#.to_vec();
         let digest = compute_sig_structure_digest(&protected_bytes, &payload).unwrap();
         let (sig, _): (p256::ecdsa::Signature, _) = signing_key.sign_prehash(&digest).unwrap();
         let sig_bytes = sig.to_bytes().to_vec();
@@ -604,7 +618,7 @@ mod tests {
     fn vdp_missing_inclusion_path() {
         let (signing_key, store) = make_key_and_store(1);
         let protected_bytes = build_receipt_protected_bytes(&signing_key);
-        let payload = b"event".to_vec();
+        let payload = br#""event""#.to_vec();
         let digest = compute_sig_structure_digest(&protected_bytes, &payload).unwrap();
         let (sig, _): (p256::ecdsa::Signature, _) = signing_key.sign_prehash(&digest).unwrap();
         let sig_bytes = sig.to_bytes().to_vec();
@@ -640,7 +654,7 @@ mod tests {
     fn vdp_inclusion_path_element_wrong_length() {
         let (signing_key, store) = make_key_and_store(1);
         let protected_bytes = build_receipt_protected_bytes(&signing_key);
-        let payload = b"event".to_vec();
+        let payload = br#""event""#.to_vec();
         let digest = compute_sig_structure_digest(&protected_bytes, &payload).unwrap();
         let (sig, _): (p256::ecdsa::Signature, _) = signing_key.sign_prehash(&digest).unwrap();
         let sig_bytes = sig.to_bytes().to_vec();
@@ -701,7 +715,7 @@ mod tests {
         let mut protected_bytes = Vec::new();
         ciborium::ser::into_writer(&map, &mut protected_bytes).unwrap();
 
-        let payload = b"event".to_vec();
+        let payload = br#""event""#.to_vec();
         let sig_digest = compute_sig_structure_digest(&protected_bytes, &payload).unwrap();
         let (sig, _): (p256::ecdsa::Signature, _) = signing_key.sign_prehash(&sig_digest).unwrap();
         let sig_bytes = sig.to_bytes().to_vec();
@@ -750,7 +764,7 @@ mod tests {
         let mut protected_bytes = Vec::new();
         ciborium::ser::into_writer(&map, &mut protected_bytes).unwrap();
 
-        let payload = b"event".to_vec();
+        let payload = br#""event""#.to_vec();
         let sig_digest = compute_sig_structure_digest(&protected_bytes, &payload).unwrap();
         let (sig, _): (p256::ecdsa::Signature, _) = signing_key.sign_prehash(&sig_digest).unwrap();
         let sig_bytes = sig.to_bytes().to_vec();
@@ -778,7 +792,7 @@ mod tests {
     fn root_hash_is_deterministic_for_same_tree() {
         // Verifies that root_hash in VerifiedReceipt is consistently computed.
         let (signing_key, store) = make_key_and_store(1);
-        let leaves: &[&[u8]] = &[b"a", b"b", b"c", b"d"];
+        let leaves: &[&[u8]] = &[br#""a""#, br#""b""#, br#""c""#, br#""d""#];
 
         let receipt0 = make_receipt(&signing_key, leaves, 0);
         let result0 = verify_receipt(&receipt0, &store).unwrap();
@@ -795,18 +809,18 @@ mod tests {
     #[test]
     fn tampered_payload_in_receipt() {
         let (signing_key, store) = make_key_and_store(1);
-        let leaves: &[&[u8]] = &[b"real-event"];
+        let leaves: &[&[u8]] = &[br#""real-event""#];
         let (_, inclusion_path) = build_tree_and_proof(leaves, 0);
 
         let protected_bytes = build_receipt_protected_bytes(&signing_key);
         // Sign the real payload
-        let real_payload = b"real-event".to_vec();
+        let real_payload = br#""real-event""#.to_vec();
         let digest = compute_sig_structure_digest(&protected_bytes, &real_payload).unwrap();
         let (sig, _): (p256::ecdsa::Signature, _) = signing_key.sign_prehash(&digest).unwrap();
         let sig_bytes = sig.to_bytes().to_vec();
 
         // Swap in a different payload — signature will fail
-        let fake_payload = b"fake-event".to_vec();
+        let fake_payload = br#""fake-event""#.to_vec();
         let vdp = build_vdp_map(1, 0, &inclusion_path);
         let unprotected = build_unprotected_with_vdp(vdp);
 
@@ -829,7 +843,7 @@ mod tests {
     fn vdp_tree_size_wrong_type() {
         let (signing_key, store) = make_key_and_store(1);
         let protected_bytes = build_receipt_protected_bytes(&signing_key);
-        let payload = b"event".to_vec();
+        let payload = br#""event""#.to_vec();
         let digest = compute_sig_structure_digest(&protected_bytes, &payload).unwrap();
         let (sig, _): (p256::ecdsa::Signature, _) = signing_key.sign_prehash(&digest).unwrap();
         let sig_bytes = sig.to_bytes().to_vec();
@@ -870,7 +884,7 @@ mod tests {
     fn vdp_inclusion_path_wrong_type() {
         let (signing_key, store) = make_key_and_store(1);
         let protected_bytes = build_receipt_protected_bytes(&signing_key);
-        let payload = b"event".to_vec();
+        let payload = br#""event""#.to_vec();
         let digest = compute_sig_structure_digest(&protected_bytes, &payload).unwrap();
         let (sig, _): (p256::ecdsa::Signature, _) = signing_key.sign_prehash(&digest).unwrap();
         let sig_bytes = sig.to_bytes().to_vec();
@@ -981,7 +995,7 @@ mod tests {
         let (signing_key, store) = make_key_and_store(1);
         // iss = "tl.example.com" matches the key's C2SP name
         let protected = build_protected_with_iss(&signing_key, "tl.example.com");
-        let leaves: &[&[u8]] = &[b"event"];
+        let leaves: &[&[u8]] = &[br#""event""#];
         let receipt = make_receipt_with_protected(&signing_key, &protected, leaves, 0);
 
         let result = verify_receipt(&receipt, &store).unwrap();
@@ -993,7 +1007,7 @@ mod tests {
         let (signing_key, store) = make_key_and_store(1);
         // iss = "evil.example.com" does NOT match key's "tl.example.com"
         let protected = build_protected_with_iss(&signing_key, "evil.example.com");
-        let leaves: &[&[u8]] = &[b"event"];
+        let leaves: &[&[u8]] = &[br#""event""#];
         let receipt = make_receipt_with_protected(&signing_key, &protected, leaves, 0);
 
         let err = verify_receipt(&receipt, &store).unwrap_err();
@@ -1013,10 +1027,57 @@ mod tests {
     fn no_iss_claim_still_passes() {
         // When iss is absent, we don't enforce — existing behavior preserved
         let (signing_key, store) = make_key_and_store(1);
-        let leaves: &[&[u8]] = &[b"event"];
+        let leaves: &[&[u8]] = &[br#""event""#];
         let receipt = make_receipt(&signing_key, leaves, 0);
 
         let result = verify_receipt(&receipt, &store).unwrap();
         assert!(result.iss.is_none());
+    }
+
+    #[test]
+    fn signature_failure_precedes_untrusted_issuer() {
+        let (key, store) = make_key_and_store(1);
+        let protected = build_protected_with_iss(&key, "untrusted.example");
+        let mut receipt = make_receipt_with_protected(&key, &protected, &[br#"{}"#], 0);
+        let last = receipt.last_mut().unwrap();
+        *last ^= 1;
+        assert!(matches!(
+            verify_receipt(&receipt, &store),
+            Err(ScittError::SignatureInvalid)
+        ));
+    }
+
+    #[test]
+    fn rejects_signed_noncanonical_payloads() {
+        let (key, store) = make_key_and_store(1);
+        for payload in [
+            br#"{ "a": 1 }"#.as_slice(),
+            br#"{"b":2,"a":1}"#,
+            br#"{"a":1,"a":1}"#,
+            br#"{"a":1.0}"#,
+            br#"{"a":-0}"#,
+            br#"{"a":"\u0061"}"#,
+            b"not-json",
+        ] {
+            let receipt = make_receipt(&key, &[payload], 0);
+            assert!(matches!(
+                verify_receipt(&receipt, &store),
+                Err(ScittError::InvalidReceiptPayload(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn canonical_unicode_and_number_payloads_preserve_the_signed_leaf() {
+        let (key, store) = make_key_and_store(1);
+        for payload in [
+            r#"{"😀":1,"דּ":2}"#.as_bytes(),
+            br#"{"a":1e+30,"b":0.000001,"c":1e-7}"#,
+        ] {
+            let receipt = make_receipt(&key, &[payload], 0);
+            let verified = verify_receipt(&receipt, &store).unwrap();
+            assert_eq!(verified.event_bytes, payload);
+            assert_eq!(verified.root_hash, build_tree_and_proof(&[payload], 0).0);
+        }
     }
 }

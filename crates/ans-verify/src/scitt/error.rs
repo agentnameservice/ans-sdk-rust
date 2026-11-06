@@ -96,6 +96,18 @@ pub enum ScittError {
     #[error("Invalid receipt identity: {0}")]
     InvalidReceiptIdentity(String),
 
+    /// The signed receipt payload is not canonical JSON per RFC 8785.
+    #[error("Invalid receipt payload: {0}")]
+    InvalidReceiptPayload(String),
+
+    /// A required per-request SCITT artifact is absent.
+    #[error("Missing SCITT artifact: {0}")]
+    MissingArtifact(&'static str),
+
+    /// Initial artifact acquisition exceeded its configured deadline.
+    #[error("SCITT initialization timed out")]
+    InitializationTimeout,
+
     /// Certificate, receipt, and status token do not name the same peer.
     #[error("ANS identity binding failed: {0}")]
     IdentityBinding(String),
