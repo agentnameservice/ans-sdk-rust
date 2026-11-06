@@ -102,6 +102,14 @@ pub struct Badge {
     pub payload: BadgePayload,
     /// Schema version (`V1` or `V2`).
     pub schema_version: String,
+    /// Computed identity links. `Some([])` means no visible links; absence
+    /// can mean an older badge or an unavailable join (see the marker below).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identities: Option<Vec<crate::LinkedIdentity>>,
+    /// True when the TL could not compute the identity join. Never interpret
+    /// this as an empty set of identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identities_unavailable: Option<bool>,
     /// Signature over the badge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
@@ -404,5 +412,22 @@ mod tests {
         assert_eq!(badge.agent_host(), "agent.example.com");
         assert_eq!(badge.agent_version(), "v1.0.0");
         assert!(badge.server_cert_fingerprint().starts_with("SHA256:"));
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        value["identities"] = serde_json::json!([]);
+        let empty: Badge = serde_json::from_value(value.clone()).unwrap();
+        assert!(empty.identities.as_ref().unwrap().is_empty());
+        assert_eq!(empty.identities_unavailable, None);
+        assert_eq!(
+            serde_json::to_value(empty).unwrap()["identities"],
+            serde_json::json!([])
+        );
+        value.as_object_mut().unwrap().remove("identities");
+        value["identitiesUnavailable"] = serde_json::json!(true);
+        let unavailable: Badge = serde_json::from_value(value).unwrap();
+        assert!(unavailable.identities.is_none());
+        assert_eq!(unavailable.identities_unavailable, Some(true));
+        let roundtrip = serde_json::to_value(unavailable).unwrap();
+        assert_eq!(roundtrip["identitiesUnavailable"], true);
+        assert!(roundtrip.get("identities").is_none());
     }
 }

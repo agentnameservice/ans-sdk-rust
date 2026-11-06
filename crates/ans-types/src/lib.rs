@@ -28,6 +28,7 @@
 pub mod badge;
 pub mod error;
 pub mod fingerprint;
+pub mod identity;
 pub mod scitt;
 pub mod types;
 
@@ -38,5 +39,6 @@ pub use badge::{
 };
 pub use error::{CryptoError, ParseError};
 pub use fingerprint::CertFingerprint;
+pub use identity::*;
 pub use scitt::{CertEntry, CertType, StatusTokenPayload, VerificationTier};
 pub use types::{AnsName, Fqdn, Version};

@@ -50,8 +50,10 @@ use crate::models::{
     AgentResolutionRequest, AgentResolutionResponse, AgentRevocationRequest,
     AgentRevocationResponse, AgentSearchResponse, AgentStatus, CertificateResponse,
     CsrStatusResponse, CsrSubmissionRequest, CsrSubmissionResponse, EventPageResponse,
-    RegistrationPending, RenewalStatusResponse, RenewalSubmissionResponse,
-    RenewalVerificationResponse, RevocationReason, SearchCriteria, ServerCertificateRenewalRequest,
+    IdentityChallengeResponse, IdentityDetails, IdentityLinkRequest, IdentityLinkResponse,
+    IdentityListResponse, IdentityRegistrationRequest, RegistrationPending, RenewalStatusResponse,
+    RenewalSubmissionResponse, RenewalVerificationResponse, RevocationReason, SearchCriteria,
+    ServerCertificateRenewalRequest, VerifyIdentityControlRequest,
 };
 
 /// Default request timeout.
@@ -595,6 +597,132 @@ impl AnsClient {
                 .query(&query),
         )
         .await
+    }
+
+    /// Start or reissue a V2 identity control challenge. Verified duplicates return 409.
+    #[instrument(skip(self, request))]
+    pub async fn register_identity(
+        &self,
+        request: &IdentityRegistrationRequest,
+    ) -> Result<IdentityChallengeResponse> {
+        self.require_v2("register_identity")?;
+        self.request("POST", "/v2/ans/identities", Some(request))
+            .await
+    }
+
+    /// List the authenticated caller's identities with an opaque cursor.
+    #[instrument(skip(self, cursor))]
+    pub async fn list_identities(
+        &self,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<IdentityListResponse> {
+        self.require_v2("list_identities")?;
+        Self::validate_page_limit(limit)?;
+        let mut query = Vec::new();
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(cursor) = cursor {
+            query.push(("cursor", cursor.to_string()));
+        }
+        self.send(
+            self.build_request("GET", "/v2/ans/identities")?
+                .query(&query),
+        )
+        .await
+    }
+
+    /// Read one owned identity and its live agent links.
+    #[instrument(skip(self))]
+    pub async fn get_identity(&self, identity_id: &str) -> Result<IdentityDetails> {
+        self.require_v2("get_identity")?;
+        self.request("GET", &Self::identity_path(identity_id, ""), None::<&()>)
+            .await
+    }
+
+    /// Stage a replacement identifier and receive its fresh challenge round.
+    #[instrument(skip(self, request))]
+    pub async fn rotate_identity(
+        &self,
+        identity_id: &str,
+        request: &IdentityRegistrationRequest,
+    ) -> Result<IdentityChallengeResponse> {
+        self.require_v2("rotate_identity")?;
+        self.request("PUT", &Self::identity_path(identity_id, ""), Some(request))
+            .await
+    }
+
+    /// Submit one to sixteen distinct compact JWS control proofs atomically.
+    #[instrument(skip(self, request))]
+    pub async fn verify_identity_control(
+        &self,
+        identity_id: &str,
+        request: &VerifyIdentityControlRequest,
+    ) -> Result<IdentityDetails> {
+        self.require_v2("verify_identity_control")?;
+        if !(1..=16).contains(&request.signed_proofs.len()) {
+            return Err(ClientError::Configuration(
+                "signedProofs must contain 1 through 16 proofs".into(),
+            ));
+        }
+        self.request(
+            "POST",
+            &Self::identity_path(identity_id, "verify-control"),
+            Some(request),
+        )
+        .await
+    }
+
+    /// Permanently revoke an owned identity.
+    #[instrument(skip(self))]
+    pub async fn revoke_identity(&self, identity_id: &str) -> Result<IdentityDetails> {
+        self.require_v2("revoke_identity")?;
+        self.request(
+            "POST",
+            &Self::identity_path(identity_id, "revoke"),
+            None::<&()>,
+        )
+        .await
+    }
+
+    /// Link one to 256 owned agents in one atomic batch.
+    #[instrument(skip(self, request))]
+    pub async fn link_identity_agents(
+        &self,
+        identity_id: &str,
+        request: &IdentityLinkRequest,
+    ) -> Result<IdentityLinkResponse> {
+        self.require_v2("link_identity_agents")?;
+        if !(1..=256).contains(&request.agent_ids.len()) {
+            return Err(ClientError::Configuration(
+                "agentIds must contain 1 through 256 identifiers".into(),
+            ));
+        }
+        self.request(
+            "POST",
+            &Self::identity_path(identity_id, "links"),
+            Some(request),
+        )
+        .await
+    }
+
+    /// Remove one identity-to-agent association; accepts an empty 204 response.
+    #[instrument(skip(self))]
+    pub async fn unlink_identity_agent(&self, identity_id: &str, agent_id: &str) -> Result<()> {
+        self.require_v2("unlink_identity_agent")?;
+        let suffix = format!("links/{}", urlencoding::encode(agent_id));
+        self.request_empty("DELETE", &Self::identity_path(identity_id, &suffix))
+            .await
+    }
+
+    fn identity_path(identity_id: &str, suffix: &str) -> String {
+        let id = urlencoding::encode(identity_id);
+        if suffix.is_empty() {
+            format!("/v2/ans/identities/{id}")
+        } else {
+            format!("/v2/ans/identities/{id}/{suffix}")
+        }
     }
 
     fn require_v2(&self, operation: &str) -> Result<()> {
