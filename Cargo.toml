@@ -21,68 +21,68 @@ ans-verify = { path = "crates/ans-verify", version = "0.1.5" }
 ans-client = { path = "crates/ans-client", version = "0.1.5" }
 
 # Async runtime
-tokio = { version = "1.53", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros", "net", "io-util"] }
 
 # TLS
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-rustls = "0.26"
-rustls-pki-types = { version = "1.15", features = ["std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26.6"
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
 
 # HTTP client
-reqwest = { version = "0.13", default-features = false, features = [
+reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "query",
     "rustls",
 ] }
 
 # DNS resolution
-hickory-resolver = { version = "0.26", features = ["tls-ring", "dnssec-ring", "system-config"] }
+hickory-resolver = { version = "0.26.3", features = ["tls-ring", "dnssec-ring", "system-config"] }
 
 # Cryptography
-sha2 = "0.11"
-hex = "0.4"
-subtle = "2.6"
-rcgen = { version = "0.14", features = ["pem"] }
-rsa = { version = "0.9", features = ["pem"] }
-rand = "0.10"
-x509-parser = "0.18"
-pkcs8 = { version = "0.11", features = ["pem"] }
-p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
-ring = "0.17"
-ciborium = "0.2"
-base64 = "0.23"
+sha2 = "0.11.1"
+hex = "0.4.3"
+subtle = "2.6.1"
+rcgen = { version = "0.14.10", features = ["pem"] }
+rsa = { version = "0.9.10", features = ["pem"] }
+rand = "0.10.3"
+x509-parser = "0.18.1"
+pkcs8 = { version = "0.11.0", features = ["pem"] }
+p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
+ring = "0.17.14"
+ciborium = "0.2.2"
+base64 = "0.23.1"
 
 # Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 
 # Error handling
-thiserror = "2.0"
+thiserror = "2.0.21"
 
 # Secret management
-secrecy = { version = "0.10", features = ["serde"] }
+secrecy = { version = "0.10.3", features = ["serde"] }
 
 # Utilities
-chrono = { version = "0.4", default-features = false, features = ["serde", "std", "now"] }
-url = { version = "2.5", features = ["serde"] }
-uuid = { version = "1.24", features = ["serde", "v4"] }
-tracing = "0.1"
-async-trait = "0.1"
-urlencoding = "2.1"
+chrono = { version = "0.4.45", default-features = false, features = ["serde", "std", "now"] }
+url = { version = "2.5.8", features = ["serde"] }
+uuid = { version = "1.26.1", features = ["serde", "v4"] }
+tracing = "0.1.44"
+async-trait = "0.1.92"
+urlencoding = "2.1.3"
 
 # Async utilities
-tokio-util = "0.7"
-futures-util = "0.3"
+tokio-util = "0.7.20"
+futures-util = "0.3.34"
 
 # Caching
-moka = { version = "0.12", features = ["future", "sync"] }
+moka = { version = "0.12.16", features = ["future", "sync"] }
 
 # Testing
-tokio-test = "0.4"
-wiremock = "0.6"
-rstest = "0.27"
-test-log = { version = "0.2", features = ["trace"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-test = "0.4.6"
+wiremock = "0.6.5"
+rstest = "0.28.0"
+test-log = { version = "0.2.21", features = ["trace"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # Benchmarks measure pure-Rust field arithmetic, which benefits from LTO and
 # a single codegen unit. Profiles only apply to builds in this workspace —
