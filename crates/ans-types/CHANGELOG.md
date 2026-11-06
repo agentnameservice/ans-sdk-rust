@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-types-v0.2.0...ans-types-v0.3.0) (2026-11-06)
+
+
+### Miscellaneous
+
+* **ans-types:** Synchronize ans-sdk versions
+
 ## [0.2.0](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-types-v0.1.5...ans-types-v0.2.0) (2026-11-06)
 
 
