@@ -15,7 +15,7 @@ unmaintained = "workspace"
 ignore = []
 
 # ── Licenses ───────────────────────────────────────────────────────────
-# Ensures all dependency licenses are acceptable for an MIT-licensed SDK.
+# Ensures dependency licenses satisfy the project licensing policy.
 [licenses]
 confidence-threshold = 0.8
 
