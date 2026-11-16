@@ -228,8 +228,8 @@ transition union, so in that case first-found-wins returns the rows with the
 weaker required flag. Don't "fix" the order by citing §3.1.
 
 **`ANS_DNSAID` is the default profile and `ANS_TXT` is opt-in** (ANS-3 §6.1).
-This flipped in ans-registry#42, merged 2026-07-23 — before that `ANS_TXT` was
-the default. A local `ans-registry` checkout older than that date shows the old
+This flipped in ans-spec#42, merged 2026-07-23 — before that `ANS_TXT` was
+the default. A local `ans-spec` checkout older than that date shows the old
 direction, so check the table on `main` before "correcting" these docs.
 
 An SVCB RRset containing an AliasMode record yields no discovery records
