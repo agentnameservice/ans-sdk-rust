@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-types-v0.2.0...ans-types-v0.3.0) (2026-11-16)
+
+
+### Miscellaneous
+
+* adopt ANS governance and contribution licensing ([#129](https://github.com/agentnameservice/ans-sdk-rust/issues/129)) ([f6c437a](https://github.com/agentnameservice/ans-sdk-rust/commit/f6c437a45736368f45127d47cdd33eca2e661002))
+
 ## [0.2.0](https://github.com/agentnameservice/ans-sdk-rust/compare/ans-types-v0.1.5...ans-types-v0.2.0) (2026-11-06)
 
 
