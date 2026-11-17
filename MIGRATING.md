@@ -99,3 +99,15 @@ enable stale-cache fallback.
 
 Caller badge lookup prefers an exact version, then a legacy versionless record.
 A different numbered version is never substituted.
+
+## ANS names and CSR validation
+
+`Fqdn::new` and deserialization reject IP literals, single-label hosts, multiple
+trailing dots, and names longer than 253 bytes. One trailing root dot is
+normalized. `Version::parse` rejects signed and leading-zero components.
+Previously accepted invalid values must be corrected at their source.
+
+CSR host errors arise at this shared boundary. The obsolete
+`CsrError::HostTooLong`, `HostIsIpLiteral`, `HostNotFullyQualified`, and
+`InvalidName` variants are removed. CSR SANs are constructed directly from the
+validated host and version.
