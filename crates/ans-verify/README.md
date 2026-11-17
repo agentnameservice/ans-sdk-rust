@@ -370,4 +370,6 @@ let verifier = ServerVerifier::builder()
 
 ## License
 
-MIT
+New original contributions use [Apache-2.0](LICENSE). Legacy MIT-licensed
+material retains its [MIT terms](LICENSES/MIT.txt); see [NOTICE](NOTICE).
+The package license expression is `Apache-2.0 AND MIT`.
