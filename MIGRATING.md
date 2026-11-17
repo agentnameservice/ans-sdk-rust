@@ -111,3 +111,18 @@ CSR host errors arise at this shared boundary. The obsolete
 `CsrError::HostTooLong`, `HostIsIpLiteral`, `HostNotFullyQualified`, and
 `InvalidName` variants are removed. CSR SANs are constructed directly from the
 validated host and version.
+
+## V2 management
+
+`AgentRegistrationRequest.identity_csr_pem` is `Option<String>` so a V2
+server-only registration omits `identityCsrPEM`. Existing `new(...)` calls retain
+an explicitly supplied CSR as `Some`, including an empty string. Use
+`without_identity(...)` for intentional omission; direct field assignments must
+wrap their value in `Some`. Servers decide which registration modes they support.
+V1 request routing and existing CSR APIs are unchanged.
+
+Response models preserve endpoint `metaDataHash`, badge `metadataHashes`, and
+`DEPRECATED` lifecycle status. Use `ApiVersion::V2` for `list_agents` and all four
+server-renewal methods. Listing limits are 1–100; status filters are repeated
+query parameters and cursors are opaque. Renewal constructors select exactly
+one CSR or BYOC certificate source. Cancellation accepts empty 204 responses.

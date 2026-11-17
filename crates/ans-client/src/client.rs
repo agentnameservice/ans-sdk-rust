@@ -46,10 +46,12 @@ use url::Url;
 
 use crate::error::{ClientError, HttpError, Result};
 use crate::models::{
-    AgentDetails, AgentRegistrationRequest, AgentResolutionRequest, AgentResolutionResponse,
-    AgentRevocationRequest, AgentRevocationResponse, AgentSearchResponse, AgentStatus,
-    CertificateResponse, CsrStatusResponse, CsrSubmissionRequest, CsrSubmissionResponse,
-    EventPageResponse, RegistrationPending, RevocationReason, SearchCriteria,
+    AgentDetails, AgentListOptions, AgentListResponse, AgentRegistrationRequest,
+    AgentResolutionRequest, AgentResolutionResponse, AgentRevocationRequest,
+    AgentRevocationResponse, AgentSearchResponse, AgentStatus, CertificateResponse,
+    CsrStatusResponse, CsrSubmissionRequest, CsrSubmissionResponse, EventPageResponse,
+    RegistrationPending, RenewalStatusResponse, RenewalSubmissionResponse,
+    RenewalVerificationResponse, RevocationReason, SearchCriteria, ServerCertificateRenewalRequest,
 };
 
 /// Default request timeout.
@@ -569,6 +571,118 @@ impl AnsClient {
             .await
     }
 
+    /// List the authenticated caller's agents using the V2 cursor API.
+    /// This is distinct from the legacy public discovery/search endpoint.
+    #[instrument(skip(self, options))]
+    pub async fn list_agents(&self, options: &AgentListOptions) -> Result<AgentListResponse> {
+        self.require_v2("list_agents")?;
+        Self::validate_page_limit(options.limit)?;
+        let mut query = Vec::new();
+        for status in &options.statuses {
+            query.push(("status", status.as_str().to_string()));
+        }
+        if let Some(host) = &options.agent_host {
+            query.push(("agentHost", host.clone()));
+        }
+        if let Some(limit) = options.limit {
+            query.push(("limit", limit.to_string()));
+        }
+        if let Some(cursor) = &options.cursor {
+            query.push(("cursor", cursor.clone()));
+        }
+        self.send(
+            self.build_request("GET", self.agents_collection_path())?
+                .query(&query),
+        )
+        .await
+    }
+
+    fn require_v2(&self, operation: &str) -> Result<()> {
+        if self.api_version != ApiVersion::V2 {
+            return Err(ClientError::Configuration(format!(
+                "{operation} requires ApiVersion::V2"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_page_limit(limit: Option<u32>) -> Result<()> {
+        if limit.is_some_and(|limit| !(1..=100).contains(&limit)) {
+            return Err(ClientError::Configuration(
+                "page limit must be between 1 and 100".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn request_empty(&self, method: &str, path: &str) -> Result<()> {
+        let response = self
+            .build_request(method, path)?
+            .send()
+            .await
+            .map_err(HttpError::from)?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = response.text().await.map_err(HttpError::from)?;
+        Err(ClientError::from_response(status.as_u16(), &body))
+    }
+
+    /// Submit a CSR or BYOC server-certificate renewal on the V2 API.
+    #[instrument(skip(self, request))]
+    pub async fn submit_server_cert_renewal(
+        &self,
+        agent_id: &str,
+        request: &ServerCertificateRenewalRequest,
+    ) -> Result<RenewalSubmissionResponse> {
+        self.require_v2("submit_server_cert_renewal")?;
+        self.request(
+            "POST",
+            &self.agent_path(agent_id, "certificates/server/renewal"),
+            Some(request),
+        )
+        .await
+    }
+
+    /// Poll a V2 server-certificate renewal order.
+    #[instrument(skip(self))]
+    pub async fn get_server_cert_renewal_status(
+        &self,
+        agent_id: &str,
+    ) -> Result<RenewalStatusResponse> {
+        self.require_v2("get_server_cert_renewal_status")?;
+        self.request(
+            "GET",
+            &self.agent_path(agent_id, "certificates/server/renewal"),
+            None::<&()>,
+        )
+        .await
+    }
+
+    /// Cancel a V2 renewal order; a successful empty response is accepted.
+    #[instrument(skip(self))]
+    pub async fn cancel_server_cert_renewal(&self, agent_id: &str) -> Result<()> {
+        self.require_v2("cancel_server_cert_renewal")?;
+        self.request_empty(
+            "DELETE",
+            &self.agent_path(agent_id, "certificates/server/renewal"),
+        )
+        .await
+    }
+
+    /// Validate renewal ACME challenges and continue CSR/BYOC issuance.
+    #[instrument(skip(self))]
+    pub async fn verify_renewal_acme(&self, agent_id: &str) -> Result<RenewalVerificationResponse> {
+        self.require_v2("verify_renewal_acme")?;
+        self.request(
+            "POST",
+            &self.agent_path(agent_id, "certificates/server/renewal/verify-acme"),
+            None::<&()>,
+        )
+        .await
+    }
+
     // =========================================================================
     // Validation Operations
     // =========================================================================
@@ -778,7 +892,7 @@ mod tests {
     #[test]
     fn test_auth_debug_redacts_secrets() {
         let jwt = Auth::Jwt(SecretString::from("super-secret-token"));
-        let debug_output = format!("{:?}", jwt);
+        let debug_output = format!("{jwt:?}");
         assert!(
             !debug_output.contains("super-secret-token"),
             "JWT token must not appear in Debug output"
@@ -789,7 +903,7 @@ mod tests {
             key: "mykey".into(),
             secret: SecretString::from("top-secret"),
         };
-        let debug_output = format!("{:?}", api_key);
+        let debug_output = format!("{api_key:?}");
         assert!(
             !debug_output.contains("top-secret"),
             "API secret must not appear in Debug output"
