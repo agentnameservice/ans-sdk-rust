@@ -1546,29 +1546,9 @@ impl ClientVerifier {
                         .invalidate(&CacheKey::fqdn_version(&fqdn, &version))
                         .await;
                 }
-                tracing::debug!("No badge for specific version, trying preferred badge");
-                // Try to find any badge
-                match self.dns_resolver.find_preferred_badge(&fqdn).await {
-                    Ok(Some(record)) => {
-                        tracing::debug!(url = %record.url, version = ?record.version, "Using preferred badge");
-                        record
-                    }
-                    Ok(None) => {
-                        if let Some(cache) = &self.cache {
-                            cache.invalidate_fqdn(&fqdn).await;
-                        }
-                        tracing::warn!(fqdn = %fqdn, "No badge record found - not an ANS agent");
-                        return VerificationOutcome::NotAnsAgent {
-                            fqdn: fqdn.to_string(),
-                        };
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "DNS lookup failed");
-                        return self
-                            .handle_dns_error(e, &fqdn, &version, client_cert, &ans_name)
-                            .await;
-                    }
-                }
+                return VerificationOutcome::NotAnsAgent {
+                    fqdn: fqdn.to_string(),
+                };
             }
             Err(e) => {
                 tracing::error!(error = %e, "DNS lookup failed");
@@ -1754,15 +1734,11 @@ impl ClientVerifier {
             .await
         {
             Ok(Some(record)) => record,
-            Ok(None) => match self.dns_resolver.find_preferred_badge(fqdn).await {
-                Ok(Some(record)) => record,
-                Ok(None) => {
-                    return VerificationOutcome::NotAnsAgent {
-                        fqdn: fqdn.to_string(),
-                    };
-                }
-                Err(e) => return VerificationOutcome::DnsError(e),
-            },
+            Ok(None) => {
+                return VerificationOutcome::NotAnsAgent {
+                    fqdn: fqdn.to_string(),
+                };
+            }
             Err(e) => return VerificationOutcome::DnsError(e),
         };
 

@@ -1871,9 +1871,9 @@ async fn test_6_3_no_matching_version() {
         .verify(&mtls_cert(host, "v1.0.0", IDENTITY_FP))
         .await;
 
-    // Badge's ans_name (v1.0.1) won't match cert's ans_name (v1.0.0)
+    // Missing caller-version evidence stops before fetching another version.
     assert!(
-        matches!(outcome, VerificationOutcome::AnsNameMismatch { .. }),
+        matches!(outcome, VerificationOutcome::NotAnsAgent { .. }),
         "No matching version should reject, got: {:?}",
         outcome
     );
@@ -2693,4 +2693,36 @@ async fn test_11_3_versionless_record_caches_correctly() {
         "Second verify should use cached badge, got: {:?}",
         outcome2
     );
+}
+
+#[tokio::test]
+async fn missing_version_during_refresh_invalidates_the_old_badge() {
+    let host = "agent.example.com";
+    let fqdn = Fqdn::new(host).unwrap();
+    let version = Version::new(1, 0, 0);
+    let cache = Arc::new(BadgeCache::new(CacheConfig::default()));
+    cache
+        .insert_for_fqdn_version(&fqdn, &version, badge(host, "v1.0.0", SERVER_FP, WRONG_FP))
+        .await;
+    let dns = Arc::new(MockDnsResolver::new().with_records(
+        host,
+        vec![dns_record(Some(Version::new(1, 0, 1)), BADGE_URL_V2)],
+    ));
+    let tlog = Arc::new(
+        MockTransparencyLogClient::new()
+            .with_badge(BADGE_URL_V2, badge(host, "v1.0.1", SERVER_FP, IDENTITY_FP)),
+    );
+    let verifier = ClientVerifier::builder()
+        .trusted_ra_domains(["tlog.example.com"])
+        .dns_resolver(dns)
+        .tlog_client(tlog)
+        .cache(cache.clone())
+        .build()
+        .await
+        .unwrap();
+    let outcome = verifier
+        .verify(&mtls_cert(host, "v1.0.0", IDENTITY_FP))
+        .await;
+    assert!(matches!(outcome, VerificationOutcome::NotAnsAgent { .. }));
+    assert!(cache.get_by_fqdn_version(&fqdn, &version).await.is_none());
 }
