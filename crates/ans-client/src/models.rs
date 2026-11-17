@@ -5,7 +5,10 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+mod identities;
 mod lifecycle;
+pub use ans_types::{IdentityKind, IdentityStatus, LinkedIdentity};
+pub use identities::*;
 pub use lifecycle::*;
 use std::fmt;
 use uuid::Uuid;
@@ -591,6 +594,9 @@ pub struct AgentDetails {
     /// Pending registration details.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registration_pending: Option<RegistrationPending>,
+    /// Computed current identity associations.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub identities: Vec<LinkedIdentity>,
     /// HATEOAS links.
     #[serde(default, deserialize_with = "null_as_default")]
     pub links: Vec<Link>,

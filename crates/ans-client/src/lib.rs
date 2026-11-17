@@ -116,7 +116,9 @@
 pub mod client;
 pub mod csr;
 pub mod error;
+pub mod identity_proof;
 pub mod models;
+pub use identity_proof::{IdentityProofAlgorithm, PreparedIdentityProof};
 
 pub use client::{AnsClient, AnsClientBuilder, ApiVersion, Auth};
 pub use csr::{AnsCsrBuilder, CsrError, CsrOutput};
