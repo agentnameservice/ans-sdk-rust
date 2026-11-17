@@ -148,3 +148,35 @@ Call `prepare_proof` with your trusted RA identifier and the chosen method's
 with the raw JOSE signature. ES256 uses P1363, not DER. The RA's served payload
 is preserved verbatim. Submit each distinct key's proof in one
 `VerifyIdentityControlRequest`; private keys remain with the signer.
+
+## DNSSEC-authenticated DANE
+
+DANE binds TLSA records to the queried service name and requires every CNAME hop
+and the terminal TLSA record set to be DNSSEC-secure. Unrelated signed answers,
+unsigned records, and unproven aliases are ignored with `ValidateIfPresent`
+and cannot satisfy `Required`.
+
+## SCITT transport
+
+SCITT HTTP clients require HTTPS and reject redirects, including root-key
+fetches. Configure the final trusted TL URL.
+
+## Canonical SCITT receipts
+
+Receipt payloads must already be RFC 8785 canonical JSON. Verification checks
+the original COSE signature before issuer and canonical-form checks. Producers
+must canonicalize before signing.
+
+## Regular SCITT artifact policy
+
+Regular SCITT verification requires both artifacts. `RequireScitt` rejects an
+incomplete pair. Fallback policies verify any supplied evidence before
+consulting the badge and bind it to the same registration. Invalid evidence
+always rejects. Method B's explicit receipt waiver is unchanged.
+
+## Outgoing SCITT headers
+
+`ScittHeaderSupplier::current_headers()` is cache-only. Call
+`initialize().await?` during startup, then retain `start_auto_refresh()`'s handle.
+`with_init_timeout()` bounds explicit startup initialization. Until acquisition
+succeeds, cached fields remain absent.

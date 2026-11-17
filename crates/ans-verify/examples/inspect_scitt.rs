@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let root_keys = if cli_keys.is_empty() {
         step(1, "Fetching root keys from /root-keys ...");
-        fetch_root_keys_text(&tlog_url).await.unwrap_or_else(|e| {
+        client.fetch_root_keys().await.unwrap_or_else(|e| {
             fail(&format!("Failed to fetch root keys: {e}"));
             eprintln!("\n  Hint: pass --key <C2SP_KEY> to provide root keys explicitly.");
             std::process::exit(1);
@@ -440,19 +440,4 @@ fn parse_args(args: &[String]) -> Option<ParsedArgs> {
         agent_id: agent_id?,
         keys,
     })
-}
-
-/// Fetch root keys from `{base_url}/root-keys` (newline-separated C2SP text format).
-async fn fetch_root_keys_text(base_url: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let url = format!("{}/root-keys", base_url.trim_end_matches('/'));
-    let body = reqwest::get(&url).await?.error_for_status()?.text().await?;
-    let keys: Vec<String> = body
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    if keys.is_empty() {
-        return Err(format!("No keys returned from {url}").into());
-    }
-    Ok(keys)
 }

@@ -429,11 +429,10 @@ impl VerificationOutcome {
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub enum ScittTierPolicy {
-    /// Try SCITT first, fall back to badge if headers absent (recommended).
+    /// Try SCITT first; use the badge tier when either artifact is absent.
     ///
-    /// Present headers are final: any SCITT failure (including `TokenExpired`)
-    /// is a hard reject with no badge fallback. Badge fallback only occurs
-    /// when SCITT headers are completely absent.
+    /// Any supplied artifact must first verify and agree with the badge.
+    /// Invalid or expired evidence rejects instead of causing a downgrade.
     #[default]
     ScittWithBadgeFallback,
 
@@ -441,9 +440,8 @@ pub enum ScittTierPolicy {
     ///
     /// Only safe when 100% of peers support SCITT. `TokenExpired` is a
     /// hard failure under this policy (no badge fallback available).
-    /// A valid status token without a receipt still succeeds at
-    /// [`ans_types::VerificationTier::StatusTokenVerified`]. Applications
-    /// requiring an inclusion receipt must require the `FullScitt` tier.
+    /// Both the status token and receipt are required. Incomplete artifact
+    /// pairs reject instead of succeeding at a weaker verification tier.
     RequireScitt,
 
     /// Badge first, enhance with SCITT if headers present.
@@ -451,6 +449,40 @@ pub enum ScittTierPolicy {
     /// For gradual migration: existing badge verification runs first,
     /// SCITT supplements the result if headers are available.
     BadgeWithScittEnhancement,
+}
+
+#[cfg(feature = "scitt")]
+impl ScittTierPolicy {
+    fn allows_badge_fallback(self) -> bool {
+        match self {
+            Self::ScittWithBadgeFallback | Self::BadgeWithScittEnhancement => true,
+            Self::RequireScitt => false,
+        }
+    }
+
+    fn badge_first(self) -> bool {
+        match self {
+            Self::BadgeWithScittEnhancement => true,
+            Self::ScittWithBadgeFallback | Self::RequireScitt => false,
+        }
+    }
+}
+
+#[cfg(feature = "scitt")]
+#[derive(Clone, Copy)]
+enum ScittPeer<'a> {
+    Server(&'a Fqdn),
+    Client,
+}
+
+#[cfg(feature = "scitt")]
+impl<'a> ScittPeer<'a> {
+    fn dialed_host(self) -> Option<&'a str> {
+        match self {
+            Self::Server(host) => Some(host.as_str()),
+            Self::Client => None,
+        }
+    }
 }
 
 /// Configuration for SCITT verification.
@@ -2085,254 +2117,211 @@ impl AnsVerifier {
         server_cert: &CertIdentity,
         headers: &crate::scitt::ScittHeaders,
     ) -> VerificationOutcome {
-        let fqdn_str = fqdn.as_ref();
-        let parsed_fqdn = match Fqdn::new(fqdn_str) {
-            Ok(f) => f,
-            Err(e) => return VerificationOutcome::ParseError(e),
+        let fqdn = match Fqdn::new(fqdn.as_ref()) {
+            Ok(fqdn) => fqdn,
+            Err(error) => return VerificationOutcome::ParseError(error),
         };
-
-        let Some(config) = &self.scitt_config else {
-            // SCITT not configured — fall through to badge
-            return self.server_verifier.verify(&parsed_fqdn, server_cert).await;
-        };
-
-        let Some(key_store) = &self.scitt_key_store else {
-            // Defensive: builder.build() rejects this combination, but guard
-            // against direct struct construction in tests.
-            tracing::error!("BUG: scitt_config present but no key store — falling back to badge");
-            return self.server_verifier.verify(&parsed_fqdn, server_cert).await;
-        };
-
-        match config.tier_policy {
-            ScittTierPolicy::ScittWithBadgeFallback => {
-                self.verify_scitt_first(&parsed_fqdn, server_cert, headers, key_store, config, true)
-                    .await
-            }
-            ScittTierPolicy::RequireScitt => {
-                self.verify_scitt_first(
-                    &parsed_fqdn,
-                    server_cert,
-                    headers,
-                    key_store,
-                    config,
-                    false,
-                )
-                .await
-            }
-            ScittTierPolicy::BadgeWithScittEnhancement => {
-                // Badge first, then optionally enhance with SCITT
-                let badge_outcome = self.server_verifier.verify(&parsed_fqdn, server_cert).await;
-                if !badge_outcome.is_success() || headers.is_empty() {
-                    return badge_outcome;
-                }
-                // Badge succeeded and SCITT headers present — try to upgrade.
-                // If SCITT headers are present but corrupt, REJECT (no fallback
-                // to badge) — prevents MITM downgrade via header injection.
-                let scitt_cache = self.scitt_verification_cache.as_deref();
-                let scitt_outcome = Self::try_scitt_verification(
-                    server_cert,
-                    headers,
-                    key_store,
-                    config,
-                    true,
-                    Some(parsed_fqdn.as_str()),
-                    scitt_cache,
-                )
-                .await;
-                match scitt_outcome {
-                    Some(VerificationOutcome::ScittVerified {
-                        status_token,
-                        tier,
-                        matched_fingerprint,
-                        badge: _,
-                    }) => {
-                        // Carry the badge from badge_outcome into ScittVerified
-                        let badge = badge_outcome.badge().cloned();
-                        VerificationOutcome::ScittVerified {
-                            status_token,
-                            tier,
-                            matched_fingerprint,
-                            badge,
-                        }
-                    }
-                    // Any SCITT failure when headers are present = hard reject.
-                    // Present-but-corrupt headers must never fall back to badge.
-                    Some(outcome) => outcome,
-                    None => VerificationOutcome::ScittError(
-                        crate::scitt::ScittError::MissingTokenField(
-                            "SCITT headers present without a status token".into(),
-                        ),
-                    ),
-                }
-            }
-        }
+        self.verify_with_scitt(ScittPeer::Server(&fqdn), server_cert, headers)
+            .await
     }
 
-    /// Verify an mTLS client with SCITT artifacts from HTTP headers.
-    ///
-    /// Same SCITT-first flow as server verification, but matches against
-    /// identity certificate fingerprints instead of server certificates.
+    /// Verify an mTLS client using identity certificate fingerprints and SCITT evidence.
     #[cfg(feature = "scitt")]
     pub async fn verify_client_with_scitt(
         &self,
         client_cert: &CertIdentity,
         headers: &crate::scitt::ScittHeaders,
     ) -> VerificationOutcome {
-        let Some(config) = &self.scitt_config else {
-            return self.client_verifier.verify(client_cert).await;
-        };
-
-        let Some(key_store) = &self.scitt_key_store else {
-            // Defensive: builder.build() rejects this combination, but guard
-            // against direct struct construction in tests.
-            tracing::error!("BUG: scitt_config present but no key store — falling back to badge");
-            return self.client_verifier.verify(client_cert).await;
-        };
-
-        match config.tier_policy {
-            ScittTierPolicy::ScittWithBadgeFallback => {
-                self.verify_client_scitt_first(client_cert, headers, key_store, config, true)
-                    .await
-            }
-            ScittTierPolicy::RequireScitt => {
-                self.verify_client_scitt_first(client_cert, headers, key_store, config, false)
-                    .await
-            }
-            ScittTierPolicy::BadgeWithScittEnhancement => {
-                let badge_outcome = self.client_verifier.verify(client_cert).await;
-                if !badge_outcome.is_success() || headers.is_empty() {
-                    return badge_outcome;
-                }
-                // Headers present — try SCITT upgrade. Corrupt headers = reject.
-                let scitt_cache = self.scitt_verification_cache.as_deref();
-                let scitt_outcome = Self::try_scitt_verification(
-                    client_cert,
-                    headers,
-                    key_store,
-                    config,
-                    false,
-                    None,
-                    scitt_cache,
-                )
-                .await;
-                match scitt_outcome {
-                    Some(VerificationOutcome::ScittVerified {
-                        status_token,
-                        tier,
-                        matched_fingerprint,
-                        badge: _,
-                    }) => {
-                        let badge = badge_outcome.badge().cloned();
-                        VerificationOutcome::ScittVerified {
-                            status_token,
-                            tier,
-                            matched_fingerprint,
-                            badge,
-                        }
-                    }
-                    Some(outcome) => outcome, // present-but-corrupt = reject
-                    None => VerificationOutcome::ScittError(
-                        crate::scitt::ScittError::MissingTokenField(
-                            "SCITT headers present without a status token".into(),
-                        ),
-                    ),
-                }
-            }
-        }
-    }
-
-    /// SCITT-first verification: try SCITT, optionally fall back to badge
-    /// **only when headers are completely absent**.
-    ///
-    /// When headers are present, the SCITT result is final — no badge
-    /// fallback for any error, including `TokenExpired`. This prevents
-    /// MITM downgrade via header injection/corruption.
-    #[cfg(feature = "scitt")]
-    async fn verify_scitt_first(
-        &self,
-        fqdn: &Fqdn,
-        server_cert: &CertIdentity,
-        headers: &crate::scitt::ScittHeaders,
-        key_store: &Arc<crate::scitt::RefreshableKeyStore>,
-        config: &ScittConfig,
-        allow_badge_fallback: bool,
-    ) -> VerificationOutcome {
-        // If no SCITT headers at all, the peer doesn't support SCITT
-        if headers.is_empty() {
-            if allow_badge_fallback {
-                tracing::debug!(fqdn = %fqdn, "No SCITT headers — falling back to badge");
-                return self.server_verifier.verify(fqdn, server_cert).await;
-            }
-            return VerificationOutcome::ScittError(crate::scitt::ScittError::MissingTokenField(
-                "No SCITT headers present and RequireScitt policy is active".to_string(),
-            ));
-        }
-
-        // Headers are present — SCITT result is final, no badge fallback.
-        let scitt_cache = self.scitt_verification_cache.as_deref();
-        let outcome = match Self::try_scitt_verification(
-            server_cert,
-            headers,
-            key_store,
-            config,
-            true,
-            Some(fqdn.as_str()),
-            scitt_cache,
-        )
-        .await
-        {
-            Some(outcome) => outcome,
-            None => {
-                // Headers present but no status token decoded — hard reject.
-                VerificationOutcome::ScittError(crate::scitt::ScittError::MissingTokenField(
-                    "SCITT headers present but no valid status token found".to_string(),
-                ))
-            }
-        };
-        self.server_verifier
-            .enforce_dane(fqdn, server_cert, outcome)
+        self.verify_with_scitt(ScittPeer::Client, client_cert, headers)
             .await
     }
 
-    /// SCITT-first client verification with optional badge fallback
-    /// **only when headers are completely absent**.
     #[cfg(feature = "scitt")]
-    async fn verify_client_scitt_first(
+    async fn verify_badge(&self, peer: ScittPeer<'_>, cert: &CertIdentity) -> VerificationOutcome {
+        match peer {
+            ScittPeer::Server(host) => self.server_verifier.verify(host, cert).await,
+            ScittPeer::Client => self.client_verifier.verify(cert).await,
+        }
+    }
+
+    #[cfg(feature = "scitt")]
+    async fn verify_with_scitt(
         &self,
-        client_cert: &CertIdentity,
+        peer: ScittPeer<'_>,
+        cert: &CertIdentity,
         headers: &crate::scitt::ScittHeaders,
-        key_store: &Arc<crate::scitt::RefreshableKeyStore>,
-        config: &ScittConfig,
-        allow_badge_fallback: bool,
     ) -> VerificationOutcome {
-        if headers.is_empty() {
-            if allow_badge_fallback {
-                tracing::debug!("No SCITT headers on client — falling back to badge");
-                return self.client_verifier.verify(client_cert).await;
+        let (Some(config), Some(key_store)) = (&self.scitt_config, &self.scitt_key_store) else {
+            return self.verify_badge(peer, cert).await;
+        };
+        match (&headers.receipt, &headers.status_token) {
+            (None, None) => {
+                return if config.tier_policy.allows_badge_fallback() {
+                    self.verify_badge(peer, cert).await
+                } else {
+                    VerificationOutcome::ScittError(crate::scitt::ScittError::MissingTokenField(
+                        "No SCITT headers present and RequireScitt policy is active".into(),
+                    ))
+                };
             }
-            return VerificationOutcome::ScittError(crate::scitt::ScittError::MissingTokenField(
-                "No SCITT headers present and RequireScitt policy is active".to_string(),
-            ));
+            (Some(_), None) | (None, Some(_)) => {
+                return self
+                    .verify_partial_scitt(cert, headers, key_store, config, peer)
+                    .await;
+            }
+            (Some(_), Some(_)) => {}
         }
 
-        // Headers are present — SCITT result is final, no badge fallback.
-        let scitt_cache = self.scitt_verification_cache.as_deref();
-        match Self::try_scitt_verification(
-            client_cert,
+        let badge = if config.tier_policy.badge_first() {
+            let outcome = self.verify_badge(peer, cert).await;
+            if !outcome.is_success() {
+                return outcome;
+            }
+            outcome.badge().cloned()
+        } else {
+            None
+        };
+        let mut outcome = Self::try_scitt_verification(
+            cert,
             headers,
             key_store,
             config,
-            false,
-            None,
-            scitt_cache,
+            peer,
+            self.scitt_verification_cache.as_deref(),
         )
         .await
+        .unwrap_or_else(|| {
+            VerificationOutcome::ScittError(crate::scitt::ScittError::MissingTokenField(
+                "SCITT headers present without a status token".into(),
+            ))
+        });
+        if let VerificationOutcome::ScittVerified {
+            badge: verified_badge,
+            ..
+        } = &mut outcome
         {
-            Some(outcome) => outcome,
-            None => VerificationOutcome::ScittError(crate::scitt::ScittError::MissingTokenField(
-                "SCITT headers present but no valid status token found".to_string(),
-            )),
+            *verified_badge = badge;
         }
+        // Badge verification already enforces DANE; a SCITT-only result still needs it.
+        match peer {
+            ScittPeer::Server(host) if !config.tier_policy.badge_first() => {
+                self.server_verifier.enforce_dane(host, cert, outcome).await
+            }
+            ScittPeer::Server(_) | ScittPeer::Client => outcome,
+        }
+    }
+
+    /// Missing evidence may use the badge tier, but present evidence must
+    /// still verify and agree with the live registration (ANS-6 §9.7).
+    #[cfg(feature = "scitt")]
+    async fn verify_partial_scitt(
+        &self,
+        cert: &CertIdentity,
+        headers: &crate::scitt::ScittHeaders,
+        key_store: &Arc<crate::scitt::RefreshableKeyStore>,
+        config: &ScittConfig,
+        peer: ScittPeer<'_>,
+    ) -> VerificationOutcome {
+        let token = if headers.status_token.is_some() {
+            match Self::try_scitt_verification(
+                cert,
+                headers,
+                key_store,
+                config,
+                peer,
+                self.scitt_verification_cache.as_deref(),
+            )
+            .await
+            {
+                Some(VerificationOutcome::ScittVerified { status_token, .. }) => Some(status_token),
+                Some(outcome) => return outcome,
+                None => {
+                    return VerificationOutcome::ScittError(
+                        crate::scitt::ScittError::MissingArtifact("X-ANS-Status-Token"),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+
+        let receipt = if let Some(bytes) = headers.receipt.as_ref() {
+            match Self::verify_receipt_with_refresh(
+                bytes,
+                key_store,
+                self.scitt_verification_cache.as_deref(),
+            )
+            .await
+            {
+                Ok((receipt, _)) => Some(receipt),
+                Err(error) => return VerificationOutcome::ScittError(error),
+            }
+        } else {
+            None
+        };
+
+        if !config.tier_policy.allows_badge_fallback() {
+            return VerificationOutcome::ScittError(crate::scitt::ScittError::MissingArtifact(
+                if headers.status_token.is_none() {
+                    "X-ANS-Status-Token"
+                } else {
+                    "X-SCITT-Receipt"
+                },
+            ));
+        }
+
+        let outcome = self.verify_badge(peer, cert).await;
+        if !outcome.is_success() {
+            return outcome;
+        }
+        let Some(badge) = outcome.badge() else {
+            return outcome;
+        };
+        if let Some(token) = token
+            && let Err(error) = crate::scitt::bind_status_to_badge(&token.payload, badge)
+        {
+            return VerificationOutcome::ScittError(error);
+        }
+        if let Some(receipt) = receipt {
+            let expected_host = peer.dialed_host().or_else(|| cert.fqdn());
+            if let Err(error) = crate::scitt::bind_receipt_to_badge(&receipt, badge, expected_host)
+            {
+                return VerificationOutcome::ScittError(error);
+            }
+        }
+        outcome
+    }
+
+    #[cfg(feature = "scitt")]
+    async fn verify_receipt_with_refresh(
+        bytes: &[u8],
+        key_store: &crate::scitt::RefreshableKeyStore,
+        cache: Option<&crate::scitt::ScittVerificationCache>,
+    ) -> Result<(Arc<crate::scitt::VerifiedReceipt>, [u8; 32]), crate::scitt::ScittError> {
+        let mut snapshot = key_store.current_snapshot().await;
+        let mut hash = snapshot.artifact_cache_key(bytes);
+        if let Some(cache) = cache
+            && let Some(receipt) = cache.get_verified_receipt(&hash).await
+        {
+            return Ok((receipt, hash));
+        }
+        let mut result = crate::scitt::verify_receipt(bytes, &snapshot);
+        if matches!(result, Err(crate::scitt::ScittError::UnknownKeyId(_))) {
+            match key_store.refresh_if_cooldown_elapsed().await {
+                Ok(true) => {
+                    snapshot = key_store.current_snapshot().await;
+                    hash = snapshot.artifact_cache_key(bytes);
+                    result = crate::scitt::verify_receipt(bytes, &snapshot);
+                }
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%error, "Receipt key refresh failed"),
+            }
+        }
+        let receipt = Arc::new(result?);
+        if let Some(cache) = cache {
+            cache.insert_verified_receipt(hash, receipt.clone()).await;
+        }
+        Ok((receipt, hash))
     }
 
     /// Attempt SCITT verification from headers. Returns `None` if no status token.
@@ -2350,15 +2339,8 @@ impl AnsVerifier {
     ///
     /// Only successful verifications are cached. Errors are never stored.
     ///
-    /// The `is_server` flag controls which cert array to match:
-    /// - `true`: matches against `valid_server_certs`
-    /// - `false`: matches against `valid_identity_certs`
-    ///
-    /// `dialed_host` anchors server verification to the host the caller
-    /// dialed (ANS-6 §5.2): the status token's `ansName` host must equal it.
-    /// Client verification passes `None` — there the certificate's own CN is
-    /// the anchor. The check runs on cache hits too, since the outcome cache
-    /// is keyed by artifact bytes, not by the dialed host.
+    /// The peer selects the certificate role and anchors server verification
+    /// to the dialed host. These bindings are checked on cache hits too.
     #[cfg(feature = "scitt")]
     #[allow(clippy::too_many_lines)] // verification + caching flow reads best as a single method
     async fn try_scitt_verification(
@@ -2366,8 +2348,7 @@ impl AnsVerifier {
         headers: &crate::scitt::ScittHeaders,
         key_store: &Arc<crate::scitt::RefreshableKeyStore>,
         config: &ScittConfig,
-        is_server: bool,
-        dialed_host: Option<&str>,
+        peer: ScittPeer<'_>,
         mut cache: Option<&crate::scitt::ScittVerificationCache>,
     ) -> Option<VerificationOutcome> {
         let token_bytes = headers.status_token.as_ref()?;
@@ -2387,12 +2368,9 @@ impl AnsVerifier {
                 .await
         {
             tracing::debug!("SCITT verification cache hit (Layer 2 — full outcome)");
-            if let Some(e) = Self::check_scitt_certificate(
-                cert,
-                &outcome.verified_token.payload,
-                is_server,
-                dialed_host,
-            ) {
+            if let Some(e) =
+                Self::check_scitt_certificate(cert, &outcome.verified_token.payload, peer)
+            {
                 return Some(e);
             }
             return Some(VerificationOutcome::ScittVerified {
@@ -2461,63 +2439,22 @@ impl AnsVerifier {
         };
 
         // Certificate role and peer names are checked on cache hits too.
-        if let Some(e) =
-            Self::check_scitt_certificate(cert, &verified_token.payload, is_server, dialed_host)
-        {
+        if let Some(e) = Self::check_scitt_certificate(cert, &verified_token.payload, peer) {
             return Some(e);
         }
 
         // ── Receipt verification (Layer 1 cached) ──────────────────────
         let tier = if let Some(receipt_bytes) = &headers.receipt {
-            // Safety: receipt_hash is always Some when receipt bytes are present
-            // (computed at the top of this function from the same Option).
-            let Some(rh) = receipt_hash.as_ref() else {
-                // Defensive: should be unreachable, but fall back gracefully
-                tracing::warn!("receipt_hash missing despite receipt bytes present");
-                return Some(VerificationOutcome::ScittError(
-                    crate::scitt::ScittError::MissingTokenField(
-                        "Internal error: receipt hash not computed".to_string(),
-                    ),
-                ));
-            };
-
-            let receipt = if let Some(cached_receipt) = match cache {
-                Some(c) => c.get_verified_receipt(rh).await,
-                None => None,
-            } {
-                tracing::debug!("SCITT receipt cache hit (Layer 1 — skipping Merkle)");
-                cached_receipt
-            } else {
-                // Use the same snapshot as the cache keys/token verification.
-                let mut result = crate::scitt::verify_receipt(receipt_bytes, &snapshot);
-                if matches!(result, Err(crate::scitt::ScittError::UnknownKeyId(_))) {
-                    match key_store.refresh_if_cooldown_elapsed().await {
-                        Ok(true) => {
-                            snapshot = key_store.current_snapshot().await;
-                            cache = None;
-                            result = crate::scitt::verify_receipt(receipt_bytes, &snapshot);
-                        }
-                        Ok(false) => {}
-                        Err(error) => tracing::warn!(%error, "Receipt key refresh failed"),
-                    }
-                }
-                match result {
-                    Ok(receipt) => {
-                        tracing::debug!("SCITT receipt verified — FullScitt tier");
-                        let receipt = Arc::new(receipt);
-                        if let Some(cache) = cache {
-                            cache.insert_verified_receipt(*rh, receipt.clone()).await;
-                        }
-                        receipt
-                    }
-                    Err(e) => {
-                        // ANS-6 §9.7: present, failed evidence never causes
-                        // a downgrade to status-token-only verification.
-                        return Some(VerificationOutcome::ScittError(e));
-                    }
-                }
-            };
-            let expected_host = if is_server { dialed_host } else { cert.fqdn() };
+            let (receipt, verified_hash) =
+                match Self::verify_receipt_with_refresh(receipt_bytes, key_store, cache).await {
+                    Ok(verified) => verified,
+                    Err(error) => return Some(VerificationOutcome::ScittError(error)),
+                };
+            // A refreshed trust scope must not populate the old outcome-cache key.
+            if Some(verified_hash) != receipt_hash {
+                cache = None;
+            }
+            let expected_host = peer.dialed_host().or_else(|| cert.fqdn());
             if let Err(e) = crate::scitt::bind_receipt_to_status(
                 &receipt,
                 &verified_token.payload,
@@ -2559,9 +2496,10 @@ impl AnsVerifier {
     fn check_scitt_certificate(
         cert: &CertIdentity,
         payload: &ans_types::StatusTokenPayload,
-        is_server: bool,
-        dialed_host: Option<&str>,
+        peer: ScittPeer<'_>,
     ) -> Option<VerificationOutcome> {
+        let is_server = matches!(peer, ScittPeer::Server(_));
+        let dialed_host = peer.dialed_host();
         let matches = if is_server {
             crate::scitt::matches_server_cert(payload, cert.fingerprint())
         } else {
@@ -2917,10 +2855,10 @@ impl AnsVerifierBuilder {
         }
 
         #[cfg(feature = "scitt")]
-        let badge_enabled = !matches!(
-            self.scitt_config.as_ref().map(|config| config.tier_policy),
-            Some(ScittTierPolicy::RequireScitt)
-        );
+        let badge_enabled = self
+            .scitt_config
+            .as_ref()
+            .is_none_or(|config| config.tier_policy.allows_badge_fallback());
         #[cfg(not(feature = "scitt"))]
         let badge_enabled = true;
         if badge_enabled {
@@ -4890,8 +4828,9 @@ mod tests {
             key_store: Arc<ScittKeyStore>,
             tier_policy: ScittTierPolicy,
         ) -> AnsVerifier {
-            let identity_fp = format!("SHA256:{}", "22".repeat(32));
-            let badge = create_test_badge(host, "v1.0.0", badge_fingerprint, &identity_fp);
+            let identity_fp = test_fp2();
+            let mut badge = create_test_badge(host, "v1.0.0", badge_fingerprint, &identity_fp);
+            badge.payload.producer.event.ans_id = Uuid::nil();
             let badge_url = "https://tlog.example.com/v1/agents/test-id";
             let dns_record = BadgeRecord {
                 format_version: "ans-badge1".to_string(),
@@ -5003,8 +4942,7 @@ mod tests {
                     &headers,
                     &trusted,
                     &config,
-                    true,
-                    Some("agent.example.com"),
+                    ScittPeer::Server(&Fqdn::new("agent.example.com").unwrap()),
                     Some(&cache),
                 )
                 .await
@@ -5020,8 +4958,7 @@ mod tests {
                     &headers,
                     &untrusted,
                     &config,
-                    true,
-                    Some("agent.example.com"),
+                    ScittPeer::Server(&Fqdn::new("agent.example.com").unwrap()),
                     Some(&cache),
                 )
                 .await
@@ -5034,6 +4971,126 @@ mod tests {
                     "{outcome:?}"
                 );
             }
+        }
+
+        fn receipt_for_peer(key: &SigningKey) -> Vec<u8> {
+            use ciborium::Value as C;
+            let mut protected: C =
+                ciborium::de::from_reader(build_protected_bytes(key).as_slice()).unwrap();
+            if let C::Map(pairs) = &mut protected {
+                pairs.push((C::Integer(395.into()), C::Integer(1.into())));
+            }
+            let mut protected_bytes = Vec::new();
+            ciborium::ser::into_writer(&protected, &mut protected_bytes).unwrap();
+            let payload=serde_json_canonicalizer::to_vec(&serde_json::json!({"ansId":Uuid::nil(),"ansName":"ans://v1.0.0.agent.example.com","agent":{"host":"agent.example.com"}})).unwrap();
+            let digest = compute_sig_structure_digest(&protected_bytes, &payload).unwrap();
+            let (signature, _): (p256::ecdsa::Signature, _) = key.sign_prehash(&digest).unwrap();
+            let proof = C::Map(vec![
+                (C::Integer((-1).into()), C::Integer(1.into())),
+                (C::Integer((-2).into()), C::Integer(0.into())),
+                (C::Integer((-3).into()), C::Array(vec![])),
+            ]);
+            let cose = C::Array(vec![
+                C::Bytes(protected_bytes),
+                C::Map(vec![(C::Integer(396.into()), proof)]),
+                C::Bytes(payload),
+                C::Bytes(signature.to_bytes().to_vec()),
+            ]);
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&cose, &mut bytes).unwrap();
+            bytes
+        }
+
+        #[tokio::test]
+        async fn partial_and_complete_artifacts_share_the_trust_scoped_receipt_cache() {
+            let (key, store) = make_key_and_store(1);
+            let receipt = receipt_for_peer(&key);
+            let hash = store.artifact_cache_key(&receipt);
+            let mut verifier = make_verifier_with_scitt(
+                "agent.example.com",
+                &test_fp(),
+                Arc::new(store),
+                ScittTierPolicy::ScittWithBadgeFallback,
+            );
+            let cache = Arc::new(crate::scitt::ScittVerificationCache::default());
+            verifier.scitt_verification_cache = Some(cache.clone());
+            let cert = create_test_cert_identity("agent.example.com", &test_fp());
+            let headers = ScittHeaders::new(Some(receipt.clone()), None);
+            assert!(
+                verifier
+                    .verify_server_with_scitt("agent.example.com", &cert, &headers)
+                    .await
+                    .is_success()
+            );
+            let cached = cache
+                .get_verified_receipt(&hash)
+                .await
+                .expect("receipt-only path caches verified evidence");
+            let headers = ScittHeaders::new(
+                Some(receipt.clone()),
+                Some(make_valid_token(&key, &test_fp())),
+            );
+            assert!(
+                verifier
+                    .verify_server_with_scitt("agent.example.com", &cert, &headers)
+                    .await
+                    .is_success()
+            );
+            assert!(Arc::ptr_eq(
+                &cached,
+                &cache.get_verified_receipt(&hash).await.unwrap()
+            ));
+            let (_, untrusted) = make_key_and_store(2);
+            assert!(matches!(
+                AnsVerifier::verify_receipt_with_refresh(
+                    &receipt,
+                    &RefreshableKeyStore::from_static(untrusted),
+                    Some(&cache)
+                )
+                .await,
+                Err(ScittError::UnknownKeyId(_))
+            ));
+            let mut corrupt = receipt;
+            *corrupt.last_mut().unwrap() ^= 1;
+            let keys = verifier.scitt_key_store.as_ref().unwrap();
+            let hash = keys.current_snapshot().await.artifact_cache_key(&corrupt);
+            for _ in 0..2 {
+                assert!(
+                    AnsVerifier::verify_receipt_with_refresh(&corrupt, keys, Some(&cache))
+                        .await
+                        .is_err()
+                );
+            }
+            assert!(cache.get_verified_receipt(&hash).await.is_none());
+        }
+
+        #[tokio::test]
+        async fn receipt_refresh_caches_only_under_the_refreshed_trust_scope() {
+            let (key, _) = make_key_and_store(2);
+            let (_, initial) = make_key_and_store(1);
+            let receipt = receipt_for_peer(&key);
+            let old_hash = initial.artifact_cache_key(&receipt);
+            let der = key.verifying_key().to_public_key_der().unwrap();
+            let hash = Sha256::digest(der.as_bytes());
+            let root = format!(
+                "tl.example.com+{}+{}",
+                hex::encode(&hash[..4]),
+                BASE64_STANDARD.encode(der.as_bytes())
+            );
+            let client = crate::scitt::MockScittClient::new().with_root_keys(vec![root]);
+            let store = RefreshableKeyStore::new(initial, Arc::new(client));
+            let cache = crate::scitt::ScittVerificationCache::default();
+            let (first, new_hash) =
+                AnsVerifier::verify_receipt_with_refresh(&receipt, &store, Some(&cache))
+                    .await
+                    .unwrap();
+            assert_ne!(old_hash, new_hash);
+            assert!(cache.get_verified_receipt(&old_hash).await.is_none());
+            let (second, _) =
+                AnsVerifier::verify_receipt_with_refresh(&receipt, &store, Some(&cache))
+                    .await
+                    .unwrap();
+            assert!(Arc::ptr_eq(&first, &second));
         }
 
         // ── ScittConfig / ScittTierPolicy tests ─────────────────────────
@@ -5170,7 +5227,7 @@ mod tests {
         // ── verify_server_with_scitt ────────────────────────────────────
 
         #[tokio::test]
-        async fn scitt_server_verification_success_token_only() {
+        async fn scitt_server_falls_back_without_receipt() {
             let fp = test_fp();
             let (signing_key, store) = make_key_and_store(1);
             let store = Arc::new(store);
@@ -5190,12 +5247,7 @@ mod tests {
                 .verify_server_with_scitt("agent.example.com", &cert, &headers)
                 .await;
             assert!(outcome.is_success());
-            match outcome {
-                VerificationOutcome::ScittVerified { tier, .. } => {
-                    assert_eq!(tier, ans_types::VerificationTier::StatusTokenVerified);
-                }
-                other => panic!("Expected ScittVerified, got: {other:?}"),
-            }
+            assert!(matches!(outcome, VerificationOutcome::Verified { .. }));
         }
 
         #[tokio::test]
@@ -5418,9 +5470,9 @@ mod tests {
             let outcome = verifier
                 .verify_server_with_scitt("agent.example.com", &cert, &headers)
                 .await;
-            // Badge succeeds, SCITT enhances → ScittVerified
+            // A valid token without a receipt uses the verified badge.
             assert!(outcome.is_success());
-            assert!(matches!(outcome, VerificationOutcome::ScittVerified { .. }));
+            assert!(matches!(outcome, VerificationOutcome::Verified { .. }));
         }
 
         #[tokio::test]
@@ -5534,7 +5586,7 @@ mod tests {
 
             let outcome = verifier.verify_client_with_scitt(&cert, &headers).await;
             assert!(outcome.is_success());
-            assert!(matches!(outcome, VerificationOutcome::ScittVerified { .. }));
+            assert!(matches!(outcome, VerificationOutcome::Verified { .. }));
         }
 
         // ── Builder extensions ──────────────────────────────────────────

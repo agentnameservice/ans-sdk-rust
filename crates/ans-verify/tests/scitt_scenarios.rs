@@ -50,7 +50,7 @@ fn make_badge_with_status(
             "logId": Uuid::new_v4().to_string(),
             "producer": {
                 "event": {
-                    "ansId": Uuid::new_v4().to_string(),
+                    "ansId": Uuid::nil().to_string(),
                     "ansName": format!("ans://{version}.{host}"),
                     "eventType": "AGENT_REGISTERED",
                     "agent": { "host": host, "name": "Test Agent", "version": version },
@@ -385,6 +385,17 @@ fn build_receipt(signing_key: &SigningKey, event_payload: &[u8]) -> Vec<u8> {
     buf
 }
 
+fn complete_headers(signing_key: &SigningKey, token: &[u8]) -> ScittHeaders {
+    let event = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "ansId": Uuid::nil(),
+        "ansName": format!("ans://v1.0.0.{HOST}"),
+        "agent": {"host": HOST},
+    }))
+    .unwrap();
+    let receipt = build_receipt(signing_key, &event);
+    ScittHeaders::from_base64(Some(&encode_b64(&receipt)), Some(&encode_b64(token))).unwrap()
+}
+
 fn encode_b64(bytes: &[u8]) -> String {
     BASE64_STANDARD.encode(bytes)
 }
@@ -421,7 +432,7 @@ async fn ans6_scitt_enforces_dane_on_fresh_and_cached_results() {
             .build()
             .await
             .unwrap();
-        let headers = ScittHeaders::new(None, Some(make_server_token(&key, SERVER_FP)));
+        let headers = complete_headers(&key, &make_server_token(&key, SERVER_FP));
         for _ in 0..2 {
             let outcome = verifier
                 .verify_server_with_scitt(HOST, &server_cert(HOST, SERVER_FP), &headers)
@@ -486,7 +497,7 @@ async fn ans6_client_name_binding_applies_on_outcome_cache_hits() {
         ScittTierPolicy::RequireScitt,
     )
     .await;
-    let headers = ScittHeaders::new(None, Some(token));
+    let headers = complete_headers(&key, &token);
     let valid = mtls_cert(HOST, "v1.0.0", IDENTITY_FP);
     assert!(
         verifier
@@ -525,7 +536,7 @@ fn ans6_status_token_skew_cannot_exceed_ten_minutes() {
 // S1: Valid SCITT verification
 // =========================================================================
 
-/// S1.1: Valid status token, server verify → ScittVerified (StatusTokenVerified)
+/// S1.1: A valid status token without a receipt falls back to the live badge.
 #[tokio::test]
 async fn test_s1_1_valid_token_server_verify() {
     let (signing_key, store) = make_key_and_store(1);
@@ -547,12 +558,7 @@ async fn test_s1_1_valid_token_server_verify() {
         .verify_server_with_scitt(HOST, &cert, &headers)
         .await;
     assert!(outcome.is_success());
-    match outcome {
-        VerificationOutcome::ScittVerified { tier, .. } => {
-            assert_eq!(tier, VerificationTier::StatusTokenVerified);
-        }
-        other => panic!("Expected ScittVerified, got: {other:?}"),
-    }
+    assert!(matches!(outcome, VerificationOutcome::Verified { .. }));
 }
 
 /// ANS-6 §5.2 dialed-host anchor: a valid status token whose `ansName` names
@@ -606,7 +612,7 @@ async fn test_s1_2_valid_token_mtls_verify() {
     )
     .await;
     let cert = mtls_cert(HOST, "v1.0.0", IDENTITY_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     let outcome = verifier.verify_client_with_scitt(&cert, &headers).await;
     assert!(outcome.is_success());
@@ -661,7 +667,7 @@ async fn test_s1_3_server_verify_token_without_identity_certs() {
     )
     .await;
     let cert = server_cert(HOST, SERVER_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     let outcome = verifier
         .verify_server_with_scitt(HOST, &cert, &headers)
@@ -708,7 +714,7 @@ async fn test_s1_4_client_verify_token_without_identity_certs_rejects() {
 // S2: Missing headers → badge fallback
 // =========================================================================
 
-/// S2.1: Missing receipt header only → ScittVerified (token alone is sufficient)
+/// S2.1: Missing receipt header falls back only after validating the token.
 #[tokio::test]
 async fn test_s2_1_missing_receipt_header() {
     let (signing_key, store) = make_key_and_store(1);
@@ -731,12 +737,7 @@ async fn test_s2_1_missing_receipt_header() {
         .verify_server_with_scitt(HOST, &cert, &headers)
         .await;
     assert!(outcome.is_success());
-    match outcome {
-        VerificationOutcome::ScittVerified { tier, .. } => {
-            assert_eq!(tier, VerificationTier::StatusTokenVerified);
-        }
-        other => panic!("Expected ScittVerified with StatusTokenVerified tier, got: {other:?}"),
-    }
+    assert!(matches!(outcome, VerificationOutcome::Verified { .. }));
 }
 
 /// S2.2: Receipt present but no status token → reject (headers present = SCITT final)
@@ -954,7 +955,7 @@ async fn test_s5_1_fingerprint_matches_second_element() {
     )
     .await;
     let cert = server_cert(HOST, SERVER_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     let outcome = verifier
         .verify_server_with_scitt(HOST, &cert, &headers)
@@ -1021,7 +1022,7 @@ async fn test_s5_3_renewal_overlap_both_certs_accepted() {
 
     // Old cert still works
     let old_cert = server_cert(HOST, SERVER_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
     let outcome = verifier
         .verify_server_with_scitt(HOST, &old_cert, &headers)
         .await;
@@ -1037,7 +1038,7 @@ async fn test_s5_3_renewal_overlap_both_certs_accepted() {
         ScittTierPolicy::ScittWithBadgeFallback,
     )
     .await;
-    let headers2 = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers2 = complete_headers(&signing_key, &token);
     let outcome2 = verifier2
         .verify_server_with_scitt(HOST, &new_cert, &headers2)
         .await;
@@ -1093,7 +1094,7 @@ async fn test_s8_1_mtls_active_all_pass() {
     )
     .await;
     let cert = mtls_cert(HOST, "v1.0.0", IDENTITY_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     let outcome = verifier.verify_client_with_scitt(&cert, &headers).await;
     assert!(outcome.is_success());
@@ -1149,7 +1150,7 @@ async fn test_s8_4_mtls_deprecated_status() {
     )
     .await;
     let cert = mtls_cert(HOST, "v1.0.0", IDENTITY_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     let outcome = verifier.verify_client_with_scitt(&cert, &headers).await;
     // DEPRECATED is allowed (not terminal) → ScittVerified
@@ -1226,7 +1227,7 @@ async fn test_badge_enhancement_both_succeed() {
     )
     .await;
     let cert = server_cert(HOST, SERVER_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     let outcome = verifier
         .verify_server_with_scitt(HOST, &cert, &headers)
@@ -1372,7 +1373,7 @@ async fn test_s9_1_unknown_key_triggers_refresh_and_succeeds() {
     // Sign token with key B (not in initial store)
     let token = make_server_token(&signing_key_b, SERVER_FP);
     let cert = server_cert(HOST, SERVER_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key_b, &token);
 
     let outcome = verifier
         .verify_server_with_scitt(HOST, &cert, &headers)
@@ -1497,7 +1498,7 @@ async fn test_s10_1_repeated_calls_return_consistent_results() {
     )
     .await;
     let cert = server_cert(HOST, SERVER_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     // First call: full verification
     let outcome1 = verifier
@@ -1598,7 +1599,7 @@ async fn test_s10_3_cached_token_renewal_overlap_both_succeed() {
         ScittTierPolicy::ScittWithBadgeFallback,
     )
     .await;
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     // First call with old cert → populates caches
     let cert_old = server_cert(HOST, SERVER_FP);
@@ -1686,7 +1687,7 @@ async fn test_s10_5_with_caching_enables_scitt_cache() {
         .expect("build should succeed");
 
     let cert = server_cert(HOST, SERVER_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     // Verify twice — should succeed both times (second hits cache)
     for i in 0..2 {
@@ -1728,7 +1729,7 @@ async fn test_s10_6_explicit_cache_builder_method() {
         .expect("build should succeed");
 
     let cert = server_cert(HOST, SERVER_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     let outcome = verifier
         .verify_server_with_scitt(HOST, &cert, &headers)
@@ -1756,7 +1757,7 @@ async fn test_s10_7_mtls_cached_verification() {
     )
     .await;
     let cert = mtls_cert(HOST, "v1.0.0", IDENTITY_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     // First call: full verification
     let outcome1 = verifier.verify_client_with_scitt(&cert, &headers).await;
@@ -1827,7 +1828,7 @@ async fn test_s10_9_badge_enhancement_cached() {
     )
     .await;
     let cert = server_cert(HOST, SERVER_FP);
-    let headers = ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap();
+    let headers = complete_headers(&signing_key, &token);
 
     // First call: badge then SCITT enhancement
     let outcome1 = verifier
@@ -1871,7 +1872,7 @@ async fn test_s10_10_concurrent_cached_verifications() {
         .await,
     );
     let cert = Arc::new(server_cert(HOST, SERVER_FP));
-    let headers = Arc::new(ScittHeaders::from_base64(None, Some(&encode_b64(&token))).unwrap());
+    let headers = Arc::new(complete_headers(&signing_key, &token));
 
     // Spawn 20 concurrent verifications
     let mut handles = Vec::new();
@@ -2025,4 +2026,119 @@ async fn test_full_scitt_tier_with_token_and_receipt() {
         }
         other => panic!("Expected ScittVerified with FullScitt tier, got: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn partial_artifacts_follow_policy_without_hiding_failed_evidence() {
+    for policy in [
+        ScittTierPolicy::ScittWithBadgeFallback,
+        ScittTierPolicy::RequireScitt,
+        ScittTierPolicy::BadgeWithScittEnhancement,
+    ] {
+        for is_server in [true, false] {
+            let (key, store) = make_key_and_store(41);
+            let verifier =
+                make_scitt_verifier(HOST, SERVER_FP, IDENTITY_FP, Arc::new(store), policy).await;
+            let cert = if is_server {
+                server_cert(HOST, SERVER_FP)
+            } else {
+                mtls_cert(HOST, "v1.0.0", IDENTITY_FP)
+            };
+            let token = if is_server {
+                make_server_token(&key, SERVER_FP)
+            } else {
+                make_identity_token(&key, IDENTITY_FP)
+            };
+            let complete = complete_headers(&key, &token);
+            for headers in [
+                ScittHeaders::new(None, Some(token)),
+                ScittHeaders::new(complete.receipt.clone(), None),
+            ] {
+                for _ in 0..2 {
+                    let outcome = if is_server {
+                        verifier
+                            .verify_server_with_scitt(HOST, &cert, &headers)
+                            .await
+                    } else {
+                        verifier.verify_client_with_scitt(&cert, &headers).await
+                    };
+                    if matches!(policy, ScittTierPolicy::RequireScitt) {
+                        assert!(
+                            matches!(
+                                outcome,
+                                VerificationOutcome::ScittError(ScittError::MissingArtifact(_))
+                            ),
+                            "{outcome:?}"
+                        );
+                    } else {
+                        assert!(
+                            matches!(outcome, VerificationOutcome::Verified { .. }),
+                            "{outcome:?}"
+                        );
+                    }
+                }
+            }
+            for headers in [
+                ScittHeaders::from_base64(Some(""), None).unwrap(),
+                ScittHeaders::new(None, Some(Vec::new())),
+            ] {
+                let outcome = if is_server {
+                    verifier
+                        .verify_server_with_scitt(HOST, &cert, &headers)
+                        .await
+                } else {
+                    verifier.verify_client_with_scitt(&cert, &headers).await
+                };
+                assert!(
+                    matches!(outcome, VerificationOutcome::ScittError(_)),
+                    "{outcome:?}"
+                );
+            }
+            let outcome = if is_server {
+                verifier
+                    .verify_server_with_scitt(HOST, &cert, &complete)
+                    .await
+            } else {
+                verifier.verify_client_with_scitt(&cert, &complete).await
+            };
+            assert!(
+                matches!(
+                    outcome,
+                    VerificationOutcome::ScittVerified {
+                        tier: VerificationTier::FullScitt,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn partial_receipt_must_agree_with_the_live_badge() {
+    let (key, store) = make_key_and_store(42);
+    let verifier = make_scitt_verifier(
+        HOST,
+        SERVER_FP,
+        IDENTITY_FP,
+        Arc::new(store),
+        ScittTierPolicy::ScittWithBadgeFallback,
+    )
+    .await;
+    let event = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "ansId": Uuid::new_v4(), "ansName": format!("ans://v1.0.0.{HOST}"), "agent": {"host": HOST},
+    }))
+    .unwrap();
+    let headers = ScittHeaders::new(Some(build_receipt(&key, &event)), None);
+    let outcome = verifier
+        .verify_server_with_scitt(HOST, &server_cert(HOST, SERVER_FP), &headers)
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            VerificationOutcome::ScittError(ScittError::IdentityBinding(_))
+        ),
+        "{outcome:?}"
+    );
 }
